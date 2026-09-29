@@ -1,0 +1,12 @@
+{
+  "name": "hq",
+  "private": true,
+  "type": "module",
+  "description": "Personal AI company runtime: chairman -> CEO agent -> teams. Runs teams on schedules, supervises Claude Code processes, serves state to the desk pet.",
+  "scripts": {
+    "start": "node src/main.ts",
+    "check": "tsc --noEmit"
+  },
+  "engines": { "node": ">=26" },
+  "devDependencies": { "typescript": "7.0.2", "@types/node": "latest" }
+}

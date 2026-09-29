@@ -1,0 +1,4 @@
+[
+  { "id": "hq", "name": "hq 본부", "path": "~/path/to/hq" },
+  { "id": "my-app", "name": "내 프로젝트", "path": "~/path/to/my-app" }
+]

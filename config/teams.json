@@ -1,0 +1,26 @@
+[
+  {
+    "id": "smoke",
+    "name": "시험 팀",
+    "pack": "digimon",
+    "command": [
+      "node",
+      "teams/smoke.ts"
+    ],
+    "cwd": ".",
+    "everyMinutes": 60,
+    "enabled": false
+  },
+  {
+    "id": "revenue",
+    "name": "수익자동화",
+    "pack": "digimon",
+    "command": [
+      "node",
+      "teams/demo-revenue.ts"
+    ],
+    "cwd": ".",
+    "everyMinutes": 30,
+    "enabled": true
+  }
+]
