@@ -27,7 +27,7 @@ import { canAutoApply, reviseDiff, reviseProblem, runReviseTurn } from './revise
 import { checkVerdict, ladderUp, VERDICT_SCHEMA } from './review.ts'
 import { claudeBinReadable, real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
 import { extractBashRuns, lastActivityOf, StreamTail } from './stream.ts'
-import { claudeArgs, findOrphan, killGroup, launch, psLstart, readProcessInfo, removeCacheDir, sameProcessAlive, terminateGroup } from './worker.ts'
+import { claudeArgs, defaultProbe, findOrphan, identify, killGroup, launch, LaunchAborted, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
 import { reconcile as reconcileInvariants, recover as recoverState, type Violation } from './reconcile.ts'
 
 export type Notify = (title: string, body: string) => void
@@ -48,6 +48,8 @@ export interface RunnerDeps {
   ceoLock?: TurnLock
   /** Team id → display name, for team decision titles. */
   teamNames?: Record<string, string>
+  /** How process identity is observed (tests inject failing or swapped ps). */
+  probe?: Partial<Probe>
 }
 
 export interface Live {
@@ -57,9 +59,13 @@ export interface Live {
   startedAt: string | null
   /** Set for processes spawned by this daemon; recovered ones are probed by pid + start time. */
   child: ChildProcess | null
+  /** Exit observed since spawn (null for recovered processes). */
+  exit: ExitWatch | null
   exited: boolean
   killAt: number | null
   killed9: boolean
+  /** Seen as `same` at least once: only then may the leftover group be cleaned up after the leader is gone (§7.4). */
+  confirmed: boolean
 }
 
 /** Result of a chairman decision; replays of the same decision return the stored one (§D). */
@@ -72,6 +78,12 @@ const MAX_LIMITED_STREAK = 3
 const RECONCILE_MS = 60_000
 const LOG_RETENTION_MS = 30 * 24 * 60 * 60_000
 const BACKOFF_MIN = [15, 30, 60]
+/** Background job retry: 1s → 2s → … → 60s; the 5th failure in a row stops its task. */
+const JOB_BACKOFF_MIN_MS = 1_000
+const JOB_BACKOFF_MAX_MS = 60_000
+const JOB_MAX_FAILURES = 5
+const JOB_FAILING = '내부 작업이 계속 실패해요 · hq logs를 확인해 주세요'
+const IDENTITY_UNKNOWN = '작업자 프로세스를 확인할 수 없어 멈췄어요 · 직접 확인한 뒤 다시 시도해 주세요'
 export const TERMINAL_REQUEST = new Set(['merged', 'rejected', 'failed', 'cancelled', 'expired'])
 const UNCOUNTED_PREV = new Set(['limited', 'transient', 'start_failed', 'brief_blocked'])
 export const INTEGRATION_OPTIONS = ['다시 통합', '해당 작업 재작업', '요청 중단']
@@ -92,6 +104,11 @@ const JUDGE_ADDED = '사람 확인이 필요한 기준이 있어 검토를 추�
 const kindOf = (a: Acceptance) => (a.kind === 'new' ? 'new' : 'regression')
 
 class Setup extends Error {}
+/** A start path found its attempt cancelled or superseded after an await: stop without spawning (F08). */
+class StartAborted extends Error {
+  readonly outcome: 'cancelled' | 'superseded'
+  constructor(outcome: 'cancelled' | 'superseded', why: string) { super(why); this.outcome = outcome }
+}
 class DecisionRefused extends Error {}
 
 export class Runner {
@@ -121,11 +138,15 @@ export class Runner {
   private jobs = new Set<Promise<unknown>>()
   private current: Promise<void> | null = null
   lastViolations: Violation[] = []
+  readonly probe: Probe
+  /** Consecutive failures of keyed background jobs and when they may run again (this.now() clock). */
+  private failures = new Map<string, { n: number; until: number }>()
 
   constructor(d: RunnerDeps) {
     this.store = d.store; this.bus = d.bus; this.cfg = d.cfg; this.projects = d.projects; this.hqRoot = d.hqRoot; this.hqPort = d.hqPort
     this.notify = d.notify; this.now = d.now; this.ceoLock = d.ceoLock ?? new TurnLock()
     this.teamNames = d.teamNames ?? {}
+    this.probe = { ...defaultProbe, ...d.probe }
     mkdirSync(d.cfg.home, { recursive: true })
     this.home = real(d.cfg.home)
     this.tokenDir = d.tokenDir ?? join(homedir(), '.config/hq')
@@ -141,10 +162,45 @@ export class Runner {
   /** Stops ticking only; worker processes keep running and are re-adopted on the next start (§F). */
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = null; this.stopped = true }
 
-  /** Runs a background job and remembers it so shutdown (and tests) can wait for it. */
-  private bg(p: Promise<unknown>): void {
-    const j = p.catch((e) => console.error('[hq runner] job', e)).finally(() => { this.jobs.delete(j); this.kick() })
+  /**
+   * Runs a background job and remembers it so shutdown (and tests) can wait for it. A keyed job that throws is not
+   * retried at once: jobReady(key) stays false for 1s → 2s → … → 60s (reset on success), and after JOB_MAX_FAILURES
+   * failures in a row `giveUp` stops its task.
+   */
+  private bg(p: Promise<unknown>, key?: string, giveUp?: (e: unknown) => void): void {
+    const j = p.then(() => { if (key) this.failures.delete(key) }, (e) => {
+      if (key) this.jobFailed(key, e, giveUp)
+      else console.error('[hq runner] job', e)
+    }).finally(() => { this.jobs.delete(j); this.kick() })
     this.jobs.add(j)
+  }
+
+  /** False while a keyed job is backing off after a failure. */
+  jobReady(key: string): boolean {
+    const f = this.failures.get(key)
+    return !f || this.now() >= f.until
+  }
+
+  private jobFailed(key: string, e: unknown, giveUp?: (e: unknown) => void): void {
+    const n = (this.failures.get(key)?.n ?? 0) + 1
+    if (n >= JOB_MAX_FAILURES && giveUp) {
+      console.error(`[hq runner] job ${key} failed ${n} times in a row, stopping it:`, e)
+      this.failures.delete(key)
+      try { giveUp(e) } catch (e2) { console.error(`[hq runner] job ${key} give-up`, e2) }
+      return
+    }
+    const delay = Math.min(JOB_BACKOFF_MAX_MS, JOB_BACKOFF_MIN_MS * 2 ** (n - 1))
+    this.failures.set(key, { n, until: this.now() + delay })
+    console.error(`[hq runner] job ${key} failed (${n} in a row), retry in ${delay / 1000}s:`, e)
+    setTimeout(() => this.kick(), delay).unref()
+  }
+
+  /** giveUp for a task's job: the task stops for the chairman (not while it is already stopped or finished). */
+  private blockOnFailure(taskId: string, generation: number): (e: unknown) => void {
+    return () => this.store.tx(() => {
+      const t = this.store.task(taskId)
+      if (t && t.generation === generation && !['blocked', 'passed', 'cancelled'].includes(t.status)) this.block(t, JOB_FAILING)
+    })
   }
 
   /** Resolves when no background job and no tick is running. */
@@ -171,12 +227,22 @@ export class Runner {
       projects: this.projects.map((p) => p.path), mirror: this.mirror(projectId), readable: claudeBinReadable(this.cfg.claudeBin) }
   }
 
-  /** Check/integration processes are recorded so a restart can kill leftover groups (§9). */
+  /**
+   * Check/integration processes are recorded so a restart can kill leftover groups (§9) — only when pid + start time
+   * still match (the start time is added as soon as ps answers; without it the group is never signalled).
+   */
   procTracker(what: string): { onSpawn: OnSpawn; done: () => void } {
-    const pids: number[] = []
+    const pids = new Set<number>()
     return {
-      onSpawn: (pid) => { pids.push(pid); this.store.set(`proc:${pid}`, JSON.stringify({ pid, what, startedAt: new Date().toISOString() })) },
-      done: () => { for (const p of pids) this.store.set(`proc:${p}`, null) },
+      onSpawn: (pid) => {
+        pids.add(pid)
+        const row = { pid, what, startedAt: new Date().toISOString() }
+        this.store.set(`proc:${pid}`, JSON.stringify(row))
+        void Promise.resolve().then(() => this.probe.lstart(pid)).catch(() => null).then((lstart) => {
+          if (lstart && pids.has(pid)) this.store.set(`proc:${pid}`, JSON.stringify({ ...row, lstart }))
+        }).catch(() => { /* store closed */ })
+      },
+      done: () => { for (const p of pids) this.store.set(`proc:${p}`, null); pids.clear() },
     }
   }
 
@@ -426,11 +492,25 @@ export class Runner {
   }
 
   // ----- live process supervision (§7 §13) -----
-  track(att: AttemptRow, pid: number, lstart: string | null, startedAt: string | null, child: ChildProcess | null, exited = false): Live {
-    const l: Live = { tail: new StreamTail(hqDirOf(att)), pid, lstart, startedAt, child, exited, killAt: null, killed9: false }
-    if (child) child.once('exit', () => { l.exited = true; this.kick() })
+  /** `spawned`: the child and its exit watch from launch() (exit observed since spawn, F09); null for recovered processes. */
+  track(att: AttemptRow, pid: number, lstart: string | null, startedAt: string | null, spawned: { child: ChildProcess; exit: ExitWatch } | null): Live {
+    const l: Live = { tail: new StreamTail(hqDirOf(att)), pid, lstart, startedAt, child: spawned?.child ?? null, exit: spawned?.exit ?? null,
+      exited: false, killAt: null, killed9: false, confirmed: !!spawned }
+    if (spawned) spawned.exit.onExit(() => { l.exited = true; this.kick() })
     this.live.set(att.id, l)
     return l
+  }
+
+  /**
+   * Identity of a tracked worker (§7, §22). A child of this daemon that has not exited is `same` (its pid cannot be
+   * reused before it is reaped); one that has exited is `gone`. A recovered process is probed by pid + start time.
+   */
+  private async identityOf(l: Live): Promise<Identity> {
+    if (l.child) {
+      const running = !l.exited && !l.exit?.exited && l.child.exitCode === null && l.child.signalCode === null
+      return running ? 'same' : 'gone'
+    }
+    return identify(l.pid, l.lstart, this.probe.lstart)
   }
 
   private wallMs(t: TaskRow | null): number {
@@ -453,8 +533,15 @@ export class Runner {
         if (s.sessionId && s.sessionId !== att.session_id && att.kind === 'work') { this.store.updateAttempt(att.id, { session_id: s.sessionId }); att.session_id = s.sessionId }
         if (s.rateLimit) this.observe(line)
       })
-      const alive = l.child ? !l.exited : await sameProcessAlive(l.pid, l.lstart, l.startedAt)
-      if (alive) {
+      const id = await this.identityOf(l)
+      if (id === 'same') l.confirmed = true
+      if (id === 'unknown') {
+        // Cannot tell whether the pid is still our worker: never signal it. Finished evidence (a result line) is judged;
+        // otherwise the task stops for the chairman (§22).
+        l.tail.poll((line, s) => { if (s.rateLimit) this.observe(line) })
+        if (!l.tail.finalResult()) { this.stopUnknown(att); continue }
+      }
+      if (id === 'same') {
         const now = this.now()
         const wall = this.wallMs(task)
         const elapsed = now - Date.parse(att.started_at ?? new Date(now).toISOString())
@@ -467,6 +554,7 @@ export class Runner {
           this.bus.emit({ kind: 'attempt', text: `폭주 감시: ${why}`, data: { id: att.id } })
         }
         if (att.outcome === 'runaway' || att.outcome === 'cancelled' || att.outcome === 'superseded') {
+          // Identity was confirmed just above on this tick, so each signal (the later SIGKILL included) is re-checked.
           if (l.killAt === null) { killGroup(l.pid, 'SIGTERM'); l.killAt = Date.now() }
           else if (!l.killed9 && Date.now() - l.killAt >= KILL_GRACE_MS) { killGroup(l.pid, 'SIGKILL'); l.killed9 = true }
         }
@@ -474,7 +562,9 @@ export class Runner {
       }
       l.tail.poll((line, s) => { if (s.rateLimit) this.observe(line) })
       this.live.delete(att.id)
-      terminateGroup(l.pid, KILL_GRACE_MS) // background processes the worker left behind (§7.4)
+      // Background processes the worker left behind (§7.4): only a group this daemon saw as ours whose leader is now gone.
+      // A reused pid (`other`) or an unknown identity is never signalled.
+      if (id === 'gone' && l.confirmed) void terminateGroup(l.pid, l.lstart, KILL_GRACE_MS, this.probe)
       const cacheDir = readProcessInfo(hqDirOf(att))?.cacheDir // per-launch package cache (§6.2), gone with the group
       setTimeout(() => removeCacheDir(cacheDir), KILL_GRACE_MS + 1_000).unref()
       const fresh = this.store.attempt(att.id)!
@@ -490,6 +580,17 @@ export class Runner {
         })
       }
     }
+  }
+
+  /** The worker's identity cannot be confirmed and it left no result: stop tracking it without a signal, the task stops. */
+  private stopUnknown(att: AttemptRow): void {
+    this.live.delete(att.id)
+    this.store.tx(() => {
+      this.store.updateAttempt(att.id, { status: 'unverifiable', ended_at: this.iso(), reason: IDENTITY_UNKNOWN })
+      const t = this.store.task(att.task_id)
+      if (t && t.generation === att.generation && ['running', 'reviewing'].includes(t.status)) this.block(t, IDENTITY_UNKNOWN)
+    })
+    this.bus.emit({ kind: 'attempt', text: IDENTITY_UNKNOWN, data: { id: att.id } })
   }
 
   private usage(result: Record<string, unknown> | null) {
@@ -646,8 +747,9 @@ export class Runner {
     const all = this.store.tasks(d.request_id)
     for (const a of this.store.liveAttempts()) if (a.task_id === d.id) {
       this.store.updateAttempt(a.id, { outcome: 'superseded' })
-      if (a.pid) { const pid = a.pid; queueMicrotask(() => killGroup(pid, 'SIGTERM')) }
     }
+    // The tick signals superseded workers after confirming their identity (pollLive); a starting one never spawns (F08).
+    queueMicrotask(() => this.kick())
     const sameProjectDep = specOf(d).depends_on.some((k) => { const x = all.find((y) => y.key === k); return x?.project === d.project && x.role === 'implement' })
     const requestBase = this.store.get(`base:${d.request_id}:${d.project}`) ?? d.base_sha
     this.store.updateTask(d.id, { generation: d.generation + 1, status: 'pending', attempts: 0, head_sha: null, worktree: null,
@@ -748,8 +850,10 @@ export class Runner {
     } finally { await removeMirrorWorktree(mirror, wt.path).catch(() => {}) }
   }
 
-  private async runSetup(project: Project, wt: string, hq: string, name: string): Promise<void> {
+  /** `gate` (start paths): asked right before the setup process is spawned; it throws to stop. */
+  private async runSetup(project: Project, wt: string, hq: string, name: string, gate?: () => void): Promise<void> {
     if (!project.setup) return
+    gate?.()
     const prof = join(hq, `${name}.sb`)
     atomicWrite(prof, sandboxProfile(this.sandboxFor(wt, null, project.id)))
     const p = this.procTracker(name)
@@ -760,32 +864,69 @@ export class Runner {
     } finally { p.done() }
   }
 
+  /**
+   * Why a starting attempt must not go on (F08), or null: its request was cancelled or finished, the task's generation
+   * changed or the task left `taskStatus`, or the attempt is no longer `starting` / got an outcome (cancelled, superseded).
+   */
+  private startBlocker(attemptId: string, taskStatus: string): StartAborted | null {
+    const a = this.store.attempt(attemptId)
+    const t = a ? this.store.task(a.task_id) : null
+    const r = t ? this.store.request(t.request_id) : null
+    if (!a || !t || !r || r.status === 'cancelled' || a.outcome === 'cancelled' || t.status === 'cancelled') return new StartAborted('cancelled', '요청 중단')
+    if (TERMINAL_REQUEST.has(r.status) || r.status === 'merging' || t.generation !== a.generation || t.status !== taskStatus
+      || a.status !== 'starting' || a.outcome) return new StartAborted('superseded', '세대가 바뀌어 시작하지 않음')
+    return null
+  }
+
+  /** Throws StartAborted when the attempt must not start any more; call after every await and before each spawn. */
+  private gate(attemptId: string, taskStatus: string): void {
+    const b = this.startBlocker(attemptId, taskStatus)
+    if (b) throw b
+  }
+
+  /** Records an aborted start: nothing was spawned, the attempt ends with its cancel/supersede outcome (task untouched). */
+  private startAborted(att: AttemptRow, e: StartAborted): void {
+    this.store.updateAttempt(att.id, { status: 'failed', outcome: e.outcome, ended_at: this.iso(), reason: e.message })
+    this.bus.emit({ kind: 'attempt', text: e.message, data: { id: att.id } })
+  }
+
   private async prepareAndLaunch(attemptId: string, resume: boolean, prev: AttemptRow | null): Promise<void> {
     const att = this.store.attempt(attemptId)!
     let t = this.store.task(att.task_id)!
     const project = this.project(t.project)
     const hq = hqDirOf(att), out = outDirOf(att)
+    const gate = () => this.gate(attemptId, 'running')
+    const collectWt = t.role === 'collect' ? this.worktreeDir(t.request_id, `${t.key}.c${att.n}`) : null
     try {
       if (!project) throw new Setup(`등록되지 않은 프로젝트: ${t.project}`)
       mkdirSync(hq, { recursive: true }); mkdirSync(out, { recursive: true })
       const mirror = this.mirror(t.project)
-      if (!existsSync(join(mirror, 'HEAD'))) await ensureMirror(project, mirror)
+      if (!existsSync(join(mirror, 'HEAD'))) { await ensureMirror(project, mirror); gate() }
       let cwd: string
-      if (t.role === 'collect') {
+      if (collectWt) {
         const base = t.base_sha ?? await this.resolveBase(t)
-        cwd = (await verifyWorktree(mirror, this.worktreeDir(t.request_id, `${t.key}.c${att.n}`), base)).path
+        gate()
+        cwd = (await verifyWorktree(mirror, collectWt, base)).path
+        gate()
         if (!t.base_sha) this.tset(t, { base_sha: base })
-        await this.runSetup(project, cwd, hq, 'setup')
+        await this.runSetup(project, cwd, hq, 'setup', gate)
+        gate()
       } else {
         cwd = this.workDir(t.request_id, t.key)
         if (!t.worktree) {
           const base = await this.resolveBase(t)
-          await newWorkClone(mirror, cwd, base, await this.projectIdentity(project))
-          await this.runSetup(project, cwd, hq, 'setup')
+          gate()
+          const identity = await this.projectIdentity(project)
+          gate()
+          await newWorkClone(mirror, cwd, base, identity)
+          gate()
+          await this.runSetup(project, cwd, hq, 'setup', gate)
+          gate()
           if (!this.tset(t, { worktree: cwd, base_sha: base })) throw new Setup('작업이 다른 세대로 바뀌어 시작을 멈췄어요')
           t = this.store.task(t.id)!
         }
-        const bases = await this.ensureBaseline(t, hq)
+        const bases = await this.ensureBaseline(t, hq, gate)
+        gate()
         const envMsg = this.baselineEnvMessage(t, bases)
         if (envMsg) throw new Setup(envMsg)
       }
@@ -800,17 +941,23 @@ export class Runner {
           out, token: att.attempt_token, rework: t.note && prev ? this.reworkText(t, prev) : null, dirtyNotice: null, upstream: this.upstream(t) })
       }
       const argv = claudeArgs(this.cfg, { role, model: att.model, sessionId: att.session_id, resume, out })
-      const { info, child } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd, hqDir: hq, outDir: out, prompt, sessionId: att.session_id,
-        sandbox: this.sandboxFor(cwd, out, t.project),
+      gate()
+      const { info, child, exit } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd, hqDir: hq, outDir: out, prompt, sessionId: att.session_id,
+        sandbox: this.sandboxFor(cwd, out, t.project), proceed: () => !this.startBlocker(attemptId, 'running'),
         spec: { attemptId, kind: 'work', role, model: att.model, base: t.base_sha, generation: att.generation, attempt_token: att.attempt_token, resume, startedAt: this.iso() } })
       const startedAt = this.iso()
+      // Spawned: from here the attempt is a live process; a cancel that lands now is handled by pollLive (SIGTERM).
       this.store.tx(() => {
         this.store.updateAttempt(attemptId, { status: 'running', pid: info.pid, lstart: info.lstart, started_at: startedAt })
         this.tset(t, { resume_session: null })
       })
-      this.track({ ...att, status: 'running' }, info.pid, info.lstart, info.startedAt, child)
+      this.track({ ...att, status: 'running' }, info.pid, info.lstart, info.startedAt, { child, exit })
     } catch (e) {
-      this.startFailed(att, e instanceof Setup ? e.message : `시작 실패: ${String(e)}`)
+      const aborted = e instanceof StartAborted ? e : e instanceof LaunchAborted ? this.startBlocker(attemptId, 'running') : null
+      if (aborted) {
+        if (collectWt) await removeMirrorWorktree(this.mirror(t.project), collectWt).catch(() => {})
+        this.startAborted(att, aborted)
+      } else this.startFailed(att, e instanceof Setup ? e.message : `시작 실패: ${String(e)}`)
     }
   }
 
@@ -841,7 +988,7 @@ export class Runner {
    * §9 baseline: each check once on the base, recorded (never an exemption). Returns every nonManual check's base result
    * (fresh and cached). Environment failures are not stored, so a retry after fixing the setup runs the baseline again.
    */
-  private async ensureBaseline(t: TaskRow, hq: string): Promise<Record<string, BaseResult>> {
+  private async ensureBaseline(t: TaskRow, hq: string, gate?: () => void): Promise<Record<string, BaseResult>> {
     const project = this.project(t.project)!
     const out: Record<string, BaseResult> = {}
     const missing: Acceptance[] = []
@@ -851,6 +998,7 @@ export class Runner {
       else missing.push(a)
     }
     if (!missing.length) return out
+    gate?.() // before the baseline spawns its setup and checks
     const p = this.procTracker('baseline')
     try {
       const res = await baseline({ mirror: this.mirror(t.project), base: t.base_sha!, path: this.worktreeDir(t.request_id, `${t.key}.baseline`),
@@ -935,9 +1083,9 @@ export class Runner {
   // ----- verification (§9) -----
   private startVerifications(): void {
     for (const t of this.store.tasksByStatus(['verifying'])) {
-      if (this.checking.has(t.id)) continue
+      if (this.checking.has(t.id) || !this.jobReady(`verify:${t.id}`)) continue
       this.checking.add(t.id)
-      this.bg(this.verify(t).finally(() => this.checking.delete(t.id)))
+      this.bg(this.verify(t).finally(() => this.checking.delete(t.id)), `verify:${t.id}`, this.blockOnFailure(t.id, t.generation))
     }
   }
 
@@ -951,8 +1099,16 @@ export class Runner {
       if (!att || !t.base_sha || !t.head_sha) throw new Error('성공한 시도·커밋 정보가 없음')
       const project = this.project(t.project)!
       const hq = hqDirOf(att)
+      // Before each spawn: the task must still be verifying this head in this generation (F08); otherwise stop quietly.
+      const gate = () => {
+        const cur = this.store.task(t.id), r = cur ? this.store.request(cur.request_id) : null
+        if (!cur || !r || TERMINAL_REQUEST.has(r.status) || cur.status !== 'verifying' || cur.generation !== t.generation || cur.head_sha !== t.head_sha)
+          throw new StartAborted('superseded', '검증 대상이 바뀌어 멈춤')
+      }
       const wt = await verifyWorktree(mirror, path, t.head_sha)
-      await this.runSetup(project, wt.path, hq, 'verify-setup')
+      gate()
+      await this.runSetup(project, wt.path, hq, 'verify-setup', gate)
+      gate()
       const eff = this.effectiveChecks(t)
       const file = await runChecks({ wt, base: t.base_sha, head: t.head_sha, checks: eff.checks, basePassed: eff.basePassed,
         timeoutMs: this.cfg.checkTimeoutMinutes * 60_000, sandbox: this.sandboxFor(wt.path, null, t.project), profilePath: checksProfile(hq), onSpawn: p.onSpawn })
@@ -976,6 +1132,7 @@ export class Runner {
         if (addReview) this.emitTask(cur, '기존 실패 항목이 있어 검토를 추가해요 · sonnet')
       })
     } catch (e) {
+      if (e instanceof StartAborted) return
       this.store.tx(() => {
         const cur = this.store.task(t.id)
         if (cur?.status === 'verifying' && cur.generation === t.generation) { this.tset(cur, { checks_state: 'error' }); this.block(cur, e instanceof Setup ? e.message : `검증을 실행할 수 없어요: ${String(e).slice(0, 300)}`) }
@@ -1007,14 +1164,19 @@ export class Runner {
     const mirror = this.mirror(t.project)
     const path = this.reviewWorktree(t, att.n)
     const hq = hqDirOf(att)
+    const gate = () => this.gate(attemptId, 'reviewing')
     try {
       mkdirSync(hq, { recursive: true })
       const wt = await verifyWorktree(mirror, path, t.head_sha!)
-      await this.runSetup(project, wt.path, hq, 'setup')
+      gate()
+      await this.runSetup(project, wt.path, hq, 'setup', gate)
+      gate()
       // The reviewer must see the commit under review, not what setup made of it (F01).
       const changed = await trackedChanges(wt, t.head_sha!)
+      gate()
       if (changed.length) throw new Setup(setupChangedReason(changed))
       const stat = await hqGit(mirror, null, ['diff', '--stat', '--no-ext-diff', '--no-textconv', t.base_sha!, t.head_sha!])
+      gate()
       const work = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
       const result = work ? readJson<{ protectedChanges?: string[] }>(join(hqDirOf(work), 'result.json')) : null
       const checks = work ? readJson<ChecksFile>(join(hqDirOf(work), 'checks.json')) : null
@@ -1023,15 +1185,18 @@ export class Runner {
         checks, protectedChanges: result?.protectedChanges ?? [], manualIds: checks?.manual ?? [], report,
         manualTails: Object.fromEntries((checks?.manual ?? []).map((id) => [id, { candidate: checks!.checks.find((c) => c.id === id)?.outputTail ?? '', base: checks!.baseTails?.[id] ?? '' }])) })
       const argv = claudeArgs(this.cfg, { role: 'review', model: att.model, sessionId: att.session_id, resume: false, out: null, schema: VERDICT_SCHEMA })
-      const { info, child } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd: wt.path, hqDir: hq, outDir: null, prompt, sessionId: att.session_id,
-        sandbox: this.sandboxFor(wt.path, null, t.project),
+      gate()
+      const { info, child, exit } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd: wt.path, hqDir: hq, outDir: null, prompt, sessionId: att.session_id,
+        sandbox: this.sandboxFor(wt.path, null, t.project), proceed: () => !this.startBlocker(attemptId, 'reviewing'),
         spec: { attemptId, kind: 'review', model: att.model, head_sha: t.head_sha, base_sha: t.base_sha, worktree: wt.path, generation: att.generation, startedAt: this.iso() } })
       const startedAt = this.iso()
       this.store.updateAttempt(attemptId, { status: 'running', pid: info.pid, lstart: info.lstart, started_at: startedAt })
-      this.track({ ...att, status: 'running' }, info.pid, info.lstart, info.startedAt, child)
+      this.track({ ...att, status: 'running' }, info.pid, info.lstart, info.startedAt, { child, exit })
     } catch (e) {
       await removeMirrorWorktree(mirror, path).catch(() => {})
-      this.startFailed(att, e instanceof Setup ? e.message : `검토 시작 실패: ${String(e)}`)
+      const aborted = e instanceof StartAborted ? e : e instanceof LaunchAborted ? this.startBlocker(attemptId, 'reviewing') : null
+      if (aborted) this.startAborted(att, aborted)
+      else this.startFailed(att, e instanceof Setup ? e.message : `검토 시작 실패: ${String(e)}`)
     }
   }
 
@@ -1102,9 +1267,16 @@ export class Runner {
       for (const m of this.store.mergeRows(r.id)) {
         if (m.state !== 'pending') continue
         const k = `${r.id}:${m.project}`
-        if (this.integrating.has(k)) continue
+        if (this.integrating.has(k) || !this.jobReady(`integrate:${k}`)) continue
         this.integrating.add(k)
-        this.bg(this.runIntegration(r.id, m.project).finally(() => this.integrating.delete(k)))
+        const job = this.runIntegration(r.id, m.project).catch((e) => {
+          // Thrown (not a judged failure): back to pending so it is retried after the backoff.
+          this.store.tx(() => { if (this.store.mergeRow(r.id, m.project)?.state === 'integrating') this.store.putMerge(r.id, m.project, { state: 'pending' }) })
+          throw e
+        })
+        this.bg(job.finally(() => this.integrating.delete(k)), `integrate:${k}`, (e) => {
+          if (['executing', 'accepted'].includes(this.store.request(r.id)?.status ?? '')) this.integrationFailed(r.id, m.project, 'failed', JOB_FAILING, `${JOB_FAILING}\n${String(e).slice(0, 500)}`, [])
+        })
       }
     }
   }
@@ -1117,21 +1289,19 @@ export class Runner {
     const tasks = this.store.tasks(requestId).filter((t) => t.project === projectId && t.role === 'implement' && t.status === 'passed')
     const hq = join(this.home, 'runs', requestId, `_integration-${projectId}`, 'hq')
     mkdirSync(hq, { recursive: true })
-    const fail = (state: string, note: string, body: string, taskIds: string[], known: KnownOffer | null = null) => this.store.tx(() => {
-      this.store.putMerge(requestId, projectId, { state, note, diagnosis: null })
-      this.store.set(`integration.tasks:${requestId}:${projectId}`, JSON.stringify(taskIds))
-      this.store.set(knownKey(requestId, projectId), known ? JSON.stringify(known) : null)
-      const r = this.store.request(requestId)!
-      if (!TERMINAL_REQUEST.has(r.status)) this.store.updateRequest(requestId, { status: 'blocked', note })
-      this.store.putApproval({ id: `integration:${requestId}:${projectId}`, teamId: 'hq', subjectId: requestId, title: `통합 문제: ${project.name}`,
-        body, options: known ? [...INTEGRATION_OPTIONS, ACCEPT_KNOWN] : INTEGRATION_OPTIONS, subjectHash: sha256(`${requestId}:${projectId}:${note}:${known?.sha ?? ''}:${this.now()}`) })
-    })
+    const fail = (state: string, note: string, body: string, taskIds: string[], known: KnownOffer | null = null) => { if (wanted()) this.integrationFailed(requestId, projectId, state, note, body, taskIds, known) }
+    // The request must still want this integration before anything is spawned or recorded (F08).
+    const wanted = () => {
+      const st = this.store.request(requestId)?.status
+      return !!st && !TERMINAL_REQUEST.has(st) && st !== 'merging' && this.store.mergeRow(requestId, projectId)?.state === 'integrating'
+    }
     const target = await currentBranch(project.path)
     if (!target) { fail('failed', `프로젝트 ${project.name} checkout이 브랜치가 아니라서(detached HEAD) 통합할 대상이 없어요`, '프로젝트 checkout을 브랜치로 되돌린 뒤 다시 통합하세요.', []); return }
     const mirror = this.mirror(projectId)
     try { await ensureMirror(project, mirror) } catch (e) { fail('failed', `미러 갱신 실패: ${String(e).slice(0, 200)}`, String(e).slice(0, 500), []); return }
     const eff = tasks.map((t) => ({ t, e: this.effectiveChecks(t, `${t.key}.`) }))
     const path = this.integrationDir(requestId, projectId)
+    if (!wanted()) return
     const p = this.procTracker('integration')
     let res
     try {
@@ -1139,6 +1309,7 @@ export class Runner {
         setup: project.setup ?? null, checks: eff.flatMap((x) => x.e.checks), timeoutMs: this.cfg.checkTimeoutMinutes * 60_000,
         sandbox: this.sandboxFor(path, null, projectId), profilePath: join(hq, 'checks.sb'), onSpawn: p.onSpawn })
     } finally { p.done() }
+    if (!wanted()) return
     if (res.kind !== 'conflict' && res.checks) atomicJson(join(hq, 'checks.json'), res.checks)
     if (res.kind === 'conflict') {
       const who = tasks.find((t) => t.id === res.taskId)
@@ -1163,6 +1334,20 @@ export class Runner {
     this.store.tx(() => {
       this.store.putMerge(requestId, projectId, { state: 'integrated', target, target_sha: res.targetSha, integration_sha: res.sha, note: prevNote })
       if (this.store.request(requestId)?.status === 'accepted') this.offerMerge(requestId, projectId)
+    })
+  }
+
+  /** Records a failed integration and opens its card (the request stops unless it already ended). */
+  private integrationFailed(requestId: string, projectId: string, state: string, note: string, body: string, taskIds: string[], known: KnownOffer | null = null): void {
+    const project = this.project(projectId)!
+    this.store.tx(() => {
+      this.store.putMerge(requestId, projectId, { state, note, diagnosis: null })
+      this.store.set(`integration.tasks:${requestId}:${projectId}`, JSON.stringify(taskIds))
+      this.store.set(knownKey(requestId, projectId), known ? JSON.stringify(known) : null)
+      const r = this.store.request(requestId)!
+      if (!TERMINAL_REQUEST.has(r.status)) this.store.updateRequest(requestId, { status: 'blocked', note })
+      this.store.putApproval({ id: `integration:${requestId}:${projectId}`, teamId: 'hq', subjectId: requestId, title: `통합 문제: ${project.name}`,
+        body, options: known ? [...INTEGRATION_OPTIONS, ACCEPT_KNOWN] : INTEGRATION_OPTIONS, subjectHash: sha256(`${requestId}:${projectId}:${note}:${known?.sha ?? ''}:${this.now()}`) })
     })
   }
 
@@ -1389,8 +1574,8 @@ export class Runner {
     const tasks = this.store.tasks(requestId)
     for (const t of tasks) if (t.status !== 'passed' && t.status !== 'cancelled') this.store.updateTask(t.id, { status: 'cancelled', generation: t.generation + 1 })
     for (const a of this.store.liveAttempts()) if (tasks.some((t) => t.id === a.task_id)) {
+      // pollLive signals the group once its identity is confirmed (SIGTERM, SIGKILL after the grace period).
       this.store.updateAttempt(a.id, { outcome: 'cancelled', reason: '요청 중단' })
-      if (a.pid) { const pid = a.pid; queueMicrotask(() => { killGroup(pid, 'SIGTERM'); setTimeout(() => killGroup(pid, 'SIGKILL'), KILL_GRACE_MS).unref() }) }
     }
     for (const a of this.store.openApprovals(0)) {
       if (a.id === `plan:${requestId}` || a.id === `accept:${requestId}` || a.id.startsWith(`merge:${requestId}:`) || a.id.startsWith(`integration:${requestId}:`)
@@ -1475,10 +1660,10 @@ export class Runner {
   private async reviseOne(): Promise<void> {
     if (!this.canStartCeo()) return
     const t = this.store.tasksByStatus(['revising']).find((x) => !this.revising.has(x.id) && this.store.approval(`revise:${x.id}`)?.state !== 'open'
-      && this.store.request(x.request_id)?.status === 'executing')
+      && this.store.request(x.request_id)?.status === 'executing' && this.jobReady(`revise:${x.id}`))
     if (!t || !this.ceoLock.tryAcquire()) return
     this.revising.add(t.id)
-    this.bg(this.runRevise(t).finally(() => { this.revising.delete(t.id); this.ceoLock.release() }))
+    this.bg(this.runRevise(t).finally(() => { this.revising.delete(t.id); this.ceoLock.release() }), `revise:${t.id}`, this.blockOnFailure(t.id, t.generation))
   }
 
   private async runRevise(t: TaskRow): Promise<void> {
@@ -1491,6 +1676,9 @@ export class Runner {
     const stat = fetched && t.base_sha ? (await hqGit(this.mirror(t.project), null, ['diff', '--stat', '--no-ext-diff', '--no-textconv', t.base_sha, fetched])).stdout : ''
     // Answers the chairman gave to this revision's CEO questions (F16) go back into the turn.
     const answers = this.reviseQuestions(t).filter((q) => q.answer !== null).map((q) => ({ question: q.question, answer: q.answer! }))
+    // Right before the CEO turn is spawned: still revising this generation of an executing request (F08).
+    const now = this.store.task(t.id)
+    if (!now || now.status !== 'revising' || now.generation !== t.generation || this.store.request(t.request_id)?.status !== 'executing') return
     this.store.updateTask(t.id, { revise_turns: t.revise_turns + 1 })
     const res = await runReviseTurn({ claudeBin: this.cfg.claudeBin, hqRoot: this.hqRoot, project, projects: this.projects, requestText: r.text, task: spec, report, diffStat: stat, answers,
       onLine: (line) => { if (line.type === 'rate_limit_event') this.observe(line) } })
@@ -1534,7 +1722,7 @@ export class Runner {
     const plan = this.store.tasks(t.request_id).map((x) => (x.id === t.id ? rev : specOf(x)))
     const problem = reviseProblem(specOf(t), rev) ?? validateTasks(plan, this.projects)
     if (problem) { this.block(t, `지시서 수정안이 유효하지 않아요: ${problem}`); return null }
-    for (const a of this.store.liveAttempts()) if (a.task_id === t.id) { this.store.updateAttempt(a.id, { outcome: 'superseded' }); if (a.pid) { const pid = a.pid; queueMicrotask(() => killGroup(pid, 'SIGTERM')) } }
+    for (const a of this.store.liveAttempts()) if (a.task_id === t.id) this.store.updateAttempt(a.id, { outcome: 'superseded' }) // pollLive signals it
     this.store.updateTask(taskId, { spec: JSON.stringify(rev), title: rev.title, grade: rev.grade, model: rev.model, review_model: reviewModelOf(rev),
       revision: t.revision + 1, generation: t.generation + 1, status: 'rework', resume_session: null, note: '지시서 수정 적용' })
     this.store.set(`revise:${taskId}`, null)
@@ -1547,14 +1735,21 @@ export class Runner {
   // ----- CEO diagnosis of blocked / integration items (§17) -----
   private async diagnoseOne(): Promise<void> {
     if (!this.canStartCeo() || this.ceoLock.busy) return
-    const t = this.store.tasksByStatus(['blocked']).find((x) => x.diagnosis === null && !this.diagnosing.has(x.id))
+    const t = this.store.tasksByStatus(['blocked']).find((x) => x.diagnosis === null && !this.diagnosing.has(x.id) && this.jobReady(`diagnose:${x.id}`))
     const m = t ? null : this.store.requestsByStatus(['blocked', 'executing', 'accepted']).flatMap((r) => this.store.mergeRows(r.id))
-      .find((x) => ['conflict', 'failed'].includes(x.state) && x.diagnosis === null && !this.diagnosing.has(`${x.request_id}:${x.project}`))
+      .find((x) => ['conflict', 'failed'].includes(x.state) && x.diagnosis === null && !this.diagnosing.has(`${x.request_id}:${x.project}`)
+        && this.jobReady(`diagnose:${x.request_id}:${x.project}`))
     if ((!t && !m) || !this.ceoLock.tryAcquire()) return
     const key = t ? t.id : `${m!.request_id}:${m!.project}`
     this.diagnosing.add(key)
     const job = t ? this.diagnoseTask(t) : this.diagnoseIntegration(m!.request_id, m!.project)
-    this.bg(job.finally(() => { this.diagnosing.delete(key); this.ceoLock.release() }))
+    // Giving up stores the failed-diagnosis marker, so the item keeps hq's own explanation and the turn stops retrying.
+    const marker = JSON.stringify({ ok: false, error: JOB_FAILING })
+    const giveUp = () => this.store.tx(() => {
+      if (t) { const cur = this.store.task(t.id); if (cur?.status === 'blocked' && cur.diagnosis === null) this.store.updateTask(t.id, { diagnosis: marker }) }
+      else { const cur = this.store.mergeRow(m!.request_id, m!.project); if (cur && cur.diagnosis === null) this.store.putMerge(m!.request_id, m!.project, { diagnosis: marker }) }
+    })
+    this.bg(job.finally(() => { this.diagnosing.delete(key); this.ceoLock.release() }), `diagnose:${key}`, giveUp)
   }
 
   private checksEvidence(file: ChecksFile | null): string {
@@ -1645,7 +1840,7 @@ export class Runner {
 
   /** Adopts a recovered process (used by reconcile.recover). */
   async adopt(att: AttemptRow, pid: number): Promise<void> {
-    const lstart = await psLstart(pid)
+    const lstart = await Promise.resolve().then(() => this.probe.lstart(pid)).catch(() => null)
     this.store.updateAttempt(att.id, { status: 'running', pid, lstart, started_at: att.started_at ?? this.iso() })
     this.track(this.store.attempt(att.id)!, pid, lstart, att.started_at ?? this.iso(), null)
   }

@@ -48,24 +48,80 @@ export function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM' }
 }
 
-/** Alive and the same process we started: pid reuse is ruled out by the recorded start time. */
-export async function sameProcessAlive(pid: number, lstart: string | null, startedAt: string | null, ps: PsLstart = psLstart): Promise<boolean> {
-  if (!pidAlive(pid)) return false
+/**
+ * Who owns a pid now (§7, §22):
+ * - `same`: alive and its start time equals the recorded one — the process we started.
+ * - `gone`: no process with this pid.
+ * - `other`: alive with a different start time — the pid was reused.
+ * - `unknown`: alive but a start time is missing on either side (ps unavailable, or never recorded).
+ * Only `same` may be signalled. There is no liveness-only fallback: alive alone never means ours.
+ */
+export type Identity = 'same' | 'gone' | 'other' | 'unknown'
+
+export async function identify(pid: number, lstart: string | null, ps: PsLstart = psLstart): Promise<Identity> {
+  if (!pidAlive(pid)) return 'gone'
   const now = await safeLstart(ps, pid)
-  // ps failed (or the process just exited): weaker check, kill(pid, 0) liveness only — pid reuse is not ruled out.
-  if (!now) return pidAlive(pid)
-  if (lstart) return now === lstart
-  return !!startedAt && Math.abs(Date.parse(now) - Date.parse(startedAt)) <= 2_000
+  if (!now) return pidAlive(pid) ? 'unknown' : 'gone'
+  if (!lstart) return 'unknown'
+  return now === lstart ? 'same' : 'other'
 }
 
-export function killGroup(pid: number, sig: NodeJS.Signals): void {
-  try { process.kill(-pid, sig) } catch { try { process.kill(pid, sig) } catch { /* gone */ } }
+/** Pids whose process group id is `pgid`, or null when ps cannot run (never rejects). */
+export function psGroupMembers(pgid: number): Promise<number[] | null> {
+  return new Promise((resolve) => {
+    try {
+      execFile('ps', ['-axo', 'pid=,pgid='], { env: { ...process.env, LC_ALL: 'C' }, maxBuffer: 16 * 1024 * 1024 }, (err, out) => {
+        if (err) return resolve(null)
+        const pids: number[] = []
+        for (const line of String(out).split('\n')) {
+          const [p, g] = line.trim().split(/\s+/).map(Number)
+          if (p > 0 && g === pgid) pids.push(p)
+        }
+        resolve(pids)
+      })
+    } catch { resolve(null) }
+  })
 }
 
-/** SIGTERM the whole process group now and SIGKILL it after the grace period (§7.4). */
-export function terminateGroup(pid: number, graceMs = 10_000): void {
-  killGroup(pid, 'SIGTERM')
-  setTimeout(() => killGroup(pid, 'SIGKILL'), graceMs).unref()
+/** How identity is observed; tests inject failing or swapped probes. */
+export interface Probe { lstart: PsLstart; members: (pgid: number) => Promise<number[] | null> }
+export const defaultProbe: Probe = { lstart: psLstart, members: psGroupMembers }
+
+/**
+ * Identity of the process group led by `pid`. When the leader is gone but members of its group remain, the group is
+ * still ours: the kernel never hands out a pid that is in use as a process group id. When the pid was reused (`other`),
+ * the old group was necessarily empty.
+ */
+export async function groupIdentity(pid: number, lstart: string | null, probe: Probe = defaultProbe): Promise<Identity> {
+  const id = await identify(pid, lstart, probe.lstart)
+  if (id !== 'gone') return id
+  let members: number[] | null
+  try { members = await probe.members(pid) } catch { members = null }
+  if (members === null) return 'unknown'
+  return members.length ? 'same' : 'gone'
+}
+
+/** Signals the process group `-pid` only; never a bare pid (a failed group kill is not retried on the pid). */
+export function killGroup(pid: number, sig: NodeJS.Signals): boolean {
+  if (!(pid > 1)) return false
+  try { process.kill(-pid, sig); return true } catch { return false }
+}
+
+/** Signals the group only when it is confirmed ours (`same`); returns the identity it saw. */
+export async function signalGroup(pid: number, lstart: string | null, sig: NodeJS.Signals, probe: Probe = defaultProbe): Promise<Identity> {
+  const id = await groupIdentity(pid, lstart, probe)
+  if (id === 'same') killGroup(pid, sig)
+  return id
+}
+
+/**
+ * SIGTERM the whole process group now and SIGKILL it after the grace period (§7.4) — each only while the group is
+ * confirmed ours; identity is checked again right before the SIGKILL.
+ */
+export async function terminateGroup(pid: number, lstart: string | null, graceMs = 10_000, probe: Probe = defaultProbe): Promise<Identity> {
+  const id = await signalGroup(pid, lstart, 'SIGTERM', probe)
+  if (id === 'same') setTimeout(() => { void signalGroup(pid, lstart, 'SIGKILL', probe) }, graceMs).unref()
+  return id
 }
 
 /** A process still running this session (started before hq could record its pid). §7.3 */
@@ -78,13 +134,44 @@ export function findOrphan(sessionId: string): Promise<number | null> {
   return probe('--session-id').then((p) => p ?? probe('--resume'))
 }
 
-export interface Launched { info: ProcessInfo; child: ChildProcess }
+/** Exit of a spawned child, observed from spawn time on (a fast exit before tracking starts is never missed). */
+export interface ExitWatch {
+  exited: boolean
+  code: number | null
+  signal: NodeJS.Signals | null
+  /** Runs `cb` once the child has exited (immediately when it already has). */
+  onExit(cb: () => void): void
+}
+
+/** Watches a child from now on; also reads exitCode/signalCode in case the exit happened before the listener. */
+export function watchExit(child: ChildProcess): ExitWatch {
+  const cbs: (() => void)[] = []
+  const w: ExitWatch = {
+    exited: false, code: null, signal: null,
+    onExit(cb) { if (w.exited) cb(); else cbs.push(cb) },
+  }
+  const done = (code: number | null, signal: NodeJS.Signals | null) => {
+    if (w.exited) return
+    w.exited = true; w.code = code; w.signal = signal
+    for (const cb of cbs.splice(0)) cb()
+  }
+  child.once('exit', done)
+  child.once('close', (code, signal) => done(code, signal))
+  if (child.exitCode !== null || child.signalCode !== null) done(child.exitCode, child.signalCode as NodeJS.Signals | null)
+  return w
+}
+
+export interface Launched { info: ProcessInfo; child: ChildProcess; exit: ExitWatch }
+
+/** Thrown by launch() when `proceed` says the attempt must not start any more (nothing was spawned). */
+export class LaunchAborted extends Error {}
 
 /**
  * Writes prompt.md, spec.json and the sandbox profile into hq/, spawns the CLI inside the sandbox
  * as its own process group, and records process.json atomically. Throws when the process cannot start.
+ * `proceed` is asked right before the spawn (there is no await between the two); false → LaunchAborted, nothing spawned.
  */
-export async function launch(o: { claudeBin: string; argv: string[]; cwd: string; hqDir: string; outDir: string | null; prompt: string; sessionId: string; spec: object; sandbox: SandboxOpts }, ps: PsLstart = psLstart): Promise<Launched> {
+export async function launch(o: { claudeBin: string; argv: string[]; cwd: string; hqDir: string; outDir: string | null; prompt: string; sessionId: string; spec: object; sandbox: SandboxOpts; proceed?: () => boolean }, ps: PsLstart = psLstart): Promise<Launched> {
   mkdirSync(o.hqDir, { recursive: true })
   if (o.outDir) mkdirSync(o.outDir, { recursive: true })
   atomicWrite(join(o.hqDir, 'prompt.md'), o.prompt)
@@ -92,23 +179,28 @@ export async function launch(o: { claudeBin: string; argv: string[]; cwd: string
   atomicWrite(profile, sandboxProfile(o.sandbox))
   const argv = wrap([o.claudeBin, ...o.argv], profile)
   atomicJson(join(o.hqDir, 'spec.json'), { argv: argv.map((a) => (a.length > 2000 ? a.slice(0, 2000) + '…' : a)), cwd: o.cwd, ...o.spec })
+  if (o.proceed && !o.proceed()) throw new LaunchAborted('시작 전에 취소됨')
   const cacheDir = makeCacheDir()
   const env = childEnv({ ...cacheEnv(cacheDir), ...(o.outDir ? { HQ_ATTEMPT_OUT: o.outDir } : {}) })
   const fin = openSync(join(o.hqDir, 'prompt.md'), 'r')
   const fout = openSync(join(o.hqDir, 'stream.jsonl'), 'a')
   const ferr = openSync(join(o.hqDir, 'stderr.log'), 'a')
   let child: ChildProcess
-  try { child = spawn(argv[0], argv.slice(1), { cwd: o.cwd, env, detached: true, stdio: [fin, fout, ferr] }) } finally { closeSync(fin); closeSync(fout); closeSync(ferr) }
+  let exit: ExitWatch
+  try {
+    child = spawn(argv[0], argv.slice(1), { cwd: o.cwd, env, detached: true, stdio: [fin, fout, ferr] })
+    exit = watchExit(child)
+  } finally { closeSync(fin); closeSync(fout); closeSync(ferr) }
   const pid = await new Promise<number>((resolve, reject) => {
     if (child.pid) { child.once('error', () => {}); return resolve(child.pid) }
     child.once('error', reject)
   }).catch((e) => { removeCacheDir(cacheDir); throw e })
   child.unref()
   // ps may be unavailable (e.g. setuid exec denied inside a sandbox); the worker is already running and must be tracked.
-  // A null lstart falls back to startedAt in sameProcessAlive.
-  const info: ProcessInfo = { pid, startedAt: new Date().toISOString(), sessionId: o.sessionId, lstart: await safeLstart(ps, pid), cacheDir }
+  // A null lstart makes its identity `unknown` after the handle is gone (e.g. after a restart): never signalled.
+  const info: ProcessInfo = { pid, startedAt: new Date().toISOString(), sessionId: o.sessionId, lstart: exit.exited ? null : await safeLstart(ps, pid), cacheDir }
   atomicJson(join(o.hqDir, 'process.json'), info)
-  return { info, child }
+  return { info, child, exit }
 }
 
 /** Deletes a per-launch cache folder; anything that is not one (see isCacheDir) is left alone. */
