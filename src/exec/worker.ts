@@ -75,7 +75,7 @@ export async function launch(o: { claudeBin: string; argv: string[]; cwd: string
   if (o.outDir) mkdirSync(o.outDir, { recursive: true })
   atomicWrite(join(o.hqDir, 'prompt.md'), o.prompt)
   const profile = join(o.hqDir, 'sandbox.sb')
-  atomicWrite(profile, sandboxProfile({ ...o.sandbox, stdioFiles: ['prompt.md', 'stream.jsonl', 'stderr.log'].map((f) => join(o.hqDir, f)) }))
+  atomicWrite(profile, sandboxProfile(o.sandbox))
   const argv = wrap([o.claudeBin, ...o.argv], profile)
   atomicJson(join(o.hqDir, 'spec.json'), { argv: argv.map((a) => (a.length > 2000 ? a.slice(0, 2000) + '…' : a)), cwd: o.cwd, ...o.spec })
   const env = childEnv(o.outDir ? { HQ_ATTEMPT_OUT: o.outDir } : {})
