@@ -107,6 +107,9 @@ hq projects add ~/code/web --setup "npm ci --prefer-offline"
 ### 환경 변수 (CLI)
 `HQ_HOME`, `HQ_PORT`(기본 7777), `HQ_TOKEN_FILE`(기본 `~/.config/hq/token`), `HQ_LAUNCH_AGENTS_DIR`(기본 `~/Library/LaunchAgents`), `HQ_DRY_RUN=1`(launchctl·open·빌드를 실행하지 않고 출력만).
 
+### 펫 말풍선 글자 크기
+`~/.config/hq/pet.json`에 `{"bubbleFontSize": 12}` 형식으로 씁니다. 기본값은 10이고 범위는 8~24입니다. 파일이나 키가 없으면 10을 쓰고, 값이 잘못되었거나 JSON이 깨져 있으면 10을 쓰면서 로그에 `pet.json:` 경고를 남깁니다. 펫을 다시 켜야 반영되며, 파일 경로는 `HQ_PET_CONFIG`로 바꿀 수 있습니다.
+
 ## 6. 문제 해결 (`hq doctor` 항목별)
 | 항목 | 상태 | 해결 |
 | --- | --- | --- |
