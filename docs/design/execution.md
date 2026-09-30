@@ -79,10 +79,11 @@ schema_version: pragma user_version
 - 읽기·쓰기 거부: `~/.config/hq`, `$HQ_HOME` 전체 — 단 자기 worktree·자기 `out/`은 허용(뒤 규칙 우선).
 - 쓰기 허용 목록 외 전부 거부: 자기 worktree, 자기 `out/`, 프로젝트 repo의 `.git`(worktree 커밋에 필요), `~/.claude`, `~/.claude.json*`, `/private/tmp`, `/private/var/folders`, `/dev`, `sandbox.extraWritable`.
 - 네트워크: `localhost:<hq port>`·`127.0.0.1:<hq port>` 거부.
+- 예외: 자기 시도의 `hq/prompt.md`·`hq/stream.jsonl`·`hq/stderr.log`는 **메타데이터 읽기만** 허용(stdio로 연결된 파일을 Node가 시작 때 stat함; 내용 읽기·쓰기는 여전히 거부).
 - 환경변수 허용 목록만 전달: `PATH HOME USER LANG LC_ALL TERM TMPDIR SHELL`, `HQ_ATTEMPT_OUT`, git 보조(`GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_COUNT/KEY/VALUE`로 `remote.pushDefault`·`push.default=nothing`). `HQ_TOKEN`·API 키·`SSH_AUTH_SOCK` 제거.
 - **알려진 한계(문서화)**: 공유 `.git`에 쓸 수 있으므로 작업자가 다른 브랜치 ref를 바꿀 수 있다 → hq는 브랜치 이름이 아니라 **기록한 SHA**로만 검증·통합·병합한다(§12).
 - 권한 플래그(가드레일): 모든 역할에 `--tools <목록>`(사용 가능 도구 자체 제한) + `--setting-sources "" --strict-mcp-config --disable-slash-commands`.
-  - implement: `--tools Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch --permission-mode acceptEdits --add-dir <out>`
+  - implement: `--tools Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch --allowedTools Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch --permission-mode acceptEdits --add-dir <out>` (`--allowedTools` 없이는 `git commit`이 승인 대기로 거부됨을 실측. 경계는 샌드박스)
   - collect: `--tools Read,Glob,Grep,WebFetch,WebSearch,Write --permission-mode dontAsk --allowedTools Read,Glob,Grep,WebFetch,WebSearch,Write(//<out 절대경로>/**)` (cwd = base의 detached worktree)
   - review: `--tools Bash,Read,Glob,Grep --permission-mode dontAsk --allowedTools Bash,Read,Glob,Grep --json-schema <VERDICT>`
 - 실행: `--output-format stream-json --verbose --model <m> --session-id <uuid>|--resume <uuid> --max-turns <n>`. stdin = prompt 파일, stdout/stderr = `hq/` 로그 파일, `detached: true`(자기 프로세스 그룹).
@@ -130,11 +131,12 @@ schema_version: pragma user_version
 - 자동 적용 조건: `key·project·role` 동일, `owns`가 원래의 부분집합, acceptance check 명령 집합 동일. 그 밖은 카드 `revise:<taskId>`(수정 전후 diff 표시).
 - 적용 시 task `revision+1`, 이 작업에 의존하는 후행 작업 무효화(§11).
 - task당 최대 2회, 초과 → `blocked`.
+- 수정 턴이 질문을 내면(v2 단계): task `blocked`, 질문은 note와 결정 카드 진단에 표시. 회장의 retry/skip/stop으로 진행.
 
 ## 11. 재작업·의존·무효화
 - 실패(`failed`, `runaway`, 검사 실패, 검토 blocking, 결과 반려) 시 `attempts < maxAttempts`면 재작업: 2번째는 같은 모델, 3번째는 ladder 한 단계 위. 도달 → `blocked`("N번 실패", N = 실제 횟수).
 - **작업별 base**: 같은 프로젝트 의존이 없으면 요청 base(승인 시점 프로젝트 HEAD), 하나면 그 `head_sha`, 여럿이면 hq가 worktree에서 의존 head들을 `--no-ff` 병합한 커밋(충돌 → `blocked`). owns·diff·검토는 모두 이 `base_sha` 기준.
-- 다른 프로젝트 의존·collect 의존: 봉인된 산출물(보고서 경로·해시, 선행 head SHA)을 프롬프트로 전달.
+- 다른 프로젝트 의존·collect 의존: 봉인된 보고서 **내용**(20KB 상한, 넘으면 앞부분+잘림 표시)과 sha256, 선행 head SHA를 프롬프트에 넣어 전달(작업자는 `$HQ_HOME`을 읽을 수 없음).
 - **무효화**: `passed` 작업의 `head_sha`가 바뀌면(재작업·수정·반려) 그 작업에 전이적으로 의존하는 모든 작업을 `pending`으로 되돌리고 worktree·브랜치를 폐기(브랜치는 `hq/<req>/<key>-v<n>`로 보관), attempts 0, 이전 검증·검토 무효. 수락 카드가 열려 있으면 superseded.
 
 ## 12. 수락·통합·병합
