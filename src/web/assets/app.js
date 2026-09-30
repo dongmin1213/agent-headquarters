@@ -1,7 +1,7 @@
 // HQ web detail UI ("자세히 보기"). Vanilla JS, no dependencies.
 // Security: every piece of data reaches the DOM through textContent / text nodes / setAttribute — never as HTML.
 import {
-  ATTEMPT_STATUS, DECISION_KIND, QUOTA_MODE, REQUEST_STATUS, TASK_GROUPS, TASK_STATUS, blockedDecision, formatClock, formatCost, formatDuration,
+  ATTEMPT_STATUS, DECISION_KIND, QUOTA_MODE, REQUEST_STATUS, TASK_GROUPS, TASK_STATUS, BLOCKED_LABEL, formatClock, formatCost, formatDuration,
   formatRelative, parseDiff, percent, renderMarkdown, shortSha, statusInfo, windowLabel,
 } from './lib.js'
 
@@ -348,8 +348,10 @@ function decisionCard(d) {
       : (answer) => post(`/tasks/${enc(d.taskId ?? '')}/answer`, { questionId: d.id, answer, revision: d.revision }, '답변을 보냈어요')
     actions.push(...answerControls(key, opts, busy, send))
   } else if (d.kind === 'blocked') {
-    opts.forEach((opt, i) => {
-      const decision = blockedDecision(opt)
+    // Options are wire values (retry|skip|stop); unknown values are shown but cannot be sent.
+    opts.forEach((decision, i) => {
+      const label = BLOCKED_LABEL[decision] ?? decision
+      const known = decision in BLOCKED_LABEL
       const ck = `${key}:stop`
       if (decision === 'stop' && ui.confirm.has(ck)) {
         actions.push(h('span', { class: 'confirm' },
@@ -358,13 +360,13 @@ function decisionCard(d) {
         return
       }
       actions.push(h('button', {
-        class: `btn ${decision === 'retry' ? 'btn-primary' : decision === 'stop' ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy || !decision || !d.taskId,
-        title: decision ? null : '이 선택지를 처리할 수 없어요 (알 수 없는 결정)', 'data-fkey': `opt:${key}:${i}`,
+        class: `btn ${decision === 'retry' ? 'btn-primary' : decision === 'stop' ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy || !known || !d.taskId,
+        title: known ? null : '알 수 없는 결정이라 보낼 수 없어요', 'data-fkey': `opt:${key}:${i}`,
         onclick: () => {
           if (decision === 'stop') { ui.confirm.add(ck); rerenderDecisions(); document.querySelector(`[data-fkey="stopyes:${CSS.escape(key)}"]`)?.focus(); return }
-          post(`/tasks/${enc(d.taskId ?? '')}/decide`, { decision, revision: d.revision }, `${opt} — 보냈어요`)
+          post(`/tasks/${enc(d.taskId ?? '')}/decide`, { decision, revision: d.revision }, `${label} — 보냈어요`)
         },
-      }, busy ? '보내는 중…' : opt))
+      }, busy ? '보내는 중…' : label))
     })
   } else if (d.kind === 'accept' && ui.rejectOpen.has(key)) {
     const dk = `reason:${key}`

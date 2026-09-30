@@ -255,7 +255,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
       kind: 'worker_question' as const, id: q.id, revision: t.revision, requestId: t.requestId, taskId: t.id, title: q.question, detail: `${t.title} · 기본값: ${q.default}`, options: q.options, subjectHash: null, createdAt: t.updatedAt })))
     const blocked: DecisionItem[] = allTasks().filter((t) => t.status === 'blocked').map((t) => ({
       kind: 'blocked' as const, id: t.id, revision: t.revision, requestId: t.requestId, taskId: t.id, title: `작업 "${t.title}"이 막혔어요`, detail: t.note ?? '',
-      options: ['한 번 더 (최상위 모델)', '이 작업 취소하고 계속', '요청 중단'], subjectHash: null, createdAt: t.updatedAt }))
+      options: ['retry', 'skip', 'stop'], subjectHash: null, createdAt: t.updatedAt }))
     return [...fromApproval('plan:', 'plan'), ...ceoQ, ...workerQ, ...fromApproval('revise:', 'revise'), ...blocked, ...fromApproval('integration:', 'integration'),
       ...fromApproval('accept:', 'accept'), ...fromApproval('merge:', 'merge')]
   }

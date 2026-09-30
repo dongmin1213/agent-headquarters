@@ -188,18 +188,8 @@ export const DECISION_KIND = {
   plan: ['계획 승인', 'info'], ceo_question: ['사장 질문', 'warn'], worker_question: ['작업자 질문', 'warn'], revise: ['지시서 수정 승인', 'warn'],
   blocked: ['회로 차단', 'bad'], integration: ['통합 실패', 'bad'], accept: ['결과 수락', 'ok'], merge: ['병합 승인', 'info'],
 }
-/**
- * Maps a `blocked` card's button label to the /decide value. The contract leaves the labels free, so accept the raw values
- * and the Korean labels from execution.md; anything else returns null and the button stays disabled.
- */
-export function blockedDecision(label) {
-  const s = String(label ?? '').trim()
-  if (s === 'retry' || s === 'skip' || s === 'stop') return s
-  if (/한 번 더|다시 시도|재시도/.test(s)) return 'retry'
-  if (/취소하고 계속|건너뛰|이 작업 취소/.test(s)) return 'skip'
-  if (/요청 중단|중단/.test(s)) return 'stop'
-  return null
-}
+/** Fixed display labels for `blocked` card options, which are wire values retry|skip|stop (execution.md §17). */
+export const BLOCKED_LABEL = { retry: '한 번 더 (최상위 모델)', skip: '이 작업 건너뛰기', stop: '요청 중단' }
 /** Board columns, in order. */
 export const TASK_GROUPS = [
   { id: 'wait', label: '대기', statuses: ['pending', 'rework', 'revising', 'held'] },
