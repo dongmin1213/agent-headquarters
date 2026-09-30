@@ -81,7 +81,7 @@ test('diff parsing counts lines per file and flags binary/new files', () => {
 })
 
 test('labels and formatting', () => {
-  assert.deepEqual(lib.BLOCKED_LABEL, { retry: '한 번 더 (최상위 모델)', skip: '이 작업 건너뛰기', stop: '요청 중단' })
+  assert.deepEqual(lib.BLOCKED_LABEL, { retry: '한 번 더', skip: '이 작업 건너뛰기', stop: '요청 중단' })
   assert.equal(lib.windowLabel('five_hour'), '5시간')
   assert.equal(lib.windowLabel('some_new_window'), 'some_new_window')
   for (const m of ['normal', 'save', 'hold', 'unobserved']) assert.ok(lib.QUOTA_MODE[m], m)

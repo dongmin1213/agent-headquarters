@@ -244,7 +244,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
   /** The daemon builds this list (execution.md §17); the mock mirrors its order: plan → ceo_question → worker_question → revise → blocked → integration → accept → merge. */
   type Explain = Pick<DecisionItem, 'situation' | 'cause' | 'causeConfirmed' | 'recommendation' | 'optionHelp' | 'detailPath'>
   const HELP: Record<string, string> = {
-    retry: '같은 작업을 최상위 모델로 한 번 더 해요 · 사용량이 들어요',
+    retry: '같은 작업을 같은 모델로 한 번 더 해요 · 사용량이 들어요',
     skip: '이 작업과 여기에 의존하는 작업을 빼고 계속해요 · 나중에 새 요청으로 다시 할 수 있어요',
     stop: '요청 전체를 멈춰요 · 만든 브랜치는 남겨 둬요',
     수락: '통합본을 병합 대기로 넘겨요 · 병합은 따로 승인해요',
@@ -273,7 +273,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
       recommendation: { option: '승인', reason: '넓히는 범위가 src/exec/profiles/** 하나뿐이고 다른 작업과 겹치지 않아요' },
       help: { 승인: '고친 지시서로 작업을 이어가요', 반려: '원래 범위 안에서 다시 하게 해요' } },
     [`${R1}.recover`]: { situation: '재시작 복구 작업이 3번 시도했지만 끝났다는 표시(done.json)를 남기지 못했어요', cause: '작업자가 종료 코드 0으로 끝났지만 done.json을 쓰기 전에 프로세스가 끝난 것 같아요', causeConfirmed: false,
-      recommendation: { option: 'retry', reason: '실패 원인이 코드가 아니라 마무리 단계로 보여 최상위 모델이 한 번 더 하면 풀릴 가능성이 높아요' } },
+      recommendation: { option: 'retry', reason: '실패 원인이 코드가 아니라 마무리 단계로 보여 같은 모델로 한 번 더 하면 풀릴 가능성이 높아요' } },
     [`integration:${R5}:blog`]: { situation: 'blog 브랜치를 합치는 중에 충돌이 나고 검사가 실패했어요', cause: `src/list.ts가 두 작업에서 함께 바뀌었고 npm test가 종료 코드 1로 실패했어요 ${XSS}`, causeConfirmed: true,
       recommendation: { option: '다시 통합', reason: '충돌이 파일 하나뿐이라 순서를 바꿔 다시 합치면 풀릴 수 있어요' },
       help: { '다시 통합': '작업 순서를 바꿔 다시 합쳐요 · 사용량이 조금 들어요', '요청 중단': '요청 전체를 멈춰요 · 만든 브랜치는 남겨 둬요' } },
@@ -453,7 +453,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
         } else {
           if (t.status !== 'blocked' || !['retry', 'skip', 'stop'].includes(b.decision)) return send(res, 409, { error: '막힌 작업이 아니거나 알 수 없는 결정이에요' })
           t.status = b.decision === 'retry' ? 'pending' : 'cancelled'
-          t.note = b.decision === 'retry' ? '최상위 모델로 한 번 더' : '회장님 결정으로 취소'
+          t.note = b.decision === 'retry' ? '같은 모델로 한 번 더' : '회장님 결정으로 취소'
           if (b.decision === 'stop') { const r = requests.find((x) => x.id === t.requestId); if (r) r.status = 'cancelled' }
         }
         t.updatedAt = new Date().toISOString()
