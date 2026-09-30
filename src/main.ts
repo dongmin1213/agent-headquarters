@@ -51,7 +51,11 @@ mkdirSync(dirname(tokenPath), { recursive: true, mode: 0o700 })
 if (!existsSync(tokenPath)) { writeFileSync(tokenPath, randomBytes(24).toString('hex')); chmodSync(tokenPath, 0o600) }
 const token = readFileSync(tokenPath, 'utf8').trim()
 
-const teams = JSON.parse(readFileSync(resolve(root, 'config/teams.json'), 'utf8')) as TeamConfig[]
+// config/teams.json is machine-specific (gitignored: it points at private repos); fall back to the committed example.
+const teamsFile = ['config/teams.json', 'config/teams.example.json'].map((f) => resolve(root, f)).find(existsSync)!
+const tilde = (p: string) => p.replace(/^~(?=\/|$)/, homedir())
+const teams = (JSON.parse(readFileSync(teamsFile, 'utf8')) as TeamConfig[])
+  .map((t) => ({ ...t, cwd: resolve(root, tilde(t.cwd)), command: t.command.map(tilde) }))
 // config/projects.json is machine-specific (gitignored); fall back to the committed example.
 const projectsFile = ['config/projects.json', 'config/projects.example.json'].map((f) => resolve(root, f)).find(existsSync)!
 const projects = (JSON.parse(readFileSync(projectsFile, 'utf8')) as Project[]).map((p) => ({ ...p, path: p.path.replace(/^~(?=\/|$)/, homedir()) }))
