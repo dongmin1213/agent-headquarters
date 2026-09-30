@@ -8,14 +8,20 @@ import { atomicWrite } from './fsx.ts'
 import { hqGit, removeMirrorWorktree, SAFE_DIFF, verifyWorktree, wtGit, wtStatus, type MirrorWorktree } from './repos.ts'
 import { childEnv, sandboxProfile, wrap, type SandboxOpts } from './sandbox.ts'
 
-export interface CheckSpec { id: string; command: string; kind?: 'new' | 'regression' }
+/** `baseFailed`: a regression check that already failed on the base for an ordinary reason — still run; its failure alone does not fail the file. */
+export interface CheckSpec { id: string; command: string; kind?: 'new' | 'regression'; baseFailed?: boolean }
 export interface SecretHit { commit: string; file: string; line: number; pattern: string }
-export type CheckOutcome = CheckResult & { kind?: string }
+export type CheckOutcome = CheckResult & { kind?: string; baseFailed?: boolean }
 /**
  * `warnings`: new-kind checks that already passed on the base (they do not prove the new behaviour).
- * `manual`: regression checks that already failed on the base — not judged here, handed to the reviewer (§9).
+ * `manual`: regression checks that failed on the base and failed again on the candidate — handed to the reviewer (§9).
+ * `baseTails`: base output tail for each id in `manual`.
  */
-export interface ChecksFile { checks: CheckOutcome[]; secrets: SecretHit[]; pass: boolean; error: string | null; warnings?: string[]; manual?: string[] }
+export interface ChecksFile { checks: CheckOutcome[]; secrets: SecretHit[]; pass: boolean; error: string | null; warnings?: string[]; manual?: string[]; baseTails?: Record<string, string> }
+/** One check's result on the base (§9 baseline). `setupFailed`: the project setup failed, so the check never ran. */
+export interface BaseResult { pass: boolean; exitCode: number | null; timedOut: boolean; setupFailed?: boolean; tail: string }
+/** The base run says nothing about the code: setup failed, timed out, or the command could not be found/executed. */
+export const envFailure = (b: BaseResult): boolean => !!b.setupFailed || b.timedOut || b.exitCode === 126 || b.exitCode === 127
 /** Called with each spawned check process so a restart can kill leftover groups (§9). */
 export type OnSpawn = (pid: number) => void
 
@@ -42,7 +48,7 @@ class LineKeeper {
 }
 
 /** Runs one shell command in the sandbox; a timeout kills the whole process group (children included). */
-export function runSandboxed(command: string, cwd: string, timeoutMs: number, profilePath: string, id = 'cmd', onSpawn?: OnSpawn): Promise<CheckResult> {
+export function runSandboxed(command: string, cwd: string, timeoutMs: number, profilePath: string, id = 'cmd', onSpawn?: OnSpawn): Promise<CheckResult & { timedOut: boolean }> {
   const started = Date.now()
   return new Promise((resolve) => {
     const out = new LineKeeper()
@@ -61,7 +67,7 @@ export function runSandboxed(command: string, cwd: string, timeoutMs: number, pr
       killGroup('SIGKILL')
       let tail = out.text()
       if (timedOut) tail += `\n[hq] 시간 초과 (${Math.round(timeoutMs / 1000)}초) — 프로세스 그룹 종료`
-      resolve({ id, command, exitCode: timedOut ? null : code, durationMs: Date.now() - started, pass: !timedOut && code === 0, outputTail: tail })
+      resolve({ id, command, exitCode: timedOut ? null : code, durationMs: Date.now() - started, pass: !timedOut && code === 0, outputTail: tail, timedOut })
     })
   })
 }
@@ -135,31 +141,36 @@ export async function runChecks(o: RunChecksOpts): Promise<ChecksFile> {
   const warnings: string[] = []
   for (const c of o.checks) {
     const before = await wtStatus(o.wt)
-    const r: CheckOutcome = { ...(await runSandboxed(c.command, o.wt.path, o.timeoutMs, o.profilePath, c.id, o.onSpawn)), kind: c.kind }
+    const { timedOut: _t, ...ran } = await runSandboxed(c.command, o.wt.path, o.timeoutMs, o.profilePath, c.id, o.onSpawn)
+    const r: CheckOutcome = { ...ran, kind: c.kind }
     const after = await wtStatus(o.wt).catch(() => '?')
     if (after !== before || (await headOf()) !== o.head) { r.pass = false; r.outputTail += '\n[hq] 검사가 작업 폴더(파일 또는 HEAD)를 바꿈 — 실패로 처리' }
+    else if (c.baseFailed && !r.pass) r.baseFailed = true
     if (c.kind === 'new' && o.basePassed?.[c.id]) warnings.push(`[${c.id}] 이 검사는 base에서도 통과해서 새 동작을 확인하지 않아요`)
     results.push(r)
   }
   const secrets = await secretScan(o.wt.mirror, o.base, o.head)
-  return { checks: results, secrets, pass: results.every((r) => r.pass) && secrets.length === 0, error: null, warnings }
+  return { checks: results, secrets, pass: results.every((r) => r.pass || r.baseFailed) && secrets.length === 0, error: null, warnings }
 }
 
 /**
  * Runs checks once on the base in a throwaway mirror worktree (§9 baseline — recorded, never an exemption).
  * `setup` runs first; if it fails every check counts as failed on the base.
  */
-export async function baseline(o: { mirror: string; base: string; path: string; checks: CheckSpec[]; setup: string | null; timeoutMs: number; sandbox: (wt: string) => SandboxOpts; profilePath: string; onSpawn?: OnSpawn }): Promise<Record<string, boolean>> {
-  const res: Record<string, boolean> = {}
+export async function baseline(o: { mirror: string; base: string; path: string; checks: CheckSpec[]; setup: string | null; timeoutMs: number; sandbox: (wt: string) => SandboxOpts; profilePath: string; onSpawn?: OnSpawn }): Promise<Record<string, BaseResult>> {
+  const res: Record<string, BaseResult> = {}
   if (!o.checks.length) return res
   const wt = await verifyWorktree(o.mirror, o.path, o.base)
   try {
     atomicWrite(o.profilePath, sandboxProfile(o.sandbox(wt.path)))
     if (o.setup) {
       const s = await runSandboxed(o.setup, wt.path, o.timeoutMs, o.profilePath, 'setup', o.onSpawn)
-      if (!s.pass) { for (const c of o.checks) res[c.id] = false; return res }
+      if (!s.pass) { for (const c of o.checks) res[c.id] = { pass: false, exitCode: null, timedOut: false, setupFailed: true, tail: s.outputTail.slice(-1500) }; return res }
     }
-    for (const c of o.checks) res[c.id] = (await runSandboxed(c.command, wt.path, o.timeoutMs, o.profilePath, c.id, o.onSpawn)).pass
+    for (const c of o.checks) {
+      const r = await runSandboxed(c.command, wt.path, o.timeoutMs, o.profilePath, c.id, o.onSpawn)
+      res[c.id] = { pass: r.pass, exitCode: r.exitCode, timedOut: r.timedOut, tail: r.outputTail.slice(-1500) }
+    }
     return res
   } finally { await removeMirrorWorktree(o.mirror, wt.path) }
 }

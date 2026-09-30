@@ -50,12 +50,15 @@ export async function ensureMirror(project: { id: string; path: string }, mirror
 }
 
 /** The worker's own repository: shares the mirror's objects read-only, branch `hq-work` at the base. */
-export async function newWorkClone(mirror: string, path: string, baseSha: string): Promise<void> {
+export async function newWorkClone(mirror: string, path: string, baseSha: string, identity?: { name?: string; email?: string }): Promise<void> {
   rmSync(path, { recursive: true, force: true })
   mkdirSync(dirname(path), { recursive: true })
   await hqGitOk(null, null, ['clone', '--shared', '--no-checkout', '-q', mirror, path], { cwd: dirname(path) })
-  // The only git command hq runs inside a worker clone: right after creation, before any worker touched it.
+  // The only git commands hq runs inside a worker clone: right after creation, before any worker touched it.
   await hqGitOk(join(path, '.git'), path, ['checkout', '-q', '-b', 'hq-work', baseSha])
+  // Worker commits carry the project's own identity, not whatever the machine's global config says.
+  if (identity?.name) await hqGitOk(join(path, '.git'), path, ['config', 'user.name', identity.name])
+  if (identity?.email) await hqGitOk(join(path, '.git'), path, ['config', 'user.email', identity.email])
 }
 
 /** Brings the worker's `hq-work` into the mirror under `ref` (runs in the mirror). Returns the fetched SHA, or null. */

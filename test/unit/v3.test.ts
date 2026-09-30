@@ -113,7 +113,7 @@ test('v3-4. a new-kind check that the work does not implement fails (no baseline
   } finally { await h.close() }
 })
 
-test('v3-5. a regression check already failing on the base becomes manual for the reviewer and "기존 실패" on the accept card', async () => {
+test('v3-5. a regression check failing on the base and again on the candidate becomes manual for the reviewer and "기존 실패" on the accept card', async () => {
   const h = harness()
   try {
     const id = h.plan([task('A', { acceptance: [{ id: 'R1', text: '기존에 깨진 검사', check: 'test -f missing.txt', kind: 'regression' }] })])
@@ -122,7 +122,9 @@ test('v3-5. a regression check already failing on the base becomes manual for th
     const work = h.store.attempts(`${id}.A`).find((a) => a.kind === 'work' && a.status === 'succeeded')!
     const checks = JSON.parse(readFileSync(join(work.dir, 'hq', 'checks.json'), 'utf8'))
     assert.deepEqual(checks.manual, ['R1'])
-    assert.equal(checks.checks.length, 0)
+    assert.equal(checks.checks.length, 1, 'still run on the candidate')
+    assert.equal(checks.checks[0].baseFailed, true)
+    assert.equal(checks.pass, true)
     const review = h.store.attempts(`${id}.A`).find((a) => a.kind === 'review')!
     assert.match(readFileSync(join(review.dir, 'hq', 'prompt.md'), 'utf8'), /R1\].*manual .*기존 실패/)
     assert.match(h.store.approval(`accept:${id}`)!.body, /기존 실패\(검토자 판단\): R1/)
