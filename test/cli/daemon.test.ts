@@ -99,7 +99,7 @@ test('start refuses while the daemon lock pid is alive (even if the port is quie
   mkdirSync(ctx.home, { recursive: true })
   writeFileSync(lockFile(ctx), `${process.pid}\n`)
   assert.equal(await start(ctx), 1)
-  assert.match(ctx.errors.at(-1)!, /잠금 .*pid \d+가 살아 있어 시작하지 않습니다/)
+  assert.match(ctx.errors.at(-1)!, /잠금 .*pid \d+(이|가) 살아 있어 시작하지 않습니다/)
   assert.doesNotMatch(ctx.text(), /\[dry-run\]/)
 })
 

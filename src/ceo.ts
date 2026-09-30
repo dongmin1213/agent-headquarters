@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs'
 import { matchesGlob, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { isLimited } from './exec/contract.ts'
+import { josa, particle } from './josa.ts'
 
 export interface Project { id: string; name: string; path: string; setup?: string }
 export interface CeoQuestion { question: string; options: string[]; default: string; reason: string }
@@ -100,14 +101,14 @@ export function validateTasks(tasks: PlanTask[], projects: Project[]): string | 
   const ids = new Set(tasks.map((t) => t.id))
   if (ids.size !== tasks.length) return '작업 id가 중복됩니다'
   for (const t of tasks as (PlanTask & { external?: unknown })[]) {
-    if (!/^[A-Za-z0-9_-]{1,32}$/.test(t.id)) return `작업 id "${t.id}"는 영문·숫자·_-로 1~32자여야 합니다`
-    if (!projects.some((p) => p.id === t.project)) return `작업 ${t.id}의 프로젝트 "${t.project}"가 등록되지 않았습니다`
-    if (t.role !== 'collect' && t.role !== 'implement') return `작업 ${t.id}의 역할 "${String(t.role)}"은 지원하지 않습니다 (collect | implement)`
-    if (!['haiku', 'sonnet', 'opus'].includes(t.model)) return `작업 ${t.id}의 모델 "${String(t.model)}"은 지원하지 않습니다`
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(t.id)) return `작업 id "${t.id}"${particle(t.id, '은/는')} 영문·숫자·_-로 1~32자여야 합니다`
+    if (!projects.some((p) => p.id === t.project)) return `작업 ${t.id}의 프로젝트 "${t.project}"${particle(t.project, '이/가')} 등록되지 않았습니다`
+    if (t.role !== 'collect' && t.role !== 'implement') return `작업 ${t.id}의 역할 "${String(t.role)}"${particle(String(t.role), '은/는')} 지원하지 않습니다 (collect | implement)`
+    if (!['haiku', 'sonnet', 'opus'].includes(t.model)) return `작업 ${t.id}의 모델 "${String(t.model)}"${particle(String(t.model), '은/는')} 지원하지 않습니다`
     if (t.external !== undefined) return `작업 ${t.id}: 외부 게시·삭제·결제 작업은 지원하지 않습니다`
-    if (t.review && !['sonnet', 'opus', 'none'].includes(t.review.model)) return `작업 ${t.id}의 검토 모델 "${String(t.review.model)}"은 지원하지 않습니다`
-    if (t.depends_on.includes(t.id)) return `작업 ${t.id}가 자기 자신에 의존합니다`
-    for (const d of t.depends_on) if (!ids.has(d)) return `작업 ${t.id}가 없는 작업 ${d}에 의존합니다`
+    if (t.review && !['sonnet', 'opus', 'none'].includes(t.review.model)) return `작업 ${t.id}의 검토 모델 "${String(t.review.model)}"${particle(String(t.review.model), '은/는')} 지원하지 않습니다`
+    if (t.depends_on.includes(t.id)) return `작업 ${josa(t.id, '이/가')} 자기 자신에 의존합니다`
+    for (const d of t.depends_on) if (!ids.has(d)) return `작업 ${josa(t.id, '이/가')} 없는 작업 ${d}에 의존합니다`
     if (t.role === 'implement' && t.owns.length === 0) return `작업 ${t.id}에 owns가 없습니다`
     const accIds = t.acceptance.map((a) => a.id)
     if (new Set(accIds).size !== accIds.length) return `작업 ${t.id}의 수용 기준 id가 중복됩니다`
@@ -136,7 +137,7 @@ export function validateTasks(tasks: PlanTask[], projects: Project[]): string | 
   for (let i = 0; i < writers.length; i++) for (let j = i + 1; j < writers.length; j++) {
     const a = writers[i], b = writers[j]
     if (a.project !== b.project || reach(a.id, b.id) || reach(b.id, a.id)) continue
-    for (const x of a.owns) for (const y of b.owns) if (ownsOverlap(x, y)) return `병렬 작업 ${a.id}와 ${b.id}의 소유 경로가 겹칩니다: ${x} / ${y}`
+    for (const x of a.owns) for (const y of b.owns) if (ownsOverlap(x, y)) return `병렬 작업 ${josa(a.id, '와/과')} ${b.id}의 소유 경로가 겹칩니다: ${x} / ${y}`
   }
   return null
 }

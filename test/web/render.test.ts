@@ -173,3 +173,43 @@ async function callMock(mock: ReturnType<typeof createMockApi>, url: string): Pr
   await mock.routeApi(req as never, res as never)
   return out
 }
+
+test('U3. irreversible options need a second click on the inline confirm; others send at once', () => {
+  const open = new Set<string>()
+  const blocked = { kind: 'blocked', confirm: { stop: '정말 중단할까요? · 되돌릴 수 없어요' } }
+  const merge = { kind: 'merge', confirm: { 병합: 'main에 병합할까요?' } }
+  const integ = { kind: 'integration', confirm: { '요청 중단': '정말 중단할까요? · 되돌릴 수 없어요' } }
+  assert.equal(lib.confirmText(merge, '병합'), 'main에 병합할까요?')
+  assert.equal(lib.confirmText(merge, '보류'), null)
+  assert.equal(lib.confirmText({ kind: 'plan' }, '승인'), null)
+  assert.equal(lib.confirmText({ kind: 'blocked' }, 'stop'), '정말 중단할까요? · 되돌릴 수 없어요', 'no confirm map: still confirmed')
+  assert.equal(lib.confirmText({ kind: 'merge' }, '병합'), '대상 브랜치에 병합할까요?')
+  assert.equal(lib.confirmText({ kind: 'blocked' }, 'retry'), null)
+  // Non-confirm options send immediately.
+  assert.equal(lib.confirmStep(open, 'b', blocked, 'retry'), 'send')
+  assert.equal(lib.confirmStep(open, 'm', merge, '보류'), 'send')
+  assert.equal(open.size, 0)
+  // stop: first click only opens the question, second click (yes) sends.
+  assert.equal(lib.confirmStep(open, 'b', blocked, 'stop'), 'confirm')
+  assert.ok(open.has('b:stop'))
+  assert.equal(lib.confirmStep(open, 'b', blocked, 'stop', 'yes'), 'send')
+  assert.equal(open.has('b:stop'), false)
+  // 병합: cancel closes without sending; a stray "yes" without the question shown only opens it.
+  assert.equal(lib.confirmStep(open, 'm', merge, '병합'), 'confirm')
+  assert.equal(lib.confirmStep(open, 'm', merge, '병합', 'no'), 'cancel')
+  assert.equal(open.size, 0)
+  assert.equal(lib.confirmStep(open, 'm', merge, '병합', 'yes'), 'confirm')
+  assert.equal(lib.confirmStep(open, 'm', merge, '병합', 'yes'), 'send')
+  // integration 요청 중단 is confirmed too.
+  assert.equal(lib.confirmStep(open, 'i', integ, '요청 중단'), 'confirm')
+  assert.equal(lib.confirmStep(open, 'i', integ, '요청 중단', 'yes'), 'send')
+})
+
+test('U2. web chips use the glossary for every kind (system included), never raw kind names', () => {
+  for (const k of ['system', 'plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge', 'team']) {
+    const [label] = lib.DECISION_KIND[k]
+    assert.ok(label && label !== k && /[가-힣]/.test(label), k)
+  }
+  assert.equal(lib.DECISION_KIND.system[0], '로그인 필요')
+  assert.equal(lib.DECISION_KIND.blocked[0], '막힘')
+})

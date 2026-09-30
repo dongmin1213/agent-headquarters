@@ -5,6 +5,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, ren
 import { join } from 'node:path'
 import { apiRequest, probeHq, readToken, tokenMismatchMsg, waitFor, type HqProbe } from './api.ts'
 import { daemonLabel, daemonLog, launchdJob, launchdTarget, lockFile, logsDir, pidFile, plistPath, runCmd, samePath, showCmd, type Ctx, type LaunchdJob } from './ctx.ts'
+import { josa } from '../josa.ts'
 
 export const LOG_MAX_BYTES = 10 * 1024 * 1024
 export const LOG_KEEP = 3
@@ -103,13 +104,13 @@ export async function killTarget(ctx: Ctx, infoOf: (pid: number) => Promise<Proc
   if (info === null && alive(pid)) return { refuse: `pid ${pid}의 프로그램을 확인할 수 없어 종료하지 않습니다 (ps 실행 불가)` }
   if (info === null) return null // stale lock
   if (lock.format === 'legacy') return { refuse: LEGACY_LOCK_MSG }
-  if (!runsOurMain(ctx, info.command)) return { refuse: `잠금 파일 ${lf}의 pid ${pid}는 이 저장소(${ctx.root})의 hq 데몬이 아닙니다 (${info.command.slice(0, 80)}). 종료하지 않습니다. 오래된 잠금이면: rm ${lf}` }
+  if (!runsOurMain(ctx, info.command)) return { refuse: `잠금 파일 ${lf}의 pid ${josa(pid, '은/는')} 이 저장소(${ctx.root})의 hq 데몬이 아닙니다 (${info.command.slice(0, 80)}). 종료하지 않습니다. 오래된 잠금이면: rm ${lf}` }
   const mismatch = [
     lock.root === null || !samePath(lock.root, ctx.root) ? `저장소 ${lock.root ?? '?'}` : '',
     lock.home === null || !samePath(lock.home, ctx.home) ? `HQ_HOME ${lock.home ?? '?'}` : '',
     lock.port !== ctx.port ? `포트 ${lock.port ?? '?'}` : '',
   ].filter(Boolean)
-  if (mismatch.length) return { refuse: `pid ${pid}는 다른 설치의 데몬이에요 (${mismatch.join(', ')} · 지금 설정은 포트 ${ctx.port}, ${ctx.home}). 종료하지 않습니다` }
+  if (mismatch.length) return { refuse: `pid ${josa(pid, '은/는')} 다른 설치의 데몬이에요 (${mismatch.join(', ')} · 지금 설정은 포트 ${ctx.port}, ${ctx.home}). 종료하지 않습니다` }
   if (!lock.startedAt || info.startedAt !== lock.startedAt) return { refuse: `pid ${pid}의 시작 시각이 잠금 파일과 달라요 (pid 재사용). 종료하지 않습니다. 오래된 잠금이면: rm ${lf}` }
   return { pid }
 }
@@ -121,7 +122,7 @@ export async function stopTarget(ctx: Ctx, infoOf: (pid: number) => Promise<Proc
   if ('refuse' in t) return { error: t.refuse }
   if (ctx.dryRun) ctx.out(`[dry-run] kill -TERM ${t.pid}`)
   else process.kill(t.pid, 'SIGTERM')
-  if (!ctx.dryRun && !(await waitFor(async () => !alive(t.pid), START_WAIT_MS))) return { error: `pid ${t.pid}가 종료되지 않았습니다. 강제 종료: kill -9 ${t.pid}` }
+  if (!ctx.dryRun && !(await waitFor(async () => !alive(t.pid), START_WAIT_MS))) return { error: `pid ${josa(t.pid, '이/가')} 종료되지 않았습니다. 강제 종료: kill -9 ${t.pid}` }
   if (!ctx.dryRun) rmSync(pidFile(ctx), { force: true })
   return { pid: t.pid }
 }
@@ -129,7 +130,7 @@ export async function stopTarget(ctx: Ctx, infoOf: (pid: number) => Promise<Proc
 function busyMessage(ctx: Ctx, p: HqProbe): string | null {
   if (p.kind === 'hq') return `이미 hq가 127.0.0.1:${ctx.port}에서 실행 중입니다 (중복 실행 거부). 재시작: hq restart`
   if (p.kind === 'unauthorized') return tokenMismatchMsg(ctx.tokenFile)
-  if (p.kind === 'other') return `포트 ${ctx.port}를 다른 프로그램이 쓰고 있습니다 (HTTP ${p.status}). lsof -nP -iTCP:${ctx.port} -sTCP:LISTEN 으로 확인하거나 HQ_PORT를 바꾸세요`
+  if (p.kind === 'other') return `포트 ${josa(ctx.port, '을/를')} 다른 프로그램이 쓰고 있습니다 (HTTP ${p.status}). lsof -nP -iTCP:${ctx.port} -sTCP:LISTEN 으로 확인하거나 HQ_PORT를 바꾸세요`
   if (p.kind === 'error') return `포트 ${ctx.port} 확인 실패: ${p.message}`
   return null
 }
@@ -153,13 +154,13 @@ export async function start(ctx: Ctx): Promise<number> {
   if (busy) { ctx.err(busy); return 1 }
   const lockPid = readLockPid(ctx)
   if (lockPid && alive(lockPid)) {
-    ctx.err(`데몬 잠금 ${lockFile(ctx)}의 pid ${lockPid}가 살아 있어 시작하지 않습니다 (중복 실행 거부). 상태: hq status · 중지: hq stop`)
+    ctx.err(`데몬 잠금 ${lockFile(ctx)}의 pid ${josa(lockPid, '이/가')} 살아 있어 시작하지 않습니다 (중복 실행 거부). 상태: hq status · 중지: hq stop`)
     return 1
   }
   if (ctx.dryRun) ctx.out(`[dry-run] mkdir -p ${logsDir(ctx)} · 로그 회전`)
   else { mkdirSync(logsDir(ctx), { recursive: true }); rotateLog(daemonLog(ctx)) }
   const job = await daemonJob(ctx)
-  if (job === 'foreign') ctx.err(`경고: launchd 작업 ${daemonLabel(ctx)}는 다른 설치의 plist로 로드돼 있어 건드리지 않고 백그라운드 프로세스로 시작합니다`)
+  if (job === 'foreign') ctx.err(`경고: launchd 작업(${daemonLabel(ctx)})은 다른 설치의 plist로 로드돼 있어 건드리지 않고 백그라운드 프로세스로 시작합니다`)
   const viaLaunchd = job === 'ours' || job === 'unloaded'
   if (viaLaunchd) {
     const r = job === 'ours'

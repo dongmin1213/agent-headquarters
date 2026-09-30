@@ -23,7 +23,7 @@ export async function integrate(o: {
   setup: string | null; checks: CheckSpec[]; timeoutMs: number; sandbox: SandboxOpts; profilePath: string; onSpawn?: OnSpawn
 }): Promise<IntegrationResult> {
   const targetSha = await mirrorRev(o.mirror, `refs/heads/${o.target}`)
-  if (!targetSha) return { kind: 'failed', targetSha: null, checks: null, reason: `대상 브랜치 ${o.target}를 찾을 수 없음` }
+  if (!targetSha) return { kind: 'failed', targetSha: null, checks: null, reason: `대상 브랜치(${o.target})를 찾을 수 없음` }
   const wt = await verifyWorktree(o.mirror, o.path, targetSha)
   try {
     for (const h of o.heads) {

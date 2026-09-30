@@ -2,6 +2,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
+import { josa, particle } from './josa.ts'
 
 export type Grade = 'L0' | 'L1' | 'L2' | 'L3'
 export type ModelAlias = 'haiku' | 'sonnet' | 'opus'
@@ -56,7 +57,7 @@ export function loadConfig(root: string, env: NodeJS.ProcessEnv = process.env): 
   for (const [k, def] of Object.entries(nested)) {
     const v = raw[k]
     if (v === undefined) continue
-    if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`config/hq.json: "${k}"는 객체여야 합니다`)
+    if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`config/hq.json: "${k}"${particle(k, '은/는')} 객체여야 합니다`)
     for (const sub of Object.keys(v)) if (!(sub in def)) throw new Error(`config/hq.json: 알 수 없는 키 "${k}.${sub}"`)
   }
   const c = {
@@ -73,7 +74,7 @@ export function loadConfig(root: string, env: NodeJS.ProcessEnv = process.env): 
   if (!posInt(c.maxTurns)) throw new Error('config: maxTurns는 양의 정수')
   if (!posInt(c.maxAttempts)) throw new Error('config: maxAttempts는 양의 정수')
   if (!(c.checkTimeoutMinutes > 0)) throw new Error('config: checkTimeoutMinutes는 양수')
-  for (const g of ['L0', 'L1', 'L2', 'L3'] as const) if (!(c.attemptWallMinutes[g] > 0)) throw new Error(`config: attemptWallMinutes.${g}는 양수`)
+  for (const g of ['L0', 'L1', 'L2', 'L3'] as const) if (!(c.attemptWallMinutes[g] > 0)) throw new Error(`config: attemptWallMinutes.${josa(g, '은/는')} 양수`)
   const q = c.quota
   if (!(0 < q.saveAt && q.saveAt <= q.holdAt && q.holdAt <= 1)) throw new Error('config: quota는 0 < saveAt ≤ holdAt ≤ 1')
   if (!Array.isArray(c.protectedPaths) || c.protectedPaths.some((x) => typeof x !== 'string' || !x)) throw new Error('config: protectedPaths는 문자열 목록')

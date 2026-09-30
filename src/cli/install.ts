@@ -26,7 +26,7 @@ export function buildPlists(ctx: Ctx) {
   }
 }
 
-const foreignMsg = (label: string) => `launchd 작업 ${label}는 다른 설치의 plist로 이미 로드돼 있어 건드리지 않습니다. 확인: launchctl print gui/<uid>/${label}`
+const foreignMsg = (label: string) => `launchd 작업(${label})은 다른 설치의 plist로 이미 로드돼 있어 건드리지 않습니다. 확인: launchctl print gui/<uid>/${label}`
 
 /** launchd timing (tests shrink these): poll `print` after bootout until the job is gone, then retry a racing bootstrap. */
 export interface LaunchdTiming { pollMs: number; goneMs: number; retryMs: number; attempts: number }
@@ -178,7 +178,7 @@ export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
 
   linkHint(ctx)
   ctx.out('')
-  ctx.out('설치 완료. 화면의 펫(CEO)을 클릭해 첫 요청을 보내보세요. 상태: hq status · 진단: hq doctor')
+  ctx.out('설치 완료. 화면의 펫(사장)을 클릭해 첫 요청을 보내보세요. 상태: hq status · 진단: hq doctor')
   return 0
 }
 
@@ -189,7 +189,7 @@ export function purgePlan(ctx: Ctx): PurgePlan | { error: string } {
   const notes: string[] = []
   const h = resolve(ctx.home)
   if (h === '/' || h === resolve(ctx.userHome) || resolve(ctx.userHome).startsWith(h + '/') || resolve(ctx.root).startsWith(h + '/') || h === resolve(ctx.root)) {
-    return { error: `안전을 위해 ${h}는 지우지 않습니다 (HQ_HOME 확인)` }
+    return { error: `안전을 위해 데이터 폴더(${h})는 지우지 않습니다 (HQ_HOME 확인)` }
   }
   let home: string | null = null
   if (existsSync(h)) {
@@ -202,16 +202,16 @@ export function purgePlan(ctx: Ctx): PurgePlan | { error: string } {
   let st: ReturnType<typeof lstatSync> | null = null
   try { st = lstatSync(ctx.tokenFile) } catch { /* absent */ }
   if (st) {
-    if (!st.isFile()) return { error: `토큰 경로 ${ctx.tokenFile}가 일반 파일이 아니라(폴더·심볼릭 링크 등) 아무것도 지우지 않았어요 · HQ_TOKEN_FILE을 확인해 주세요` }
+    if (!st.isFile()) return { error: `토큰 경로(${ctx.tokenFile})가 일반 파일이 아니라(폴더·심볼릭 링크 등) 아무것도 지우지 않았어요 · HQ_TOKEN_FILE을 확인해 주세요` }
     const defaultToken = resolve(ctx.userHome, '.config/hq/token')
-    if (installSuffix(ctx) !== null && samePath(ctx.tokenFile, defaultToken)) notes.push(`기본 설치의 토큰 ${ctx.tokenFile}는 남겨 둡니다`)
+    if (installSuffix(ctx) !== null && samePath(ctx.tokenFile, defaultToken)) notes.push(`기본 설치의 토큰(${ctx.tokenFile})은 남겨 둡니다`)
     else token = ctx.tokenFile
   }
   // The pet app lives in the repository and is shared by every installation from it; only the default one removes it.
   let pet: string | null = null
   if (existsSync(petApp(ctx))) {
     if (installSuffix(ctx) === null) pet = petApp(ctx)
-    else notes.push(`펫 앱 ${petApp(ctx)}은 기본 설치와 함께 쓰므로 남겨 둡니다`)
+    else notes.push(`펫 앱(${petApp(ctx)})은 기본 설치와 함께 쓰므로 남겨 둡니다`)
   }
   return { home, token, petApp: pet, notes }
 }

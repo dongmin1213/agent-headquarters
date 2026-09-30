@@ -183,11 +183,58 @@ export const QUOTA_MODE = { normal: ['정상', 'ok'], save: ['절약 (동시 1)'
 const WINDOW_NAMES = { five_hour: '5시간', seven_day: '7일', seven_day_opus: '7일 (opus)', seven_day_sonnet: '7일 (sonnet)' }
 /** Korean label for a quota window name; unknown windows keep their name. */
 export function windowLabel(name) { return WINDOW_NAMES[name] ?? String(name ?? '미확인') }
-/** Decision kinds in the order the daemon sends them (execution.md §17), with their card label and tone. */
-export const DECISION_KIND = {
-  plan: ['계획 승인', 'info'], ceo_question: ['사장 질문', 'warn'], worker_question: ['작업자 질문', 'warn'], revise: ['지시서 수정 승인', 'warn'],
-  blocked: ['회로 차단', 'bad'], integration: ['통합 실패', 'bad'], accept: ['결과 수락', 'ok'], merge: ['병합 승인', 'info'], team: ['팀 결정', 'info'],
+// One vocabulary for every chairman surface. Identical copies: src/glossary.ts, pet/main.swift Pet.kindLabels
+// (test/unit/glossary.test.ts). "CEO" is never shown: the agent is 사장.
+export const GLOSSARY = {
+  ceo: '사장',
+  task: '작업',
+  blocked: '막힘',
+  accept: '수락',
+  merge: '병합',
 }
+/** Card label per decision kind (execution.md §17). */
+export const KIND_LABELS = {
+  system: '로그인 필요',
+  plan: '계획 승인',
+  ceo_question: '사장 질문',
+  worker_question: '작업자 질문',
+  revise: '지시서 수정안',
+  blocked: '막힘',
+  integration: '통합 문제',
+  accept: '결과 수락',
+  merge: '병합 승인',
+  team: '팀 결정',
+}
+const KIND_TONE = { system: 'bad', plan: 'info', ceo_question: 'warn', worker_question: 'warn', revise: 'warn', blocked: 'bad', integration: 'bad', accept: 'ok', merge: 'info', team: 'info' }
+/** Decision kinds in the order the daemon sends them (execution.md §17), with their card label and tone. */
+export const DECISION_KIND = Object.fromEntries(Object.entries(KIND_LABELS).map(([k, label]) => [k, [label, KIND_TONE[k]]]))
+
+/**
+ * Irreversible choices need a second click on an inline confirm (no dialogs). The daemon names them in
+ * DecisionItem.confirm ({option: question}); returns the question for this option, or null.
+ */
+export function confirmText(d, option) {
+  const c = d && typeof d.confirm === 'object' && d.confirm ? d.confirm[option] : null
+  if (typeof c === 'string' && c) return c
+  // Same rule if a daemon sent no confirm map: stopping a request and merging are never one click.
+  if ((d?.kind === 'blocked' && option === 'stop') || option === '요청 중단') return '정말 중단할까요? · 되돌릴 수 없어요'
+  if (d?.kind === 'merge' && option === '병합') return '대상 브랜치에 병합할까요?'
+  return null
+}
+/**
+ * One click on an option. `open` is the set of confirm keys currently shown.
+ * Returns 'confirm' (show the inline question; nothing sent yet), 'send' (send now) or 'cancel'.
+ * `step` is 'pick' for the option button, 'yes' / 'no' for the confirm buttons.
+ */
+export function confirmStep(open, key, d, option, step = 'pick') {
+  const ck = `${key}:${option}`
+  if (step === 'no') { open.delete(ck); return 'cancel' }
+  if (step === 'yes') { if (!open.has(ck)) { open.add(ck); return 'confirm' } open.delete(ck); return 'send' }
+  if (!confirmText(d, option)) return 'send'
+  open.add(ck)
+  return 'confirm'
+}
+
 /** Fixed display labels for `blocked` card options, which are wire values retry|skip|stop (execution.md §17). */
 export const BLOCKED_LABEL = { retry: '한 번 더', skip: '이 작업 건너뛰기', stop: '요청 중단' }
 /** Board columns, in order. */

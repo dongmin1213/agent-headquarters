@@ -624,7 +624,7 @@ export class Runner {
     this.store.updateTask(t.id, { status: 'blocked', note: reason.slice(0, 2000), diagnosis: null, block_count: cur.block_count + 1 })
     const r = this.store.request(t.request_id)
     if (r && r.status === 'executing') this.store.updateRequest(r.id, { status: 'blocked', note: `작업 ${t.title} 판단 필요` })
-    this.emitTask(t, `작업 차단: ${t.title}`)
+    this.emitTask(t, `작업 막힘: ${t.title}`)
   }
 
   /** Transitive dependents of a task within its request. */
@@ -1123,7 +1123,7 @@ export class Runner {
       this.store.set(knownKey(requestId, projectId), known ? JSON.stringify(known) : null)
       const r = this.store.request(requestId)!
       if (!TERMINAL_REQUEST.has(r.status)) this.store.updateRequest(requestId, { status: 'blocked', note })
-      this.store.putApproval({ id: `integration:${requestId}:${projectId}`, teamId: 'hq', subjectId: requestId, title: `통합 실패: ${project.name}`,
+      this.store.putApproval({ id: `integration:${requestId}:${projectId}`, teamId: 'hq', subjectId: requestId, title: `통합 문제: ${project.name}`,
         body, options: known ? [...INTEGRATION_OPTIONS, ACCEPT_KNOWN] : INTEGRATION_OPTIONS, subjectHash: sha256(`${requestId}:${projectId}:${note}:${known?.sha ?? ''}:${this.now()}`) })
     })
     const target = await currentBranch(project.path)
@@ -1521,7 +1521,7 @@ export class Runner {
     if (canAutoApply(spec, rev)) { this.store.tx(() => this.applyRevision(t.id, rev)); return }
     this.store.tx(() => {
       this.store.set(`revise:${t.id}`, JSON.stringify(rev))
-      this.store.putApproval({ id: `revise:${t.id}`, teamId: 'hq', subjectId: t.request_id, title: `지시서 수정 승인: ${t.title}`, body: reviseDiff(spec, rev),
+      this.store.putApproval({ id: `revise:${t.id}`, teamId: 'hq', subjectId: t.request_id, title: `지시서 수정안: ${t.title}`, body: reviseDiff(spec, rev),
         options: ['승인', '반려'], subjectHash: sha256(JSON.stringify(rev)) })
     })
     this.emitTask(t, `지시서 수정안 승인 필요: ${t.title}`)
@@ -1613,7 +1613,7 @@ export class Runner {
   // ----- notifications (§17: once per decision id + revision) -----
   private notifyDecisions(): void {
     const titles: Record<DecisionItem['kind'], string> = { system: 'hq가 멈췄어요 — 확인이 필요해요', plan: '사장이 계획을 올렸어요', ceo_question: '사장이 질문했어요', worker_question: '작업자가 질문했어요',
-      revise: '지시서 수정안 승인이 필요해요', blocked: '작업이 막혔어요 — 판단이 필요해요', integration: '통합에 실패했어요', accept: '결과 수락을 기다려요', merge: '병합 승인을 기다려요', team: '팀 결정이 필요해요' }
+      revise: '지시서 수정안 승인이 필요해요', blocked: '작업이 막혔어요 — 판단이 필요해요', integration: '통합에 문제가 생겼어요', accept: '결과 수락을 기다려요', merge: '병합 승인을 기다려요', team: '팀 결정이 필요해요' }
     for (const d of decisionItems(this.store, this.now(), this.teamNames)) {
       const k = `notified:${d.id}:${d.revision}`
       if (this.store.get(k)) continue
