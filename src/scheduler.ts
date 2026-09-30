@@ -2,7 +2,7 @@
 //   0  = did work or nothing to do     3  = waiting for chairman approval
 //   75 = hit the Claude usage limit (EX_TEMPFAIL)   other = error
 // A team reports progress by printing lines starting with "STATUS:" (shown as the pet's bubble).
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type { Bus } from './bus.ts'
 import type { Store } from './store.ts'
@@ -64,7 +64,7 @@ export class Scheduler {
 
   runNow(teamId: string): boolean {
     const t = this.teams.find((x) => x.id === teamId)
-    if (!t || this.state.get(t.id)!.running) return false
+    if (!t || !t.enabled || this.state.get(t.id)!.running) return false
     if (this.blockedUntil()) return false
     void this.runTeam(t)
     return true
@@ -84,19 +84,16 @@ export class Scheduler {
     const tail: string[] = []
     return new Promise((resolve) => {
       const [cmd, ...args] = t.command
-      const child = spawn(cmd, args, { cwd: t.cwd, env: { ...process.env, HQ_URL: this.hqUrl, HQ_TOKEN: this.token, HQ_TEAM: t.id }, stdio: ['ignore', 'pipe', 'pipe'] })
-      const onLine = (line: string) => {
-        tail.push(line); if (tail.length > 40) tail.shift()
-        if (line.startsWith('STATUS:')) this.set(t.id, 'working', line.slice(7).trim())
-      }
-      createInterface({ input: child.stdout }).on('line', onLine)
-      createInterface({ input: child.stderr }).on('line', onLine)
-      child.on('close', (code) => {
-        const exit = code ?? -1
-        const summary = tail.slice(-8).join('\n')
+      let done = false
+      // 'error' may be followed by 'close' (or come alone); the run must end exactly once.
+      const finish = (exit: number, failure: string | null) => {
+        if (done) return
+        done = true
+        const summary = [...tail.slice(-8), ...(failure ? [failure] : [])].join('\n')
         this.store.endRun(runId, exit, summary)
         s.running = false
-        if (exit === 0) this.set(t.id, 'idle', lastStatus(tail) ?? '완료')
+        if (failure) this.set(t.id, 'error', failure.slice(0, 140))
+        else if (exit === 0) this.set(t.id, 'idle', lastStatus(tail) ?? '완료')
         else if (exit === 3) this.set(t.id, 'waiting', lastStatus(tail) ?? '승인 대기')
         else if (exit === 75) {
           const until = new Date(Date.now() + LIMIT_BACKOFF_MS).toISOString()
@@ -106,7 +103,20 @@ export class Scheduler {
           this.set(t.id, 'sleeping', '사용 한도, 쉬는 중')
         } else this.set(t.id, 'error', `오류 (종료 코드 ${exit}): ${tail.at(-1) ?? ''}`.slice(0, 140))
         resolve()
-      })
+      }
+      const spawnFailed = (err: NodeJS.ErrnoException) => finish(-1, `실행할 수 없어요: ${err.code ?? err.message} (${cmd})`)
+      let child: ChildProcess
+      try {
+        child = spawn(cmd, args, { cwd: t.cwd, env: { ...process.env, HQ_URL: this.hqUrl, HQ_TOKEN: this.token, HQ_TEAM: t.id }, stdio: ['ignore', 'pipe', 'pipe'] })
+      } catch (err) { spawnFailed(err as NodeJS.ErrnoException); return }
+      child.on('error', spawnFailed)
+      const onLine = (line: string) => {
+        tail.push(line); if (tail.length > 40) tail.shift()
+        if (line.startsWith('STATUS:')) this.set(t.id, 'working', line.slice(7).trim())
+      }
+      createInterface({ input: child.stdout! }).on('line', onLine)
+      createInterface({ input: child.stderr! }).on('line', onLine)
+      child.on('close', (code) => finish(code ?? -1, null))
     })
   }
 }
