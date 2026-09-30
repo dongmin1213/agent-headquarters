@@ -81,16 +81,16 @@ schema_version: pragma user_version
 검토에서 공유 `.git`을 통한 탈출(hook·`core.fsmonitor`·worktree의 `.git` 파일 바꿔치기·`git replace`)이 재현됐다. 그래서 **작업자가 쓸 수 있는 git 저장소에서 hq는 git 명령을 실행하지 않는다.**
 - **hq 미러**: 프로젝트마다 `$HQ_HOME/repos/<project>.git`(bare). 설정은 hq만 쓴다. 요청 시작·병합 전에 프로젝트에서 fetch.
 - **작업자 복제본**: `$HQ_HOME/work/<requestId>/<key>` = `git clone --shared <미러>`(객체는 미러를 읽기 전용 참조) 후 작업 base에서 브랜치 `hq-work`. 작업자는 여기서만 쓴다.
-- **결과 가져오기**: 작업자 종료 후 hq는 미러에서 `git fetch <복제본> +refs/heads/hq-work:refs/hq/<requestId>/<key>/<attemptId>`만 실행한다(업로드 쪽은 저장소 설정의 실행형 키를 따르지 않는다). 복제본 안에서는 git을 실행하지 않는다.
+- **결과 가져오기**: 작업자 종료 후 hq는 미러에서 `git fetch <복제본> +refs/heads/hq-work:refs/hq/<requestId>/<key>/a<n>`(시도 id의 `~`는 ref에 쓸 수 없음)만 실행한다(업로드 쪽은 저장소 설정의 실행형 키를 따르지 않는다). 복제본 안에서는 git을 실행하지 않는다.
 - **검증·검토·통합**: 모두 미러에서 `git worktree add --detach`로 만든 worktree에서 한다. 샌드박스는 이 worktree 파일은 쓰게 하지만 미러 자체(index 포함)는 읽기만 허용한다 → 검사가 `assume-unchanged` 같은 index 조작으로 변경을 숨길 수 없다.
 - **사용자 저장소**: 샌드박스에서 쓰기 거부. hq는 병합 때만 `git -C <프로젝트> fetch <미러> <integration_sha>` → `merge --ff-only <sha>`를 실행한다(사용자 자신의 hook·설정은 사용자 것이므로 그대로 둔다).
 - hq의 모든 git 호출(미러·검증 worktree): `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.untrackedCache=false`, 환경 `GIT_NO_REPLACE_OBJECTS=1`, `GIT_CONFIG_NOSYSTEM=1`, diff는 `--no-ext-diff --no-textconv`, 명시적 `--git-dir`/`--work-tree`.
 
 ### 6.2 Seatbelt 프로필
 작업자·검토자·collect·setup·check 명령은 모두 `sandbox-exec -f <profile>`로 감싼다.
-- 내용 읽기·쓰기 거부(`file-read-data`, `file-write*`): `~/.config/hq`(또는 `HQ_TOKEN_FILE`의 폴더), `$HQ_HOME`의 `hq.db*`·`runs/`(자기 `out/` 제외)·`logs/`·다른 요청의 `work/`, `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.netrc`, `~/.docker/config.json`, `~/Library/Keychains`, 등록된 다른 프로젝트의 `.env*`.
+- 내용 읽기·쓰기 거부(`file-read-data`, `file-write*`): `~/.config/hq`(또는 `HQ_TOKEN_FILE`의 폴더), `$HQ_HOME`의 `hq.db*`·`runs/`(자기 `out/` 제외)·`logs/`·다른 요청의 `work/`, `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.netrc`, `~/.docker/config.json`, 등록된 모든 프로젝트의 `.env*`. (`~/Library/Keychains`는 거부하지 않는다: 구독 로그인 토큰이 로그인 키체인에 있어 거부하면 CLI가 인증하지 못함을 실측. 키체인 파일은 암호화돼 있고 항목 접근은 macOS가 통제한다 — 한계로 둔다.)
 - **메타데이터 읽기(`file-read-metadata`)는 허용**: Node 등은 경로의 모든 조상 폴더를 lstat한다. 실사용 시험에서 조상 폴더 메타데이터까지 막아 모든 검사가 EPERM으로 실패했다.
-- 쓰기 허용 목록: 자기 작업 복제본 또는 자기 검증·검토 worktree, 자기 `out/`, `/private/tmp`, `/private/var/folders`, `/dev`, `sandbox.extraWritable`, 그리고 Claude CLI 실행에 필요한 `~/.claude`의 **런타임 하위 폴더만**(`projects/ todos/ shell-snapshots/ statsig/ sessions/` 등 — 구현 때 실측으로 최소 집합 확정). `~/.claude/settings*.json`, `CLAUDE.md`, `skills/ agents/ commands/ plugins/ hooks/`는 쓰기 거부(사용자 세션에 훅을 심는 경로 차단). `~/.claude.json`은 CLI가 매 실행 쓰므로 허용하되 한계로 문서화(사용자 범위 MCP 추가 가능) — 다음 단계에서 `CLAUDE_CONFIG_DIR` + 토큰 인증으로 대체 검토.
+- 쓰기 허용 목록: 자기 작업 복제본 또는 자기 검증·검토 worktree, 자기 `out/`, `/private/tmp`, `/private/var/folders`, `/dev`, `sandbox.extraWritable`, 그리고 Claude CLI 실행에 필요한 `~/.claude/projects/`만(실측 최소 집합: 한 줄 응답·Bash·Write·Edit은 쓰기 없이 동작, `--resume`만 `projects/` 필요). `~/.claude/settings*.json`, `CLAUDE.md`, `skills/ agents/ commands/ plugins/ hooks/`는 쓰기 거부(사용자 세션에 훅을 심는 경로 차단). `~/.claude.json`은 CLI가 매 실행 쓰므로 허용하되 한계로 문서화(사용자 범위 MCP 추가 가능) — 다음 단계에서 `CLAUDE_CONFIG_DIR` + 토큰 인증으로 대체 검토.
 - 실행 거부: `/usr/bin/open`, `/usr/bin/osascript`, `appleevent-send`, `launchctl`.
 - 네트워크: `localhost`/`127.0.0.1`의 hq 포트 거부.
 - 예외: 자기 시도의 `hq/prompt.md`·`stream.jsonl`·`stderr.log`는 메타데이터만(stdio 파일).
@@ -306,3 +306,11 @@ Codex(X-B01~B15, A01~A07)와 Claude(C-B1~B13, A1~A15)의 지적에 대한 오케
 | 사람 재시도는 모델 유지 (회사 가이드) | 채택 | §17 |
 | 판단이 작업자보다 먼저 한도를 씀 (회사 가이드) | 채택 | §13 save 모드 CEO 우선 |
 | 약관 확인 (회사 가이드 5.5) | 기각(이번 범위 밖) | 회장 지시: 완성도 우선 |
+
+### v3 구현 중 판정 (실행 엔진 보고)
+| 항목 | 판정 |
+| --- | --- |
+| `~/Library/Keychains` 읽기 거부 시 구독 인증 실패 | 거부 목록에서 제외(§6.2), 한계로 문서화 |
+| 미러 ref에 `~` 불가 | `refs/hq/<req>/<key>/a<n>` |
+| 형식 실수 자동 재시도 조건(done.json 없을 때) | "result 줄 있음 + hq가 죽이지 않음"으로 해석 |
+| 다중 의존 base 충돌 | 통합 카드가 아니라 blocked 카드(진단 턴이 원인·추천) |
