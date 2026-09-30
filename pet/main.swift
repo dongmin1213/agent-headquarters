@@ -70,6 +70,24 @@ let defaults: UserDefaults = env["HQ_DEFAULTS_SUITE"].flatMap { UserDefaults(sui
 let debug = env["HQ_DEBUG"] != nil
 func log(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!) }
 
+let petConfigPath = env["HQ_PET_CONFIG"] ?? (NSHomeDirectory() + "/.config/hq/pet.json")
+/// Speech bubble font size from pet.json: 10 when the file or key is missing, or the value is unusable (8...24 only).
+func bubbleFontSize(from data: Data?) -> CGFloat {
+    let fallback: CGFloat = 10
+    guard let data else { return fallback }
+    guard let obj = try? JSONSerialization.jsonObject(with: data), let dict = obj as? [String: Any] else {
+        log("pet.json: 올바른 JSON 객체가 아니어서 기본 글자 크기 10을 씁니다")
+        return fallback
+    }
+    guard let raw = dict["bubbleFontSize"] else { return fallback }
+    if let n = raw as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID(), n.doubleValue.isFinite, (8.0...24.0).contains(n.doubleValue) {
+        return CGFloat(n.doubleValue)
+    }
+    log("pet.json: bubbleFontSize는 8~24 사이의 숫자여야 해서 기본 글자 크기 10을 씁니다")
+    return fallback
+}
+let bubbleFont: CGFloat = bubbleFontSize(from: try? Data(contentsOf: URL(fileURLWithPath: petConfigPath)))
+
 func authed(_ url: URL, timeout: TimeInterval = 3) -> URLRequest {
     var r = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
     let token = (try? String(contentsOfFile: tokenPath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -199,7 +217,7 @@ func plateText(_ prefix: String, _ title: String, _ suffix: String, limit: Int =
         view.animates = false
         view.wantsLayer = true
         view.layer?.magnificationFilter = .nearest
-        for (f, pt) in [(bubble, 10.0), (badge, 9.0), (plate, 10.0)] {
+        for (f, pt) in [(bubble, bubbleFont), (badge, 9.0), (plate, 10.0)] {
             f.font = .systemFont(ofSize: pt, weight: f === badge ? .bold : .medium)
             f.wantsLayer = true; f.layer?.cornerRadius = f === plate ? 5 : 6
             f.drawsBackground = true; f.alignment = .center
@@ -270,7 +288,7 @@ func plateText(_ prefix: String, _ title: String, _ suffix: String, limit: Int =
     private func centered(_ w: CGFloat, _ bounds: NSRect) -> CGFloat { min(max(0, x + size / 2 - w / 2), bounds.width - w) }
     func bubbleFrame(_ bounds: NSRect) -> NSRect {
         let w = min(bubble.fittingSize.width + 12, slotWidth)
-        return NSRect(x: centered(w, bounds), y: y + size + 6, width: w, height: 16)
+        return NSRect(x: centered(w, bounds), y: y + size + 6, width: w, height: bubbleFont + 6)
     }
 
     func layout(_ bounds: NSRect) {
@@ -591,7 +609,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
             var lift: CGFloat = 0
             if !c.bubble.isHidden {
                 var r = c.bubbleFrame(bounds)
-                while placed.contains(where: { $0.insetBy(dx: -2, dy: 0).intersects(r) }) && lift < 100 { r.origin.y += 19; lift += 19 }
+                while placed.contains(where: { $0.insetBy(dx: -2, dy: 0).intersects(r) }) && lift < 100 { r.origin.y += bubbleFont + 9; lift += bubbleFont + 9 }
                 placed.append(r)
             }
             c.bubbleLift = lift
@@ -1224,6 +1242,10 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
 }
 
 // MARK: - Start
+if env["HQ_PET_PRINT_CONFIG"] == "1" {
+    print("bubbleFontSize=\(Double(bubbleFont))")
+    exit(0)
+}
 // Single instance: a second copy would draw a second set of characters over the first.
 if env["HQ_ALLOW_SECOND_INSTANCE"] != "1", let bid = Bundle.main.bundleIdentifier {
     let me = ProcessInfo.processInfo.processIdentifier
