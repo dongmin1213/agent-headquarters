@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { apiRequest, probeHq, readToken, waitFor, type HqProbe } from './api.ts'
-import { DAEMON_LABEL, daemonLog, lockFile, logsDir, pidFile, plistPath, runCmd, showCmd, type Ctx } from './ctx.ts'
+import { daemonLabel, daemonLog, launchdJob, launchdTarget, lockFile, logsDir, pidFile, plistPath, runCmd, showCmd, type Ctx, type LaunchdJob } from './ctx.ts'
 
 export const LOG_MAX_BYTES = 10 * 1024 * 1024
 export const LOG_KEEP = 3
@@ -19,9 +19,10 @@ export function rotateLog(file: string, maxBytes = LOG_MAX_BYTES, keep = LOG_KEE
   return true
 }
 
-export const launchdInstalled = (ctx: Ctx) => existsSync(plistPath(ctx, DAEMON_LABEL))
-const target = (ctx: Ctx) => `gui/${ctx.uid}/${DAEMON_LABEL}`
-const launchdLoaded = async (ctx: Ctx) => (await ctx.run('launchctl', ['print', target(ctx)], { timeoutMs: 5000 })).code === 0
+export const launchdInstalled = (ctx: Ctx) => existsSync(plistPath(ctx, daemonLabel(ctx)))
+const target = (ctx: Ctx) => launchdTarget(ctx, daemonLabel(ctx))
+/** This installation's daemon job state; null when no plist is installed. Only 'ours' may be signalled or kickstarted. */
+const daemonJob = async (ctx: Ctx): Promise<LaunchdJob | null> => (launchdInstalled(ctx) ? launchdJob(ctx, daemonLabel(ctx)) : null)
 
 export function readPid(ctx: Ctx): number | null {
   try { const n = Number(readFileSync(pidFile(ctx), 'utf8').trim()); return Number.isInteger(n) && n > 0 ? n : null } catch { return null }
@@ -113,10 +114,13 @@ export async function start(ctx: Ctx): Promise<number> {
   }
   mkdirSync(logsDir(ctx), { recursive: true })
   rotateLog(daemonLog(ctx))
-  if (launchdInstalled(ctx)) {
-    const r = await launchdLoaded(ctx)
+  const job = await daemonJob(ctx)
+  if (job === 'foreign') ctx.err(`경고: launchd 작업 ${daemonLabel(ctx)}는 다른 설치의 plist로 로드돼 있어 건드리지 않고 백그라운드 프로세스로 시작합니다`)
+  const viaLaunchd = job === 'ours' || job === 'unloaded'
+  if (viaLaunchd) {
+    const r = job === 'ours'
       ? await ctx.act('launchctl', ['kickstart', target(ctx)])
-      : await ctx.act('launchctl', ['bootstrap', `gui/${ctx.uid}`, plistPath(ctx, DAEMON_LABEL)])
+      : await ctx.act('launchctl', ['bootstrap', `gui/${ctx.uid}`, plistPath(ctx, daemonLabel(ctx))])
     if (r.code !== 0) { ctx.err(`launchctl 실패: ${r.stderr.trim()}`); return 1 }
   } else {
     const own = await killTarget(ctx)
@@ -135,12 +139,12 @@ export async function start(ctx: Ctx): Promise<number> {
     }
   }
   if (!(await waitUp(ctx))) return failStart(ctx)
-  ctx.out(`hq 시작됨 (127.0.0.1:${ctx.port}, ${launchdInstalled(ctx) ? 'launchd' : '백그라운드 프로세스'})`)
+  ctx.out(`hq 시작됨 (127.0.0.1:${ctx.port}, ${viaLaunchd ? 'launchd' : '백그라운드 프로세스'})`)
   return 0
 }
 
 export async function stop(ctx: Ctx): Promise<number> {
-  if (launchdInstalled(ctx) && await launchdLoaded(ctx)) {
+  if (await daemonJob(ctx) === 'ours') {
     // SIGTERM → daemon exits 0 → KeepAlive{SuccessfulExit:false} does not restart it. It comes back on next login or `hq start`.
     const r = await ctx.act('launchctl', ['kill', 'SIGTERM', target(ctx)])
     if (r.code !== 0 && !/not running|No such process/i.test(r.stderr)) { ctx.err(`launchctl 실패: ${r.stderr.trim()}`); return 1 }
@@ -166,7 +170,7 @@ export async function stop(ctx: Ctx): Promise<number> {
 }
 
 export async function restart(ctx: Ctx): Promise<number> {
-  if (launchdInstalled(ctx) && await launchdLoaded(ctx)) {
+  if (await daemonJob(ctx) === 'ours') {
     rotateLog(daemonLog(ctx))
     const r = await ctx.act('launchctl', ['kickstart', '-k', target(ctx)])
     if (r.code !== 0) { ctx.err(`launchctl 실패: ${r.stderr.trim()}`); return 1 }

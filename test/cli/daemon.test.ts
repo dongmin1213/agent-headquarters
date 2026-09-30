@@ -3,9 +3,10 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { rotateLog, start, stop, stopTarget } from '../../src/cli/daemon.ts'
-import { lockFile, pidFile } from '../../src/cli/ctx.ts'
-import { fakeDaemon, freePort, testCtx, tmp, writeToken } from './helpers.ts'
+import { createHash } from 'node:crypto'
+import { restart, rotateLog, start, stop, stopTarget } from '../../src/cli/daemon.ts'
+import { daemonLabel, launchdJobPath, lockFile, makeCtx, petLabel, pidFile, plistPath, type Ctx } from '../../src/cli/ctx.ts'
+import { fakeDaemon, freePort, testCtx, tmp, writeToken, type TestCtx } from './helpers.ts'
 import { NESTED_PS_SKIP, nestedSandbox } from '../nested.ts'
 
 test('start refuses when a live hq already answers on the port', async (t) => {
@@ -147,4 +148,117 @@ test('a dead lock pid with no command is still a stale lock, not a refusal', asy
   mkdirSync(ctx.home, { recursive: true })
   writeFileSync(lockFile(ctx), '999999\n')
   assert.equal(await stopTarget(ctx, async () => null), null)
+})
+
+// ---- per-installation launchd labels and job ownership ----
+
+test('launchd labels: default home + 7777 keeps the plain labels; any other installation gets a stable suffix', () => {
+  const user = tmp()
+  const mk = (env: Record<string, string>) => makeCtx({ PATH: process.env.PATH, HOME: user, HQ_LAUNCH_AGENTS_DIR: join(user, 'la'), ...env })
+  const def = mk({ HQ_HOME: join(user, '.hq') })
+  assert.equal(def.home, join(user, '.hq'))
+  assert.equal(daemonLabel(def), 'com.agent-headquarters.daemon')
+  assert.equal(petLabel(def), 'com.agent-headquarters.pet')
+  assert.equal(plistPath(def, daemonLabel(def)), join(user, 'la', 'com.agent-headquarters.daemon.plist'))
+  assert.equal(daemonLabel(mk({ HQ_HOME: `${user}/./.hq/`, HQ_PORT: '7777' })), 'com.agent-headquarters.daemon', 'resolved path compared')
+
+  const hex = (s: string) => createHash('sha256').update(s).digest('hex').slice(0, 8)
+  const other = mk({ HQ_HOME: '/tmp/x', HQ_PORT: '7790' })
+  assert.equal(daemonLabel(other), `com.agent-headquarters.${hex('/tmp/x:7790')}.daemon`)
+  assert.equal(petLabel(other), `com.agent-headquarters.${hex('/tmp/x:7790')}.pet`)
+  assert.equal(daemonLabel(mk({ HQ_HOME: '/tmp/x', HQ_PORT: '7790' })), daemonLabel(other), 'stable')
+  const portOnly = mk({ HQ_HOME: join(user, '.hq'), HQ_PORT: '7790' })
+  assert.equal(daemonLabel(portOnly), `com.agent-headquarters.${hex(`${join(user, '.hq')}:7790`)}.daemon`)
+  assert.notEqual(daemonLabel(portOnly), daemonLabel(other))
+})
+
+test('launchdJobPath reads the top-level path line only', () => {
+  const out = 'gui/501/com.x = {\n\tactive count = 1\n\tpath = /Users/me/Library/LaunchAgents/com.x.plist\n\tstdout path = /tmp/log\n\ttype = LaunchAgent\n}\n'
+  assert.equal(launchdJobPath(out), '/Users/me/Library/LaunchAgents/com.x.plist')
+  assert.equal(launchdJobPath('garbage'), null)
+})
+
+/** A ctx whose plist is installed and whose `launchctl print` reports `jobPath` (a function of the ctx). */
+function launchdCtx(port: number, jobPath: (ctx: Ctx) => string, dryRun = true): { ctx: TestCtx; calls: string[] } {
+  const calls: string[] = []
+  let self: TestCtx
+  const ctx = self = testCtx({ port, dryRun, run: async (cmd, args) => {
+    calls.push([cmd, ...args].join(' '))
+    if (cmd === 'launchctl' && args[0] === 'print') return { code: 0, stdout: `${args[1]} = {\n\tactive count = 1\n\tpath = ${jobPath(self)}\n\tstate = running\n}\n`, stderr: '' }
+    return { code: 0, stdout: '', stderr: '' }
+  } })
+  mkdirSync(ctx.agentsDir, { recursive: true })
+  writeFileSync(plistPath(ctx, daemonLabel(ctx)), '<plist/>')
+  return { ctx, calls }
+}
+const foreignJob = () => '/Users/someone/Library/LaunchAgents/com.agent-headquarters.daemon.plist'
+const ourJob = (ctx: Ctx) => plistPath(ctx, daemonLabel(ctx))
+const launchctlSignals = (text: string, calls: string[]) =>
+  [...text.split('\n'), ...calls].filter((l) => /launchctl (kill|kickstart|bootout|bootstrap)/.test(l))
+
+test('stop: a loaded job whose plist is not ours is never signalled; the pidfile/lock target is stopped instead',
+  { skip: nestedSandbox && NESTED_PS_SKIP }, async () => {
+    const { spawn } = await import('node:child_process')
+    const { ctx, calls } = launchdCtx(await freePort(), foreignJob, false)
+    mkdirSync(ctx.home, { recursive: true })
+    // Stand-in for the 7790 test daemon of the incident: a src/main.ts process named by the lock and pidfile.
+    const dir = tmp(); mkdirSync(join(dir, 'src'))
+    writeFileSync(join(dir, 'src/main.ts'), 'setInterval(() => {}, 1000)')
+    const d = spawn(process.execPath, [join(dir, 'src/main.ts')], { stdio: 'ignore' })
+    try {
+      await new Promise((r) => setTimeout(r, 200))
+      writeFileSync(pidFile(ctx), `${d.pid}\n`)
+      writeFileSync(lockFile(ctx), `${d.pid}\n`)
+      assert.equal(await stop(ctx), 0, ctx.text())
+      assert.deepEqual(launchctlSignals(ctx.text(), calls), [])
+      assert.ok(calls.some((c) => c.startsWith('launchctl print')), 'ownership was checked')
+      assert.match(ctx.text(), new RegExp(`hq 중지됨 \\(pid ${d.pid}\\)`))
+      await new Promise((r) => setTimeout(r, 100))
+      assert.ok(d.exitCode !== null || d.signalCode !== null, 'stand-in daemon stopped')
+    } finally { d.kill('SIGKILL') }
+  })
+
+test('stop: unparsable launchctl print output counts as not ours', async () => {
+  const { ctx, calls } = launchdCtx(await freePort(), () => '')
+  assert.equal(await stop(ctx), 0, ctx.text())
+  assert.deepEqual(launchctlSignals(ctx.text(), calls), [])
+  assert.match(ctx.text(), /실행 중이 아닙니다/)
+})
+
+test('stop: our own loaded job is stopped with launchctl kill SIGTERM as before', async () => {
+  const { ctx } = launchdCtx(await freePort(), ourJob)
+  assert.equal(await stop(ctx), 0, ctx.text())
+  assert.ok(ctx.text().includes(`[dry-run] launchctl kill SIGTERM gui/${ctx.uid}/${daemonLabel(ctx)}`), ctx.text())
+})
+
+test('restart: our job is kickstarted; a foreign job never is', async () => {
+  const ours = launchdCtx(await freePort(), ourJob)
+  assert.equal(await restart(ours.ctx), 0, ours.ctx.text())
+  assert.ok(ours.ctx.text().includes(`[dry-run] launchctl kickstart -k gui/${ours.ctx.uid}/${daemonLabel(ours.ctx)}`))
+
+  const foreign = launchdCtx(await freePort(), foreignJob)
+  assert.equal(await restart(foreign.ctx), 0, foreign.ctx.text())
+  assert.deepEqual(launchctlSignals(foreign.ctx.text(), foreign.calls), [])
+  assert.match(foreign.ctx.text(), /백그라운드/)
+})
+
+test('start: our loaded job is kickstarted; a foreign job is left alone (detached start instead)', async () => {
+  const ours = launchdCtx(await freePort(), ourJob)
+  assert.equal(await start(ours.ctx), 0, ours.ctx.text())
+  assert.ok(ours.ctx.text().includes(`[dry-run] launchctl kickstart gui/${ours.ctx.uid}/${daemonLabel(ours.ctx)}`))
+  assert.match(ours.ctx.text(), /launchd\)/)
+
+  const foreign = launchdCtx(await freePort(), foreignJob)
+  assert.equal(await start(foreign.ctx), 0, foreign.ctx.text())
+  assert.deepEqual(launchctlSignals(foreign.ctx.text(), foreign.calls), [])
+  assert.match(foreign.ctx.text(), /다른 설치의 plist로 로드돼 있어 건드리지 않고/)
+  assert.match(foreign.ctx.text(), /\[dry-run\] .*src\/main\.ts \(백그라운드/)
+})
+
+test('start: installed but unloaded job is bootstrapped from our plist', async () => {
+  const ctx = testCtx({ port: await freePort() }) // fake print: not loaded
+  mkdirSync(ctx.agentsDir, { recursive: true })
+  writeFileSync(plistPath(ctx, daemonLabel(ctx)), '<plist/>')
+  assert.equal(await start(ctx), 0, ctx.text())
+  assert.ok(ctx.text().includes(`[dry-run] launchctl bootstrap gui/${ctx.uid} ${plistPath(ctx, daemonLabel(ctx))}`))
 })

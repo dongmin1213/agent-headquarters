@@ -3,7 +3,7 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, sy
 import { delimiter, join, resolve } from 'node:path'
 import { loadConfig } from '../config.ts'
 import { probeHq, waitFor } from './api.ts'
-import { DAEMON_LABEL, PET_LABEL, daemonLog, findBin, logsDir, petApp, petBinary, petLog, plistPath, type Ctx, writeAtomic } from './ctx.ts'
+import { daemonLabel, daemonLog, findBin, launchdJob, launchdTarget, logsDir, petApp, petBinary, petLabel, petLog, plistPath, type Ctx, writeAtomic } from './ctx.ts'
 import { stopTarget } from './daemon.ts'
 import { printDoctor, realProbes, runDoctor, type Probes } from './doctor.ts'
 import { daemonPlist, launchPath, petPlist } from './plist.ts'
@@ -19,15 +19,18 @@ export function buildPlists(ctx: Ctx) {
   const path = launchPath([process.execPath, findBin(claudeName, ctx.env.PATH), findBin('git', ctx.env.PATH)])
   return {
     daemon: daemonPlist({
-      nodePath: process.execPath, root: ctx.root, home: ctx.home, port: ctx.port, path, logFile: daemonLog(ctx),
+      label: daemonLabel(ctx), nodePath: process.execPath, root: ctx.root, home: ctx.home, port: ctx.port, path, logFile: daemonLog(ctx),
       tokenFile: ctx.env.HQ_TOKEN_FILE ? ctx.tokenFile : undefined,
     }),
-    pet: petPlist({ appBinary: petBinary(ctx), logFile: petLog(ctx) }),
+    pet: petPlist({ label: petLabel(ctx), appBinary: petBinary(ctx), logFile: petLog(ctx) }),
   }
 }
 
+const foreignMsg = (label: string) => `launchd 작업 ${label}는 다른 설치의 plist로 이미 로드돼 있어 건드리지 않습니다. 확인: launchctl print gui/<uid>/${label}`
+
 async function bootstrap(ctx: Ctx, label: string): Promise<boolean> {
-  await ctx.act('launchctl', ['bootout', `gui/${ctx.uid}/${label}`]) // not loaded yet → error, ignored
+  if (await launchdJob(ctx, label) === 'foreign') { ctx.err(foreignMsg(label)); return false }
+  await ctx.act('launchctl', ['bootout', launchdTarget(ctx, label)]) // not loaded yet → error, ignored
   const r = await ctx.act('launchctl', ['bootstrap', `gui/${ctx.uid}`, plistPath(ctx, label)])
   if (r.code !== 0) { ctx.err(`launchctl bootstrap 실패 (${label}): ${r.stderr.trim()}`); return false }
   return true
@@ -91,7 +94,7 @@ export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
     ctx.out(`  백그라운드 데몬(pid ${moved.pid})을 멈추고 launchd로 옮깁니다`)
   } else {
     const p = await probeHq(ctx)
-    const ours = (await ctx.run('launchctl', ['print', `gui/${ctx.uid}/${DAEMON_LABEL}`], { timeoutMs: 5000 })).code === 0
+    const ours = await launchdJob(ctx, daemonLabel(ctx)) === 'ours'
     if ((p.kind === 'hq' || p.kind === 'unauthorized') && !ours) {
       ctx.err(`127.0.0.1:${ctx.port}에 직접 실행한 hq가 떠 있습니다. 그 프로세스를 먼저 종료하세요 (lsof -nP -iTCP:${ctx.port} -sTCP:LISTEN)`)
       return 1
@@ -103,13 +106,18 @@ export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
   const labels = tccLabels(tcc)
 
   ctx.out('5/6 LaunchAgent 등록 (로그인 때 자동 시작)')
-  mkdirSync(logsDir(ctx), { recursive: true })
+  for (const label of [daemonLabel(ctx), petLabel(ctx)]) {
+    if (await launchdJob(ctx, label) === 'foreign') { ctx.err(foreignMsg(label)); return 1 }
+  }
+  if (ctx.dryRun) ctx.out(`[dry-run] mkdir -p ${logsDir(ctx)}`)
+  else mkdirSync(logsDir(ctx), { recursive: true })
   const pl = buildPlists(ctx)
-  writeAtomic(plistPath(ctx, DAEMON_LABEL), pl.daemon)
-  writeAtomic(plistPath(ctx, PET_LABEL), pl.pet)
-  ctx.out(`  ${plistPath(ctx, DAEMON_LABEL)}`)
-  ctx.out(`  ${plistPath(ctx, PET_LABEL)}`)
-  if (!(await bootstrap(ctx, DAEMON_LABEL))) return 1
+  for (const [label, content] of [[daemonLabel(ctx), pl.daemon], [petLabel(ctx), pl.pet]] as const) {
+    if (ctx.dryRun) ctx.out(`[dry-run] write ${plistPath(ctx, label)}`)
+    else writeAtomic(plistPath(ctx, label), content)
+    ctx.out(`  ${plistPath(ctx, label)}`)
+  }
+  if (!(await bootstrap(ctx, daemonLabel(ctx)))) return 1
 
   ctx.out('6/6 데몬 응답 확인')
   if (ctx.dryRun) ctx.out('[dry-run] 데몬 응답 확인 생략')
@@ -126,7 +134,7 @@ export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
       return 1
     }
   }
-  if (!(await bootstrap(ctx, PET_LABEL))) return 1
+  if (!(await bootstrap(ctx, petLabel(ctx)))) return 1
   ctx.out(`  데몬 응답 확인됨 (127.0.0.1:${ctx.port}), 펫 실행`)
 
   linkHint(ctx)
@@ -140,8 +148,9 @@ export async function uninstall(ctx: Ctx, opts: { purge: boolean; yes: boolean }
     ctx.err(`--purge는 ${ctx.home} (DB·worktree·증거)와 토큰 파일을 지웁니다. 확인하려면 --purge --yes`)
     return 2
   }
-  for (const label of [PET_LABEL, DAEMON_LABEL]) {
-    await ctx.act('launchctl', ['bootout', `gui/${ctx.uid}/${label}`])
+  for (const label of [petLabel(ctx), daemonLabel(ctx)]) {
+    if (await launchdJob(ctx, label) === 'foreign') ctx.err(`경고: ${foreignMsg(label)}`)
+    else await ctx.act('launchctl', ['bootout', launchdTarget(ctx, label)])
     const f = plistPath(ctx, label)
     if (existsSync(f)) {
       if (ctx.dryRun) ctx.out(`[dry-run] rm ${f}`)

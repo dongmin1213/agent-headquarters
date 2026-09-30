@@ -1,13 +1,13 @@
 // Shared CLI context: resolved paths, env overrides, output sinks and command runners.
 // Every side effect (launchctl, open, build scripts) goes through `act`, which only prints under HQ_DRY_RUN=1.
 import { execFile } from 'node:child_process'
-import { existsSync, mkdirSync, renameSync, writeFileSync, chmodSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, realpathSync, renameSync, writeFileSync, chmodSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
 import { loadConfig } from '../config.ts'
 
-export const DAEMON_LABEL = 'com.agent-headquarters.daemon'
-export const PET_LABEL = 'com.agent-headquarters.pet'
+const LABEL_BASE = 'com.agent-headquarters'
 
 export interface ExecResult { code: number; stdout: string; stderr: string }
 export interface RunOpts { timeoutMs?: number; cwd?: string; env?: NodeJS.ProcessEnv }
@@ -111,6 +111,43 @@ export const pidFile = (ctx: Ctx) => join(ctx.home, 'daemon.pid')
 /** Written by the daemon itself (single-instance lock, exec-engine-spec §134). */
 export const lockFile = (ctx: Ctx) => join(ctx.home, 'daemon.lock')
 export const plistPath = (ctx: Ctx, label: string) => join(ctx.agentsDir, `${label}.plist`)
+
+/**
+ * launchd labels are global per user, so each installation gets its own. The default installation
+ * (HQ_HOME = ~/.hq and port 7777) keeps the plain labels it has always used; any other one gets
+ * `com.agent-headquarters.<8 hex of sha256("<home>:<port>")>.daemon|pet`.
+ */
+export function installSuffix(ctx: Ctx): string | null {
+  const home = resolve(ctx.home)
+  if (home === resolve(ctx.userHome, '.hq') && ctx.port === 7777) return null
+  return createHash('sha256').update(`${home}:${ctx.port}`).digest('hex').slice(0, 8)
+}
+const label = (ctx: Ctx, kind: 'daemon' | 'pet') => { const s = installSuffix(ctx); return s ? `${LABEL_BASE}.${s}.${kind}` : `${LABEL_BASE}.${kind}` }
+export const daemonLabel = (ctx: Ctx) => label(ctx, 'daemon')
+export const petLabel = (ctx: Ctx) => label(ctx, 'pet')
+export const launchdTarget = (ctx: Ctx, l: string) => `gui/${ctx.uid}/${l}`
+
+/** The `path = <plist>` line of `launchctl print` output (the job's top-level plist), or null. */
+export function launchdJobPath(printOut: string): string | null {
+  const m = /^[ \t]*path = (.+?)[ \t]*$/m.exec(printOut)
+  return m ? m[1] : null
+}
+const samePath = (a: string, b: string) => {
+  if (resolve(a) === resolve(b)) return true
+  try { return realpathSync(a) === realpathSync(b) } catch { return false }
+}
+
+export type LaunchdJob = 'ours' | 'foreign' | 'unloaded'
+/**
+ * Whether the loaded job `label` is this installation's: its plist path must be exactly plistPath(ctx, label).
+ * 'foreign' (another installation's job, or output we cannot parse) must never be signalled, kickstarted or booted out.
+ */
+export async function launchdJob(ctx: Ctx, l: string): Promise<LaunchdJob> {
+  const r = await ctx.run('launchctl', ['print', launchdTarget(ctx, l)], { timeoutMs: 5000 })
+  if (r.code !== 0) return 'unloaded'
+  const p = launchdJobPath(r.stdout)
+  return p !== null && samePath(p, plistPath(ctx, l)) ? 'ours' : 'foreign'
+}
 export const petApp = (ctx: Ctx) => join(ctx.root, 'pet/HQPet.app')
 export const petBinary = (ctx: Ctx) => join(petApp(ctx), 'Contents/MacOS/hqpet')
 export const projectsFile = (ctx: Ctx) => join(ctx.root, 'config/projects.json')

@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { DAEMON_LABEL, PET_LABEL, petBinary, plistPath } from '../../src/cli/ctx.ts'
+import { daemonLabel, petBinary, petLabel, plistPath } from '../../src/cli/ctx.ts'
 import { runDoctor, type Probes } from '../../src/cli/doctor.ts'
 import { install } from '../../src/cli/install.ts'
 import { protectedFolders } from '../../src/cli/tcc.ts'
@@ -36,7 +36,7 @@ function rootUnder(ctx: TestCtx, folder: string): void {
 
 function withAgents(ctx: TestCtx): TestCtx {
   mkdirSync(ctx.agentsDir, { recursive: true })
-  for (const l of [DAEMON_LABEL, PET_LABEL]) writeFileSync(plistPath(ctx, l), '<plist/>')
+  for (const l of [daemonLabel(ctx), petLabel(ctx)]) writeFileSync(plistPath(ctx, l), '<plist/>')
   return ctx
 }
 
@@ -66,7 +66,7 @@ test('doctor tcc: outside protected folders → ok; placed after the autostart c
   const i = checks.findIndex((x) => x.id === 'tcc')
   assert.equal(checks[i].status, 'ok')
   assert.match(checks[i].detail, /보호 폴더\(데스크탑·문서·다운로드\) 밖/)
-  assert.equal(checks[i - 1].id, `launchd:${PET_LABEL}`)
+  assert.equal(checks[i - 1].id, `launchd:${petLabel(ctx)}`)
 })
 
 test('doctor tcc: registered project under Documents counts; bad projects.json is skipped silently', async () => {
@@ -80,11 +80,17 @@ test('doctor tcc: registered project under Documents counts; bad projects.json i
 
 /** Non-dry install ctx: launchctl/build faked via ctx.run, pet binary pre-created. */
 function realCtx(port: number, calls: string[]): TestCtx {
-  return testCtx({ port, dryRun: false, run: async (cmd, args) => { calls.push([cmd, ...args].join(' ')); return { code: 0, stdout: '', stderr: '' } } })
+  const ctx: TestCtx = testCtx({ port, dryRun: false, run: async (cmd, args) => {
+    calls.push([cmd, ...args].join(' '))
+    // launchctl print: the job is loaded from this installation's own plist.
+    if (cmd === 'launchctl' && args[0] === 'print') return { code: 0, stdout: `${args[1]} = {\n\tpath = ${plistPath(ctx, args[1].split('/').pop()!)}\n}\n`, stderr: '' }
+    return { code: 0, stdout: '', stderr: '' }
+  } })
+  return ctx
 }
 function petBuilt(ctx: TestCtx) { mkdirSync(dirname(petBinary(ctx)), { recursive: true }); writeFileSync(petBinary(ctx), '') }
 const installProbes = probes({ launchctlLoaded: async () => false, pgrep: async () => false })
-const petBootstrapped = (calls: string[]) => calls.some((c) => c.startsWith('launchctl bootstrap') && c.includes(PET_LABEL))
+const petBootstrapped = (calls: string[]) => calls.some((c) => c.startsWith('launchctl bootstrap') && /^launchctl bootstrap gui\/\d+ \S+\/com\.agent-headquarters\.[0-9a-f]{8}\.pet\.plist$/.test(c))
 
 test('install: protected root and daemon never responds → exit 1 with the 허용 / 90초 message, pet not bootstrapped', async () => {
   const calls: string[] = []
@@ -94,7 +100,7 @@ test('install: protected root and daemon never responds → exit 1 with the 허�
   assert.match(err, /90초/); assert.match(err, /허용/); assert.match(err, /파일 및 폴더/)
   assert.match(ctx.text(), /'node'의 데스크탑 폴더 접근 허용 창을 띄우면 \[허용\]을 눌러 주세요 \(처음 한 번\)/)
   assert.match(ctx.text(), /응답 기다리는 중… \(최대 90초\)/)
-  assert.ok(calls.some((c) => c.startsWith('launchctl bootstrap') && c.includes(DAEMON_LABEL)))
+  assert.ok(calls.some((c) => c.startsWith('launchctl bootstrap') && c.includes(daemonLabel(ctx))))
   assert.equal(petBootstrapped(calls), false)
 })
 
@@ -107,7 +113,7 @@ test('install: protected root and daemon responds → notice printed, pet bootst
     assert.equal(await install(ctx, { sprites: false, probes: installProbes, protectedWaitMs: 2000 }), 0, ctx.text())
     assert.match(ctx.text(), /'node'의 데스크탑 폴더 접근 허용 창을 띄우면 \[허용\]/)
     assert.ok(petBootstrapped(calls))
-    assert.ok(existsSync(plistPath(ctx, PET_LABEL)))
+    assert.ok(existsSync(plistPath(ctx, petLabel(ctx))))
   } finally { server.close() }
 })
 
