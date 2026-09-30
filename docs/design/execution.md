@@ -163,7 +163,7 @@ schema_version: pragma user_version
 - **무효화**: 선행 작업의 산출물(코드 `head_sha` 또는 collect 보고서 해시)이 바뀌면 전이적으로 의존하는 모든 작업의 generation +1, 살아 있는 시도 종료 확인, `pending`, 작업 복제본 폐기(미러 ref는 보관), attempts 0(시도 번호 n은 계속 증가), 이전 질문·세션·base·검증·검토 무효. 수락 카드가 열려 있으면 superseded.
 
 ## 12. 수락·통합·병합
-- 모든 작업이 `passed` 또는 `cancelled`(최소 1개 passed) → 프로젝트별 **통합**: 통합 worktree를 대상 브랜치의 현재 SHA에서 만들고 통과 작업의 **기록된 head SHA**를 계획 순서로 `--no-ff` 병합 → setup → 모든 작업의 non-manual check + 비밀값 검사. 결과 `integration_sha`. 충돌·검사 실패 → 요청 `blocked` + 카드 `integration:<req>:<project>`(다시 통합 / 요청 중단). 통합에는 기존 실패 면제가 없다: 작업 검증에서 기존 실패였던 검사가 통합본에서도 실패하면 `기존 실패 검사 <id>(<command>)가 통합본에서도 실패해요 · …`로 통합 실패.
+- 모든 작업이 `passed` 또는 `cancelled`(최소 1개 passed) → 프로젝트별 **통합**: 통합 worktree를 대상 브랜치의 현재 SHA에서 만들고 통과 작업의 **기록된 head SHA**를 계획 순서로 `--no-ff` 병합 → setup → 모든 작업의 non-manual check + 비밀값 검사. 결과 `integration_sha`. 충돌·검사 실패 → 요청 `blocked` + 카드 `integration:<req>:<project>`(다시 통합 / 요청 중단). 통합에는 기존 실패 면제가 없다: 작업 검증에서 기존 실패였던 검사가 통합본에서도 실패하면 `기존 실패 검사 <id>(<command>)가 통합본에서도 실패해요 · …`로 통합 실패. 실패가 모두 기존 실패이고 작업 검토자가 각각 `pass`(악화 없음)로 판정했으면 통합 카드에 `기존 실패로 인정하고 진행`이 추가된다: 인정한 id와 integration_sha를 merges.known_failures(스키마 6)에 기록하고 같은 SHA로 병합 단계에 넘어간다(병합 카드에 `회장이 인정한 기존 실패: [id] command`). 새 통합은 인정을 물려받지 않는다.
 - 수락 카드 `accept:<req>` (옵션 `수락`·`반려`), subject = 정렬된 `(taskId, generation, head_sha, report sha256, checks 결과 해시, verdict 해시)`. **수락은 작업 결과에 대한 판단**이고, 통합 SHA는 병합 카드가 묶는다(재통합돼도 수락은 유지, 병합 카드가 새 통합 SHA와 "대상 브랜치에 새로 생긴 커밋 N개"를 보여 준다). 통합 검사는 실제로 포함한 passed 작업의 기준만 실행한다.
 - 반려는 `POST /api/requests/:id/reject {reason(필수), subjectHash, tasks?}` 로만(카드의 `반려` 결정은 거부 409). 계획 카드 `반려` → 요청 `rejected`.
 - 통합 충돌·검사 실패 카드 선택지: `다시 통합` · `해당 작업 재작업`(새 대상 위에서, 무효화 규칙) · `요청 중단`. 다중 의존 base 충돌도 같은 카드.

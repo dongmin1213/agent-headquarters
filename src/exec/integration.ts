@@ -11,7 +11,9 @@ export interface IntegrationHead { taskId: string; title: string; sha: string }
 export type IntegrationResult =
   | { kind: 'ok'; sha: string; targetSha: string; checks: ChecksFile }
   | { kind: 'conflict'; files: string[]; targetSha: string; taskId: string }
-  | { kind: 'failed'; targetSha: string | null; checks: ChecksFile | null; reason: string }
+  | { kind: 'failed'; targetSha: string | null; checks: ChecksFile | null; reason: string
+      /** Set when the only failures are base-failed checks (ids in `known`): the integration commit, kept under the integration ref. */
+      sha?: string; known?: { id: string; command: string }[] }
 
 export const integrationRef = (requestId: string, project: string) => `refs/hq/integration/${requestId}/${project}`
 
@@ -43,6 +45,12 @@ export async function integrate(o: {
     if (!checks.pass) {
       if (checks.error) return { kind: 'failed', targetSha, checks, reason: checks.error }
       const others = checks.checks.filter((c) => !c.pass && !carried.includes(c)).map((c) => c.id)
+      if (!others.length && !checks.secrets.length) {
+        // Only known (base-failed) failures: the chairman may accept them for this commit, so keep it reachable.
+        await withRepo(o.mirror, () => hqGitOk(o.mirror, null, ['update-ref', integrationRef(o.requestId, o.project), sha]))
+        return { kind: 'failed', targetSha, checks, sha, known: carried.map((c) => ({ id: c.id, command: c.command })),
+          reason: carried.map((c) => `기존 실패 검사 ${c.id}(${c.command})가 통합본에서도 실패해요 · 작업 검토 뒤 대상 브랜치가 바뀌었을 수 있어 확인이 필요해요`).join('\n') }
+      }
       const reason = [...carried.map((c) => `기존 실패 검사 ${c.id}(${c.command})가 통합본에서도 실패해요 · 작업 검토 뒤 대상 브랜치가 바뀌었을 수 있어 확인이 필요해요`),
         ...(others.length || checks.secrets.length ? [`통합 검사 실패: ${[...others, ...(checks.secrets.length ? ['비밀값 탐지'] : [])].join(', ')}`] : [])].join('\n')
       return { kind: 'failed', targetSha, checks, reason }

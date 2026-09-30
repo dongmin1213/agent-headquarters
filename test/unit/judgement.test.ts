@@ -3,7 +3,7 @@
 // object checks on fetches from worker clones.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import * as ceo from '../../src/ceo.ts'
@@ -120,7 +120,10 @@ test('F02. task verification: a base-failed check exiting 127 / timing out on th
   assert.equal(r.pass, false)
 })
 
-test('F02. runner: a base-failed item passes task review but stops at the integration card with the reason', async () => {
+const KNOWN = '기존 실패로 인정하고 진행'
+const knownOffer = (h: Harness, id: string) => JSON.parse(h.store.get(`integration.known:${id}:p`) ?? 'null') as { sha: string } | null
+
+test('F02. runner: a base-failed item passes task review but stops at the integration card; the chairman may accept it for that SHA', async () => {
   const h = harness()
   try {
     const id = h.plan([task('A', { acceptance: [{ id: 'R1', text: '기존에 깨진 검사', check: 'ls missing.txt', kind: 'regression' }] })])
@@ -131,7 +134,67 @@ test('F02. runner: a base-failed item passes task review but stops at the integr
     assert.equal(m.state, 'failed')
     assert.equal(m.note, '기존 실패 검사 A.R1(ls missing.txt)가 통합본에서도 실패해요 · 작업 검토 뒤 대상 브랜치가 바뀌었을 수 있어 확인이 필요해요')
     assert.deepEqual(JSON.parse(h.store.get(`integration.tasks:${id}:p`) ?? '[]'), [`${id}.A`])
+    // Option present: the only failure is base-failed and the reviewer judged it pass.
+    const card = h.store.approval(`integration:${id}:p`)!
+    assert.ok(card.options.includes(KNOWN), JSON.stringify(card.options))
+    const offer = knownOffer(h, id)!
+    const item = decisionItems(h.store, h.clock.t).find((d) => d.id === card.id)!
+    assert.equal(item.optionHelp[KNOWN], `이 검사들은 작업 전부터 실패했고 검토자가 악화 없음으로 판정했어요 · 통합본(${offer.sha.slice(0, 10)})을 그대로 병합 단계로 넘겨요`)
+    // Choosing it: merge row carries the acknowledgment for that SHA; accept → merge card for the same SHA.
+    await h.decide(card.id, KNOWN)
+    const acked = h.store.mergeRow(id, 'p')!
+    assert.equal(acked.state, 'integrated')
+    assert.equal(acked.integration_sha, offer.sha)
+    assert.deepEqual(JSON.parse(acked.known_failures!), { sha: offer.sha, items: [{ id: 'A.R1', command: 'ls missing.txt' }] })
+    await h.waitFor(() => req(h, id).status === 'awaiting_acceptance', 'awaiting_acceptance')
+    await h.decide(`accept:${id}`, '수락')
+    await h.waitFor(() => h.store.approval(`merge:${id}:p`)?.state === 'open', 'merge card')
+    assert.equal(h.store.mergeRow(id, 'p')!.integration_sha, offer.sha)
+    assert.match(h.store.approval(`merge:${id}:p`)!.body, /^회장이 인정한 기존 실패: \[A\.R1\] ls missing\.txt$/m)
+    // The target moves: the merge re-integrates on a new SHA; the acknowledgment does not carry over and a new card asks again.
+    const rev = h.store.approval(`integration:${id}:p`)!.revision
+    commitFile(h.repo, 'other.txt', 'x\n', 'target moved')
+    assert.match((await h.decide(`merge:${id}:p`, '병합')) ?? '', /./)
+    await h.waitFor(() => h.store.approval(`integration:${id}:p`)!.revision > rev && h.store.approval(`integration:${id}:p`)!.state === 'open', 'new integration card')
+    const again = h.store.mergeRow(id, 'p')!
+    assert.equal(again.known_failures, null)
+    const offer2 = knownOffer(h, id)!
+    assert.notEqual(offer2.sha, offer.sha)
+    assert.ok(h.store.approval(`integration:${id}:p`)!.options.includes(KNOWN))
   } finally { await h.close() }
+})
+
+test('F02. no 기존 실패 option when the reviewer did not judge the item pass', async () => {
+  const h = harness()
+  try {
+    const id = h.plan([task('A', { acceptance: [{ id: 'R1', text: '기존에 깨진 검사', check: 'ls missing.txt', kind: 'regression' }] })])
+    await h.approve(id)
+    await h.waitFor(() => h.store.approval(`integration:${id}:p`)?.state === 'open', 'integration card')
+    // Doctor the stored verdict (a reviewer that left the item unjudged), then integrate again.
+    const review = h.store.attempts(`${id}.A`).find((a) => a.kind === 'review' && a.outcome === 'pass')!
+    const vpath = join(hqDirOf(review), 'verdict.json')
+    const v = JSON.parse(readFileSync(vpath, 'utf8'))
+    v.criteria = v.criteria.map((c: { id: string }) => (c.id === 'R1' ? { ...c, result: 'manual' } : c))
+    writeFileSync(vpath, JSON.stringify(v))
+    const rev = h.store.approval(`integration:${id}:p`)!.revision
+    await h.decide(`integration:${id}:p`, '다시 통합')
+    await h.waitFor(() => h.store.approval(`integration:${id}:p`)!.revision > rev && h.store.approval(`integration:${id}:p`)!.state === 'open', 'new card')
+    assert.equal(h.store.approval(`integration:${id}:p`)!.options.includes(KNOWN), false)
+    assert.equal(knownOffer(h, id), null)
+  } finally { await h.close() }
+})
+
+test('F02. integrate(): a failing check that is not base-failed means no acknowledgment offer', async () => {
+  const e = await repoEnv({ 'README.md': '# t\n' })
+  const head = commitFile(e.repo, 'src/a.txt', 'x\n')
+  await ensureMirror({ id: 'p', path: e.repo }, e.mirror)
+  const path = join(e.home, 'worktrees', 'r', '_integration-p')
+  const res = await integrate({ mirror: e.mirror, requestId: 'r', project: 'p', path, target: 'main', heads: [{ taskId: 'r.A', title: 'A', sha: head }], setup: null,
+    checks: [{ id: 'A.R1', command: 'ls missing.txt', kind: 'regression', baseFailed: true }, { id: 'A.N', command: 'ls nope.txt', kind: 'regression' }],
+    timeoutMs: 20_000, sandbox: e.sb(path), profilePath: join(e.dir, 'i.sb') })
+  assert.equal(res.kind, 'failed')
+  assert.equal((res as { known?: unknown }).known, undefined)
+  assert.match((res as { reason: string }).reason, /통합 검사 실패: A\.N/)
 })
 
 // ----- F03 -----

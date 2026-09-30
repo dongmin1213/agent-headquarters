@@ -107,3 +107,15 @@ export function harness(o: { cfg?: Partial<HqConfig>; repoFiles?: Record<string,
 
 export const req = (h: Harness, id: string) => h.store.request(id)!
 export const tsk = (h: Harness, id: string) => h.store.task(id)!
+
+/** F02 path: an integration card offering 기존 실패로 인정하고 진행 → accept it → 수락 → 병합 → merged. */
+export async function acceptKnownToMerged(h: Harness, id: string): Promise<void> {
+  await h.waitFor(() => h.store.approval(`integration:${id}:p`)?.state === 'open', 'integration card')
+  if (!h.store.approval(`integration:${id}:p`)!.options.includes('기존 실패로 인정하고 진행')) throw new Error('no 기존 실패 option')
+  await h.decide(`integration:${id}:p`, '기존 실패로 인정하고 진행')
+  await h.waitFor(() => req(h, id).status === 'awaiting_acceptance', 'awaiting_acceptance')
+  await h.decide(`accept:${id}`, '수락')
+  await h.waitFor(() => h.store.approval(`merge:${id}:p`)?.state === 'open', 'merge card')
+  await h.decide(`merge:${id}:p`, '병합')
+  await h.waitFor(() => req(h, id).status === 'merged', 'merged')
+}

@@ -28,6 +28,13 @@ export const OPTION_HELP: Record<string, string> = {
 const PLAN_HELP = { 승인: '계획대로 작업을 시작해요 · 사용량이 들어요', 반려: '계획을 버리고 이 요청을 끝내요' }
 const REVISE_HELP = { 승인: '고친 지시서로 이 작업을 다시 해요 · 사용량이 들어요', 반려: '수정안을 버리고 이 작업을 멈춤 상태로 둬요 · 다음 결정은 차단 카드에서 해요' }
 const INTEGRATION_HELP = { '다시 통합': '대상 브랜치의 최신 커밋 위에서 합치기와 검사를 다시 해요 · 사용량은 들지 않아요', '해당 작업 재작업': '문제가 된 작업을 대상 브랜치의 최신 커밋 위에서 처음부터 다시 해요 · 사용량이 들어요', '요청 중단': OPTION_HELP.stop }
+const ACCEPT_KNOWN = '기존 실패로 인정하고 진행'
+function integrationHelp(store: Store, requestId: string, project: string, options: string[]): Record<string, string> {
+  if (!options.includes(ACCEPT_KNOWN)) return INTEGRATION_HELP
+  let sha = '?'
+  try { sha = (JSON.parse(store.get(`integration.known:${requestId}:${project}`) ?? '{}') as { sha?: string }).sha?.slice(0, 10) ?? '?' } catch { /* shown as ? */ }
+  return { ...INTEGRATION_HELP, [ACCEPT_KNOWN]: `이 검사들은 작업 전부터 실패했고 검토자가 악화 없음으로 판정했어요 · 통합본(${sha})을 그대로 병합 단계로 넘겨요` }
+}
 const SYSTEM_HELP = { '다시 확인': '로그인 후 누르면 다음 작업부터 다시 시도해요' }
 const teamOptionHelp = (o: string) => o === '보류' ? '지금은 고르지 않아요 · 팀이 나중에 다시 물어요' : o === '반려' ? '팀이 이 항목을 진행하지 않아요' : '이 선택으로 팀이 다음 단계를 진행해요'
 
@@ -82,7 +89,7 @@ export function decisionItems(store: Store, now = Date.now(), teamNames: Record<
       const project = a.id.split(':')[2]
       const m = store.mergeRow(requestId, project)
       ex = diagnosed(m?.diagnosis ?? null, a.options, { situation: `프로젝트 ${project}의 결과를 대상 브랜치 위에 합치다 문제가 생겼어요`,
-        cause: m?.note ?? firstLine(a.body), causeConfirmed: true, recommendation: null, optionHelp: INTEGRATION_HELP })
+        cause: m?.note ?? firstLine(a.body), causeConfirmed: true, recommendation: null, optionHelp: integrationHelp(store, requestId, project, a.options) })
     } else if (a.kind === 'accept') {
       const passed = store.tasks(requestId).filter((t) => t.status === 'passed').length
       ex = { situation: `작업 ${passed}개가 검사·검토를 통과했어요 · 결과를 확인하고 수락해 주세요`, cause: null, causeConfirmed: false, recommendation: null,

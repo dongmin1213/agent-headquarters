@@ -75,6 +75,11 @@ const BACKOFF_MIN = [15, 30, 60]
 export const TERMINAL_REQUEST = new Set(['merged', 'rejected', 'failed', 'cancelled', 'expired'])
 const UNCOUNTED_PREV = new Set(['limited', 'transient', 'start_failed', 'brief_blocked'])
 export const INTEGRATION_OPTIONS = ['다시 통합', '해당 작업 재작업', '요청 중단']
+/** Extra integration option (wire value = label, like the other integration options): accept known base failures for one integration SHA. */
+export const ACCEPT_KNOWN = '기존 실패로 인정하고 진행'
+/** kv key of the acknowledgment an integration card offers: `{ sha, target, targetSha, items: [{ id, command }] }`. */
+export const knownKey = (requestId: string, project: string) => `integration.known:${requestId}:${project}`
+export interface KnownOffer { sha: string; target: string; targetSha: string; items: { id: string; command: string }[] }
 export const LOGIN_CARD = 'system:login'
 
 export const specOf = (t: TaskRow) => JSON.parse(t.spec) as PlanTask
@@ -1102,18 +1107,20 @@ export class Runner {
 
   private async runIntegration(requestId: string, projectId: string): Promise<void> {
     const project = this.project(projectId)!
-    this.store.putMerge(requestId, projectId, { state: 'integrating' })
+    // A new integration never inherits an earlier acknowledgment (it was bound to the old integration SHA).
+    this.store.tx(() => { this.store.putMerge(requestId, projectId, { state: 'integrating', known_failures: null }); this.store.set(knownKey(requestId, projectId), null) })
     const prevNote = this.store.mergeRow(requestId, projectId)?.note ?? null
     const tasks = this.store.tasks(requestId).filter((t) => t.project === projectId && t.role === 'implement' && t.status === 'passed')
     const hq = join(this.home, 'runs', requestId, `_integration-${projectId}`, 'hq')
     mkdirSync(hq, { recursive: true })
-    const fail = (state: string, note: string, body: string, taskIds: string[]) => this.store.tx(() => {
+    const fail = (state: string, note: string, body: string, taskIds: string[], known: KnownOffer | null = null) => this.store.tx(() => {
       this.store.putMerge(requestId, projectId, { state, note, diagnosis: null })
       this.store.set(`integration.tasks:${requestId}:${projectId}`, JSON.stringify(taskIds))
+      this.store.set(knownKey(requestId, projectId), known ? JSON.stringify(known) : null)
       const r = this.store.request(requestId)!
       if (!TERMINAL_REQUEST.has(r.status)) this.store.updateRequest(requestId, { status: 'blocked', note })
       this.store.putApproval({ id: `integration:${requestId}:${projectId}`, teamId: 'hq', subjectId: requestId, title: `통합 실패: ${project.name}`,
-        body, options: INTEGRATION_OPTIONS, subjectHash: sha256(`${requestId}:${projectId}:${note}:${this.now()}`) })
+        body, options: known ? [...INTEGRATION_OPTIONS, ACCEPT_KNOWN] : INTEGRATION_OPTIONS, subjectHash: sha256(`${requestId}:${projectId}:${note}:${known?.sha ?? ''}:${this.now()}`) })
     })
     const target = await currentBranch(project.path)
     if (!target) { fail('failed', `프로젝트 ${project.name} checkout이 브랜치가 아니라서(detached HEAD) 통합할 대상이 없어요`, '프로젝트 checkout을 브랜치로 되돌린 뒤 다시 통합하세요.', []); return }
@@ -1137,7 +1144,16 @@ export class Runner {
     }
     if (res.kind === 'failed') {
       const failedIds = new Set((res.checks?.checks ?? []).filter((c) => !c.pass && !c.baseFailed).map((c) => c.id.split('.')[0]))
-      fail('failed', res.reason, res.reason, tasks.filter((t) => failedIds.has(t.key)).map((t) => t.id))
+      // Every failure is a base-failed check the task reviewer judged `pass` (no worse): the chairman may accept them.
+      const judgedPass = (id: string) => {
+        const i = id.indexOf('.'), t = tasks.find((x) => x.key === id.slice(0, i))
+        const review = t ? this.store.attempts(t.id).filter((a) => a.kind === 'review' && a.outcome === 'pass' && a.generation === t.generation).at(-1) : undefined
+        const v = review ? readJson<Verdict>(join(hqDirOf(review), 'verdict.json')) : null
+        return v?.head_sha === t?.head_sha && v?.criteria.find((c) => c.id === id.slice(i + 1))?.result === 'pass'
+      }
+      const known = res.sha && res.known?.length && res.targetSha && res.known.every((k) => judgedPass(k.id))
+        ? { sha: res.sha, target, targetSha: res.targetSha, items: res.known } : null
+      fail('failed', res.reason, res.reason, tasks.filter((t) => failedIds.has(t.key)).map((t) => t.id), known)
       return
     }
     this.store.tx(() => {
@@ -1151,6 +1167,19 @@ export class Runner {
     const m = this.store.mergeRow(requestId, projectId)
     if (decision === '요청 중단') return this.cancelRequestTx(requestId)
     if (!m || !['conflict', 'failed'].includes(m.state)) return '다시 통합할 수 있는 상태가 아닙니다'
+    if (decision === ACCEPT_KNOWN) {
+      const raw = this.store.get(knownKey(requestId, projectId))
+      if (m.state !== 'failed' || !raw) return '기존 실패로 인정할 수 있는 통합이 아닙니다'
+      const k = JSON.parse(raw) as KnownOffer
+      // The acknowledgment is recorded on the merge row and bound to this integration SHA; the merge card follows for the same SHA.
+      this.store.putMerge(requestId, projectId, { state: 'integrated', target: k.target, target_sha: k.targetSha, integration_sha: k.sha, note: null,
+        known_failures: JSON.stringify({ sha: k.sha, items: k.items }) })
+      this.store.set(knownKey(requestId, projectId), null)
+      const r = this.store.request(requestId)!
+      const accepted = this.store.approval(`accept:${requestId}`)?.decision === '수락'
+      if (r.status === 'blocked' && !this.store.tasks(requestId).some((t) => t.status === 'blocked')) this.store.updateRequest(requestId, { status: accepted ? 'accepted' : 'executing', note: null })
+      return null
+    }
     const accepted = this.store.approval(`accept:${requestId}`)?.decision === '수락'
     if (decision === '해당 작업 재작업') {
       // The named tasks start over on top of the current target (invalidation rules, §12); integration restarts later.
@@ -1221,7 +1250,9 @@ export class Runner {
     const project = this.project(projectId)!
     const tasks = this.store.tasks(requestId).filter((t) => t.project === projectId && t.role === 'implement' && t.status === 'passed')
     const newCommits = this.store.get(`targetAhead:${requestId}:${projectId}`)
-    const body = [...(m.note ? [m.note, ''] : []), `대상: ${project.name} ${m.target} (${m.target_sha?.slice(0, 10)})`,
+    const known = m.known_failures ? JSON.parse(m.known_failures) as { sha: string; items: { id: string; command: string }[] } : null
+    const knownLines = known && known.sha === m.integration_sha ? known.items.map((i) => `회장이 인정한 기존 실패: [${i.id}] ${i.command}`) : []
+    const body = [...(m.note ? [m.note, ''] : []), ...knownLines, `대상: ${project.name} ${m.target} (${m.target_sha?.slice(0, 10)})`,
       `병합할 통합 커밋: ${m.integration_sha?.slice(0, 10)} (fast-forward)`, ...(newCommits ? [`대상 브랜치에 새로 생긴 커밋 ${newCommits}개`] : []),
       ...tasks.map((t) => `- ${t.key} ${t.title}`)].join('\n')
     this.store.putApproval({ id: `merge:${requestId}:${projectId}`, teamId: 'hq', subjectId: requestId, title: `병합 승인: ${project.name} ${m.target}`, body,

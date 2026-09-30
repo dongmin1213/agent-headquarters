@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto'
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { BaseResult } from '../../src/exec/checks.ts'
-import { harness, req, sh, task, tsk, type Harness } from './helpers.ts'
+import { acceptKnownToMerged, harness, req, sh, task, tsk, type Harness } from './helpers.ts'
 import { useFakeSandboxIfNested } from '../nested.ts'
 
 useFakeSandboxIfNested()
@@ -104,8 +104,8 @@ test('T5. a regression check failing on the base and on the candidate goes to re
   try {
     const id = h.plan([task('A', { acceptance: [{ id: 'R1', text: '기존에 깨진 검사', check: 'ls missing.txt', kind: 'regression' }] })])
     await h.approve(id)
-    // Task review passes; integration has no exemption (F02) and stops at the integration card.
-    await h.waitFor(() => h.store.approval(`integration:${id}:p`)?.state === 'open', 'integration card')
+    // No exemption in integration (F02): the chairman accepts the known failure on the integration card, then merges.
+    await acceptKnownToMerged(h, id)
     const atts = h.store.attempts(`${id}.A`)
     assert.equal(atts.filter((a) => a.kind === 'work').length, 1, 'no rework')
     const work = atts.find((a) => a.kind === 'work' && a.status === 'succeeded')!
@@ -172,7 +172,8 @@ test('T6b. a legacy "fail" baseline for a regression check is run on the candida
     h.store.set(`baseline:${h.runner.mirror('p')}:${base}:${createHash('sha256').update(`\n${check}`).digest('hex')}`, 'fail')
     const id = h.plan([task('A', { acceptance: [{ id: 'R1', text: '기존', check, kind: 'regression' }] })])
     await h.approve(id)
-    await h.waitFor(() => h.store.approval(`integration:${id}:p`)?.state === 'open', 'integration card (no exemption, F02)')
+    // No exemption in integration (F02): the chairman accepts the known failure on the integration card, then merges.
+    await acceptKnownToMerged(h, id)
     const work = workAttempts(h, `${id}.A`).find((a) => a.status === 'succeeded')!
     assert.equal(existsSync(join(work.dir, 'hq', 'baseline.sb')), false, 'cached legacy value used')
     const checks = JSON.parse(readFileSync(join(work.dir, 'hq', 'checks.json'), 'utf8'))
