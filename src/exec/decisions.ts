@@ -47,6 +47,17 @@ const teamOptionHelp = (o: string) => o === '보류' ? '지금은 고르지 않�
 
 export const detailPath = (requestId: string, taskId: string | null) => `/ui/#request=${encodeURIComponent(requestId)}${taskId ? `&task=${encodeURIComponent(taskId)}` : ''}`
 
+/** A possibly still running earlier worker of a task (its identity could not be confirmed), or null. */
+export interface Lingering { pid: number; lstart: string | null; since: string }
+export function lingeringOf(t: Pick<TaskRow, 'lingering'>): Lingering | null {
+  if (!t.lingering) return null
+  try { const l = JSON.parse(t.lingering) as Lingering; return l && l.pid > 0 ? l : null } catch { return null }
+}
+export const lingeringWait = (pid: number) => `이전 작업자(pid ${pid})가 끝나기를 기다려요`
+export const lingeringKillHint = (pid: number) => `직접 종료하려면: kill -TERM -${pid} (프로세스 그룹)`
+/** Statuses in which a task waits for a slot; a gated one waits for its earlier worker instead. */
+const QUEUED = new Set(['pending', 'rework', 'held'])
+
 const firstLine = (s: string | null) => (s ?? '').split('\n').find((l) => l.trim())?.trim().slice(0, 300) ?? ''
 
 type Explain = Pick<DecisionItem, 'situation' | 'cause' | 'causeConfirmed' | 'recommendation' | 'optionHelp'>
@@ -139,7 +150,9 @@ export function decisionItems(store: Store, now = Date.now(), teamNames: Record<
   for (const t of store.tasksByStatus(['blocked'])) {
     const ex = diagnosed(t.diagnosis, BLOCKED_OPTIONS, { situation: `작업이 막혔어요: ${t.title} · 어떻게 할지 정해 주세요`, cause: t.note ? explainError(t.note).cause : null, causeConfirmed: true, recommendation: null,
       optionHelp: { retry: OPTION_HELP.retry, skip: OPTION_HELP.skip, stop: OPTION_HELP.stop } })
-    items.push({ kind: 'blocked', id: t.id, revision: t.block_count, requestId: t.request_id, taskId: t.id, title: `작업이 막혔어요: ${t.title}`, detail: t.note ?? '', ...ex, confirm: { stop: CONFIRM_STOP },
+    const ling = lingeringOf(t)
+    const detail = ling ? [t.note ?? '', lingeringKillHint(ling.pid)].filter(Boolean).join('\n') : t.note ?? ''
+    items.push({ kind: 'blocked', id: t.id, revision: t.block_count, requestId: t.request_id, taskId: t.id, title: `작업이 막혔어요: ${t.title}`, detail, ...ex, confirm: { stop: CONFIRM_STOP },
       detailPath: detailPath(t.request_id, t.id), options: BLOCKED_OPTIONS, subjectHash: null, createdAt: t.updated_at })
   }
   return items.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || a.createdAt.localeCompare(b.createdAt))
@@ -165,11 +178,18 @@ export function currentAttempt(store: Store, taskId: string): AttemptRow | null 
 export const hqDirOf = (a: AttemptRow) => join(a.dir, 'hq')
 export const outDirOf = (a: AttemptRow) => join(a.dir, 'out')
 
+/** Bubble of a queued task that may not start while its earlier worker may still run. */
+function waitingFor(t: TaskRow): string | null {
+  const l = QUEUED.has(t.status) ? lingeringOf(t) : null
+  return l ? lingeringWait(l.pid) : null
+}
+
 export function taskView(store: Store, t: TaskRow, activity: (a: AttemptRow) => string | null = (a) => lastActivityOf(hqDirOf(a))): TaskView {
   const cur = currentAttempt(store, t.id)
   return {
     id: t.id, key: t.key, requestId: t.request_id, project: t.project, title: t.title, role: t.role, grade: t.grade, model: t.model,
-    status: t.status as TaskView['status'], attempts: t.attempts, currentAttemptId: cur?.id ?? null, lastActivity: cur ? activity(cur) : null,
+    status: t.status as TaskView['status'], attempts: t.attempts, currentAttemptId: cur?.id ?? null,
+    lastActivity: waitingFor(t) ?? (cur ? activity(cur) : null),
     questions: t.status === 'question' ? store.taskQuestions(t.id).filter((q) => q.revision === t.revision && q.answer === null).map((q) => ({ id: q.id, question: q.question, options: q.options, default: q.default })) : [],
     note: t.note, headSha: t.head_sha, revision: t.revision, reviewModel: t.review_model, updatedAt: t.updated_at,
   }
@@ -186,10 +206,13 @@ export function workerViews(store: Store, activity: (a: AttemptRow) => string | 
     out.push({ attemptId: a.id, taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, model: a.model,
       kind: review ? 'review' : 'work', state: review ? 'reviewing' : 'running', bubble: activity(a) ?? (review ? '검토 준비 중' : '준비 중'), startedAt: a.started_at ?? t.updated_at })
   }
-  for (const t of store.tasksByStatus(['verifying', 'held', 'blocked'])) {
+  for (const t of store.tasksByStatus(['verifying', 'held', 'blocked', 'pending', 'rework'])) {
+    const waiting = waitingFor(t)
+    if ((t.status === 'pending' || t.status === 'rework') && !waiting) continue
     const last = store.attempts(t.id).at(-1)
     const base = { attemptId: last?.id ?? '', taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, startedAt: t.updated_at }
-    if (t.status === 'verifying') out.push({ ...base, attemptId: store.attempts(t.id).filter((x) => x.kind === 'work').at(-1)?.id ?? '', model: 'hq', kind: 'verify', state: 'verifying', bubble: '수용 기준 검사 중' })
+    if (waiting) out.push({ ...base, model: t.model, kind: 'work', state: 'held', bubble: waiting })
+    else if (t.status === 'verifying') out.push({ ...base, attemptId: store.attempts(t.id).filter((x) => x.kind === 'work').at(-1)?.id ?? '', model: 'hq', kind: 'verify', state: 'verifying', bubble: '수용 기준 검사 중' })
     else if (t.status === 'held') out.push({ ...base, model: t.model, kind: 'work', state: 'held', bubble: holdUntil ? `한도 보류 · ${hhmm(holdUntil)}까지` : '한도 보류' })
     else out.push({ ...base, model: t.model, kind: last?.kind === 'review' ? 'review' : 'work', state: 'blocked', bubble: '막힘 · 사장에게 보고' })
   }

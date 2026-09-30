@@ -8,13 +8,17 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { Runner } from '../../src/exec/runner.ts'
 import { atomicJson } from '../../src/exec/fsx.ts'
+import { decisionItems, workerViews } from '../../src/exec/decisions.ts'
 import { defaultProbe, killGroup, launch, pidAlive, psLstart, terminateGroup, type Probe } from '../../src/exec/worker.ts'
 import { harness, ROOT, task, tmp, tsk, type Harness } from './helpers.ts'
 import { nestedSandbox, NESTED_PS_SKIP, useFakeSandboxIfNested } from '../nested.ts'
 
 useFakeSandboxIfNested()
 
-const UNKNOWN_NOTE = '작업자 프로세스를 확인할 수 없어 멈췄어요 · 직접 확인한 뒤 다시 시도해 주세요'
+const UNKNOWN_NOTE = (pid: number) => `작업자 프로세스를 확인할 수 없어 멈췄어요 · 이전 작업자(pid ${pid})가 아직 돌 수 있어요`
+const WAIT_BUBBLE = (pid: number) => `이전 작업자(pid ${pid})가 끝나기를 기다려요`
+const KILL_HINT = (pid: number) => `직접 종료하려면: kill -TERM -${pid} (프로세스 그룹)`
+const FAILING_PS: Partial<Probe> = { lstart: () => { throw new Error('spawn EPERM') }, members: async () => null }
 const FAILING_NOTE = '내부 작업이 계속 실패해요 · hq logs를 확인해 주세요'
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -25,6 +29,17 @@ function owner(args = ['30'], cmd = '/bin/sleep') {
   return c
 }
 const reap = (pid: number | undefined) => { if (pid) try { process.kill(-pid, 'SIGKILL') } catch { /* gone */ } }
+/** Kills a test-spawned sleep and waits until it is reaped (a zombie would still answer kill(pid, 0)). */
+async function stopOwner(c: ReturnType<typeof owner>): Promise<void> {
+  const exited = new Promise((r) => { if (c.exitCode !== null || c.signalCode !== null) r(null); else c.once('exit', r) })
+  reap(c.pid)
+  await exited
+}
+const step = async (r: Runner) => { await r.tick(); await r.drain() }
+/** Polls until the tracked attempt has seen `n` unknown identities in a row (the clock does not move). */
+async function unknownPolls(r: Runner, aid: string, n: number): Promise<void> {
+  for (let i = 0; i < 50 && (r.live.get(aid)?.unknownPolls ?? 0) < n; i++) await step(r)
+}
 
 /** The daemon after a restart, on the same DB, with an optional identity probe. */
 function restart(h: Harness, probe?: Partial<Probe>, hqRoot = ROOT): Runner {
@@ -126,23 +141,146 @@ test('reused pid found through process.json (no pid in the DB) → not signalled
   } finally { reap(o.pid); await h.close() }
 })
 
-test('unknown identity (ps failing) → not signalled even when cancelled; attempt and task stop with the note', async () => {
+test('unknown identity (ps failing) → not signalled even when cancelled; after 5 polls and 30 s the attempt and task stop with the pid', async () => {
   const h = harness()
   const o = owner()
   try {
     await sleep(100)
     const { tid, aid } = await runningAttempt(h, o.pid!, 'Wed Sep 30 00:00:00 2026')
     h.store.updateAttempt(aid, { outcome: 'runaway' }) // would be killed if it were confirmed ours
-    const r = restart(h, { lstart: () => { throw new Error('spawn EPERM') }, members: async () => null })
+    const r = restart(h, FAILING_PS)
     await r.recover()
-    for (let i = 0; i < 3; i++) { await r.tick(); await r.drain() }
+    await unknownPolls(r, aid, 5)
+    assert.ok(r.live.get(aid)!.unknownPolls >= 5)
+    assert.equal(tsk(h, tid).status, 'running', '5 polls within 30 s: not yet')
+    h.clock.t += 29_000
+    await step(r)
+    assert.equal(tsk(h, tid).status, 'running', '29 s: not yet')
+    h.clock.t += 1_000
+    await step(r)
     await sleep(100)
     assert.equal(pidAlive(o.pid!), true, 'never signalled')
     const att = h.store.attempt(aid)!
     assert.equal(att.status, 'unverifiable')
-    assert.equal(att.reason, UNKNOWN_NOTE)
+    assert.equal(att.reason, UNKNOWN_NOTE(o.pid!))
+    const t = tsk(h, tid)
+    assert.equal(t.status, 'blocked')
+    assert.equal(t.note, UNKNOWN_NOTE(o.pid!))
+    assert.deepEqual({ ...JSON.parse(t.lingering!), since: 'x' }, { pid: o.pid, lstart: 'Wed Sep 30 00:00:00 2026', since: 'x' })
+    const card = decisionItems(h.store, h.clock.t).find((d) => d.kind === 'blocked' && d.taskId === tid)!
+    assert.ok(card.detail.includes(`pid ${o.pid}`), 'card shows the pid')
+    assert.ok(card.detail.includes(KILL_HINT(o.pid!)), 'card shows the manual stop hint')
+  } finally { reap(o.pid); await h.close() }
+})
+
+test('one transient ps failure → no block; `same` again resets the streak and supervision continues', { skip: nestedSandbox && NESTED_PS_SKIP }, async () => {
+  const h = harness()
+  const o = owner()
+  try {
+    await sleep(100)
+    const lstart = (await psLstart(o.pid!))!
+    const { tid, aid } = await runningAttempt(h, o.pid!, lstart)
+    let fail = true
+    const r = restart(h, { lstart: async (pid) => { if (fail) throw new Error('ps: transient'); return psLstart(pid) } })
+    await r.recover()
+    await unknownPolls(r, aid, 1)
+    assert.equal(r.live.get(aid)!.unknownPolls, 1)
+    fail = false
+    h.clock.t += 60_000
+    await step(r)
+    assert.equal(r.live.get(aid)!.unknownPolls, 0, 'same resets the streak')
+    assert.equal(r.live.get(aid)!.unknownSince, null)
+    assert.equal(r.live.get(aid)!.confirmed, true)
+    // Another single failure long after: the streak starts over, so the elapsed time before it does not count.
+    fail = true
+    await unknownPolls(r, aid, 1)
+    fail = false
+    await step(r)
+    assert.equal(tsk(h, tid).status, 'running')
+    assert.equal(h.store.attempt(aid)!.status, 'running')
+    assert.equal(tsk(h, tid).lingering, null)
+    assert.equal(pidAlive(o.pid!), true)
+  } finally { reap(o.pid); await h.close() }
+})
+
+test('retry while the lingering pid is alive → accepted, no spawn, waiting bubble; the pid ends → next poll clears it and the attempt spawns', async () => {
+  const h = harness()
+  const o = owner()
+  try {
+    await sleep(100)
+    const { tid, aid } = await runningAttempt(h, o.pid!, 'Wed Sep 30 00:00:00 2026')
+    const r = restart(h, FAILING_PS)
+    await r.recover()
+    await unknownPolls(r, aid, 5)
+    h.clock.t += 30_000
+    await step(r)
     assert.equal(tsk(h, tid).status, 'blocked')
-    assert.equal(tsk(h, tid).note, UNKNOWN_NOTE)
+    assert.equal(r.decideTask(tid, 'retry', tsk(h, tid).block_count), null, 'the decision is accepted')
+    for (let i = 0; i < 5; i++) await step(r)
+    assert.equal(h.store.attempts(tid).length, 1, 'no new attempt while the earlier worker may run')
+    assert.equal(tsk(h, tid).status, 'rework', 'queued')
+    const w = workerViews(h.store).find((x) => x.taskId === tid)!
+    assert.equal(w.bubble, WAIT_BUBBLE(o.pid!))
+    assert.equal(w.state, 'held')
+    assert.equal(r.views().workers.find((x) => x.taskId === tid)!.bubble, WAIT_BUBBLE(o.pid!))
+    assert.equal(pidAlive(o.pid!), true, 'never signalled')
+    await stopOwner(o)
+    await step(r)
+    assert.equal(tsk(h, tid).lingering, null, 'cleared once the pid is gone')
+    const end = Date.now() + 60_000
+    while (Date.now() < end && !h.store.attempts(tid).some((a) => a.id !== aid && a.pid)) await step(r)
+    const next = h.store.attempts(tid).find((a) => a.id !== aid)!
+    assert.ok(next?.pid, 'the retry attempt spawned')
+  } finally { reap(o.pid); await h.close() }
+})
+
+test('restart: process.json names an alive pid without a start time → gated (blocked, lingering, retry waits)', async () => {
+  const h = harness()
+  const o = owner()
+  try {
+    await sleep(100)
+    const { tid, aid, dir } = await runningAttempt(h, null, null)
+    atomicJson(join(dir, 'hq', 'process.json'), { pid: o.pid, lstart: null, startedAt: new Date().toISOString(), sessionId: 's' })
+    const r = restart(h)
+    await r.recover()
+    await unknownPolls(r, aid, 5)
+    h.clock.t += 30_000
+    await step(r)
+    const t = tsk(h, tid)
+    assert.equal(t.status, 'blocked')
+    assert.equal(JSON.parse(t.lingering!).pid, o.pid)
+    assert.equal(r.decideTask(tid, 'retry', t.block_count), null)
+    for (let i = 0; i < 3; i++) await step(r)
+    assert.equal(h.store.attempts(tid).length, 1, 'gated')
+    assert.equal(tsk(h, tid).status, 'rework')
+    assert.equal(pidAlive(o.pid!), true)
+  } finally { reap(o.pid); await h.close() }
+})
+
+test('a lingering record that appears during setup stops the start right before the spawn; the task waits, then starts', async () => {
+  const h = harness({ setup: 'sleep 0.5' })
+  const o = owner()
+  try {
+    const id = h.plan([task('A')])
+    await h.approve(id)
+    const tid = `${id}.A`
+    await h.waitFor(() => { const a = h.store.attempts(tid)[0]; return !!a && existsSync(join(a.dir, 'hq', 'setup.sb')) }, 'setup started', 20_000)
+    const att = h.store.attempts(tid)[0]
+    const attempts = tsk(h, tid).attempts
+    h.store.updateTask(tid, { lingering: JSON.stringify({ pid: o.pid, lstart: null, since: new Date().toISOString() }) })
+    await h.runner.drain()
+    const after = h.store.attempt(att.id)!
+    assert.equal(after.outcome, 'waiting')
+    assert.equal(after.pid, null, 'never spawned')
+    assert.equal(existsSync(join(att.dir, 'hq', 'process.json')), false)
+    assert.equal(tsk(h, tid).status, 'rework', 'back in the queue')
+    assert.equal(tsk(h, tid).attempts, attempts - 1, 'the start that waited is not counted')
+    await h.runner.tick(); await h.runner.drain()
+    assert.equal(h.store.attempts(tid).length, 1, 'no new start while the pid lives')
+    await stopOwner(o)
+    await h.waitFor(() => h.store.attempts(tid).some((a) => a.id !== att.id && !!a.pid), 'next attempt spawned', 30_000)
+    assert.equal(tsk(h, tid).lingering, null)
+    assert.equal(tsk(h, tid).attempts, attempts, 'counted once')
   } finally { reap(o.pid); await h.close() }
 })
 

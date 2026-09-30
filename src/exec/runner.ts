@@ -14,7 +14,7 @@ import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../sto
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
 import { baseline, checksProfile, envFailure, runChecks, runSandboxed, setupChangedReason, trackedChanges, type BaseResult, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
 import { DONE_MAX, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
-import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, outDirOf, workerViews, type HeadlineInput } from './decisions.ts'
+import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, lingeringOf, lingeringWait, outDirOf, workerViews, type HeadlineInput, type Lingering } from './decisions.ts'
 import { runDiagnoseTurn } from './diagnose.ts'
 import { atomicJson, atomicWrite, readJson, readText, sha256 } from './fsx.ts'
 import { currentBranch, isRepo, revParse, withRepo } from './git.ts'
@@ -27,7 +27,7 @@ import { canAutoApply, reviseDiff, reviseProblem, runReviseTurn } from './revise
 import { checkVerdict, ladderUp, VERDICT_SCHEMA } from './review.ts'
 import { claudeBinReadable, real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
 import { extractBashRuns, lastActivityOf, StreamTail } from './stream.ts'
-import { claudeArgs, defaultProbe, findOrphan, identify, killGroup, launch, LaunchAborted, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
+import { claudeArgs, defaultProbe, findOrphan, identify, killGroup, launch, LaunchAborted, pidAlive, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
 import { reconcile as reconcileInvariants, recover as recoverState, type Violation } from './reconcile.ts'
 
 export type Notify = (title: string, body: string) => void
@@ -66,6 +66,9 @@ export interface Live {
   killed9: boolean
   /** Seen as `same` at least once: only then may the leftover group be cleaned up after the leader is gone (§7.4). */
   confirmed: boolean
+  /** Consecutive `unknown` identities and when the streak began (runner clock); any `same` resets both. */
+  unknownPolls: number
+  unknownSince: number | null
 }
 
 /** Result of a chairman decision; replays of the same decision return the stored one (§D). */
@@ -83,7 +86,10 @@ const JOB_BACKOFF_MIN_MS = 1_000
 const JOB_BACKOFF_MAX_MS = 60_000
 const JOB_MAX_FAILURES = 5
 const JOB_FAILING = '내부 작업이 계속 실패해요 · hq logs를 확인해 주세요'
-const IDENTITY_UNKNOWN = '작업자 프로세스를 확인할 수 없어 멈췄어요 · 직접 확인한 뒤 다시 시도해 주세요'
+/** `unknown` must last this many polls and this long before the task stops (one failed ps is not enough). */
+const UNKNOWN_POLLS = 5
+const UNKNOWN_MS = 30_000
+const identityUnknown = (pid: number) => `작업자 프로세스를 확인할 수 없어 멈췄어요 · 이전 작업자(pid ${pid})가 아직 돌 수 있어요`
 export const TERMINAL_REQUEST = new Set(['merged', 'rejected', 'failed', 'cancelled', 'expired'])
 const UNCOUNTED_PREV = new Set(['limited', 'transient', 'start_failed', 'brief_blocked'])
 export const INTEGRATION_OPTIONS = ['다시 통합', '해당 작업 재작업', '요청 중단']
@@ -109,6 +115,8 @@ class StartAborted extends Error {
   readonly outcome: 'cancelled' | 'superseded'
   constructor(outcome: 'cancelled' | 'superseded', why: string) { super(why); this.outcome = outcome }
 }
+/** A start path found an earlier worker of the task that may still run: nothing is spawned and the task waits. */
+class StartWaiting extends Error {}
 class DecisionRefused extends Error {}
 
 export class Runner {
@@ -468,6 +476,7 @@ export class Runner {
         this.again = false
         if (this.stopped) break
         await this.step('live', () => this.pollLive())
+        await this.step('lingering', () => this.checkLingering())
         await this.step('verify', () => this.startVerifications())
         await this.step('integrate', () => this.startIntegrations())
         await this.step('dispatch', () => this.dispatch())
@@ -495,7 +504,7 @@ export class Runner {
   /** `spawned`: the child and its exit watch from launch() (exit observed since spawn, F09); null for recovered processes. */
   track(att: AttemptRow, pid: number, lstart: string | null, startedAt: string | null, spawned: { child: ChildProcess; exit: ExitWatch } | null): Live {
     const l: Live = { tail: new StreamTail(hqDirOf(att)), pid, lstart, startedAt, child: spawned?.child ?? null, exit: spawned?.exit ?? null,
-      exited: false, killAt: null, killed9: false, confirmed: !!spawned }
+      exited: false, killAt: null, killed9: false, confirmed: !!spawned, unknownPolls: 0, unknownSince: null }
     if (spawned) spawned.exit.onExit(() => { l.exited = true; this.kick() })
     this.live.set(att.id, l)
     return l
@@ -534,12 +543,17 @@ export class Runner {
         if (s.rateLimit) this.observe(line)
       })
       const id = await this.identityOf(l)
-      if (id === 'same') l.confirmed = true
+      if (id === 'same') { l.confirmed = true; l.unknownPolls = 0; l.unknownSince = null }
       if (id === 'unknown') {
         // Cannot tell whether the pid is still our worker: never signal it. Finished evidence (a result line) is judged;
-        // otherwise the task stops for the chairman (§22).
+        // otherwise, once `unknown` has lasted UNKNOWN_POLLS polls and UNKNOWN_MS, the task stops for the chairman (§22).
         l.tail.poll((line, s) => { if (s.rateLimit) this.observe(line) })
-        if (!l.tail.finalResult()) { this.stopUnknown(att); continue }
+        if (!l.tail.finalResult()) {
+          l.unknownPolls++
+          l.unknownSince ??= this.now()
+          if (l.unknownPolls >= UNKNOWN_POLLS && this.now() - l.unknownSince >= UNKNOWN_MS) this.stopUnknown(att, l)
+          continue
+        }
       }
       if (id === 'same') {
         const now = this.now()
@@ -582,15 +596,37 @@ export class Runner {
     }
   }
 
-  /** The worker's identity cannot be confirmed and it left no result: stop tracking it without a signal, the task stops. */
-  private stopUnknown(att: AttemptRow): void {
+  /**
+   * The worker's identity stayed unconfirmable and it left no result: stop tracking it without a signal, the task stops.
+   * The process may still run, so the task remembers it (lingering) and no new attempt of the task starts until it is gone.
+   */
+  private stopUnknown(att: AttemptRow, l: Live): void {
     this.live.delete(att.id)
+    const why = identityUnknown(l.pid)
     this.store.tx(() => {
-      this.store.updateAttempt(att.id, { status: 'unverifiable', ended_at: this.iso(), reason: IDENTITY_UNKNOWN })
+      this.store.updateAttempt(att.id, { status: 'unverifiable', ended_at: this.iso(), reason: why })
       const t = this.store.task(att.task_id)
-      if (t && t.generation === att.generation && ['running', 'reviewing'].includes(t.status)) this.block(t, IDENTITY_UNKNOWN)
+      if (!t) return
+      const rec: Lingering = { pid: l.pid, lstart: l.lstart, since: this.iso() }
+      this.store.updateTask(t.id, { lingering: JSON.stringify(rec) })
+      if (t.generation === att.generation && ['running', 'reviewing'].includes(t.status)) this.block(t, why)
     })
-    this.bus.emit({ kind: 'attempt', text: IDENTITY_UNKNOWN, data: { id: att.id } })
+    this.bus.emit({ kind: 'attempt', text: why, data: { id: att.id } })
+  }
+
+  /**
+   * Each poll: a lingering earlier worker whose pid is gone (kill(pid, 0) → ESRCH), or whose pid now belongs to another
+   * process (recorded start time differs), is forgotten and its task may start again. Nothing is ever signalled here.
+   */
+  private async checkLingering(): Promise<void> {
+    for (const t of this.store.lingeringTasks()) {
+      const l = lingeringOf(t)
+      let gone = !l || !pidAlive(l.pid)
+      if (!gone && l!.lstart) gone = ['gone', 'other'].includes(await identify(l!.pid, l!.lstart, this.probe.lstart))
+      if (!gone) continue
+      if (!this.store.tx(() => { const cur = this.store.task(t.id); if (cur?.lingering !== t.lingering) return false; this.store.updateTask(t.id, { lingering: null }); return true })) continue
+      this.emitTask(t, `이전 작업자(pid ${l?.pid ?? '?'})가 끝났어요: ${t.title}`)
+    }
   }
 
   private usage(result: Record<string, unknown> | null) {
@@ -773,7 +809,8 @@ export class Runner {
     const out: TaskRow[] = []
     for (const r of this.store.requestsByStatus(['executing'])) {
       const all = this.store.tasks(r.id)
-      for (const t of all) if (['pending', 'rework', 'held'].includes(t.status) && this.depsPassed(t, all)) out.push(t)
+      // A task whose earlier worker may still run waits for it (not for a slot): it is not ready.
+      for (const t of all) if (['pending', 'rework', 'held'].includes(t.status) && !t.lingering && this.depsPassed(t, all)) out.push(t)
     }
     return out
   }
@@ -789,7 +826,7 @@ export class Runner {
       if (free <= 0) return
       const r = this.store.request(t.request_id)
       if (!r || !['executing', 'blocked'].includes(r.status)) continue
-      if (this.store.liveAttempts().some((a) => a.task_id === t.id)) continue
+      if (this.store.liveAttempts().some((a) => a.task_id === t.id) || t.lingering) continue
       if (this.claimReview(t)) free--
     }
     for (const t of this.readyTasks()) {
@@ -800,15 +837,13 @@ export class Runner {
 
   // ----- work attempts (§7 start protocol) -----
   private claimWork(t: TaskRow): boolean {
-    // The previous attempt decides counting even across a revision (a brief_blocked restart is never counted).
-    const prev = this.store.attempts(t.id).filter((a) => a.kind === 'work').at(-1)
+    const { prev, counted } = this.workCounting(t)
     const resume = t.resume_session
-    const counted = !resume && !(prev && UNCOUNTED_PREV.has(prev.status))
     const n = this.store.nextAttemptN(t.id, 'work')
     const id = `${t.id}~a${n}`
     const claimed = this.store.tx(() => {
       const cur = this.store.task(t.id)!
-      if (!['pending', 'rework', 'held'].includes(cur.status) || cur.generation !== t.generation) return false
+      if (!['pending', 'rework', 'held'].includes(cur.status) || cur.generation !== t.generation || cur.lingering) return false
       this.store.insertAttempt({ id, task_id: t.id, kind: 'work', n, model: cur.model, status: 'starting', attempt_token: randomBytes(16).toString('hex'),
         dir: this.runDir(t.request_id, t.key, id), session_id: resume ?? randomUUID(), generation: cur.generation })
       this.tset(cur, { status: 'running', attempts: cur.attempts + (counted ? 1 : 0) })
@@ -819,6 +854,15 @@ export class Runner {
     this.bg(this.prepareAndLaunch(id, !!resume, prev ?? null).finally(() => this.launching.delete(id)))
     this.emitTask(t, `${t.title} 시작 · ${t.model}`)
     return true
+  }
+
+  /**
+   * The previous work attempt (a start that waited for an earlier worker does not count as one) and whether the next
+   * attempt is counted: the previous attempt decides even across a revision (a brief_blocked restart is never counted).
+   */
+  private workCounting(t: TaskRow): { prev: AttemptRow | undefined; counted: boolean } {
+    const prev = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.outcome !== 'waiting').at(-1)
+    return { prev, counted: !t.resume_session && !(prev && UNCOUNTED_PREV.has(prev.status)) }
   }
 
   private depHeads(t: TaskRow): TaskRow[] {
@@ -868,13 +912,16 @@ export class Runner {
    * Why a starting attempt must not go on (F08), or null: its request was cancelled or finished, the task's generation
    * changed or the task left `taskStatus`, or the attempt is no longer `starting` / got an outcome (cancelled, superseded).
    */
-  private startBlocker(attemptId: string, taskStatus: string): StartAborted | null {
+  private startBlocker(attemptId: string, taskStatus: string): StartAborted | StartWaiting | null {
     const a = this.store.attempt(attemptId)
     const t = a ? this.store.task(a.task_id) : null
     const r = t ? this.store.request(t.request_id) : null
     if (!a || !t || !r || r.status === 'cancelled' || a.outcome === 'cancelled' || t.status === 'cancelled') return new StartAborted('cancelled', '요청 중단')
     if (TERMINAL_REQUEST.has(r.status) || r.status === 'merging' || t.generation !== a.generation || t.status !== taskStatus
       || a.status !== 'starting' || a.outcome) return new StartAborted('superseded', '세대가 바뀌어 시작하지 않음')
+    // An earlier worker of this task may still run (its identity could not be confirmed): never two in one task.
+    const ling = lingeringOf(t)
+    if (ling) return new StartWaiting(lingeringWait(ling.pid))
     return null
   }
 
@@ -882,6 +929,20 @@ export class Runner {
   private gate(attemptId: string, taskStatus: string): void {
     const b = this.startBlocker(attemptId, taskStatus)
     if (b) throw b
+  }
+
+  /**
+   * A start that met a lingering earlier worker: nothing was spawned, the attempt ends as `waiting` (it is not a try and
+   * does not count), and a work task goes back to the queue, where it waits until the earlier worker is gone.
+   */
+  private startWaiting(att: AttemptRow, e: StartWaiting): void {
+    this.store.tx(() => {
+      this.store.updateAttempt(att.id, { status: 'start_failed', outcome: 'waiting', ended_at: this.iso(), reason: e.message })
+      const t = this.store.task(att.task_id)
+      if (att.kind !== 'work' || !t || t.generation !== att.generation || t.status !== 'running') return
+      this.tset(t, { status: 'rework', attempts: t.attempts - (this.workCounting(t).counted ? 1 : 0) })
+    })
+    this.bus.emit({ kind: 'attempt', text: e.message, data: { id: att.id } })
   }
 
   /** Records an aborted start: nothing was spawned, the attempt ends with its cancel/supersede outcome (task untouched). */
@@ -953,10 +1014,11 @@ export class Runner {
       })
       this.track({ ...att, status: 'running' }, info.pid, info.lstart, info.startedAt, { child, exit })
     } catch (e) {
-      const aborted = e instanceof StartAborted ? e : e instanceof LaunchAborted ? this.startBlocker(attemptId, 'running') : null
+      const aborted = e instanceof StartAborted || e instanceof StartWaiting ? e : e instanceof LaunchAborted ? this.startBlocker(attemptId, 'running') : null
       if (aborted) {
         if (collectWt) await removeMirrorWorktree(this.mirror(t.project), collectWt).catch(() => {})
-        this.startAborted(att, aborted)
+        if (aborted instanceof StartWaiting) this.startWaiting(att, aborted)
+        else this.startAborted(att, aborted)
       } else this.startFailed(att, e instanceof Setup ? e.message : `시작 실패: ${String(e)}`)
     }
   }
@@ -1194,8 +1256,9 @@ export class Runner {
       this.track({ ...att, status: 'running' }, info.pid, info.lstart, info.startedAt, { child, exit })
     } catch (e) {
       await removeMirrorWorktree(mirror, path).catch(() => {})
-      const aborted = e instanceof StartAborted ? e : e instanceof LaunchAborted ? this.startBlocker(attemptId, 'reviewing') : null
-      if (aborted) this.startAborted(att, aborted)
+      const aborted = e instanceof StartAborted || e instanceof StartWaiting ? e : e instanceof LaunchAborted ? this.startBlocker(attemptId, 'reviewing') : null
+      if (aborted instanceof StartWaiting) this.startWaiting(att, aborted)
+      else if (aborted) this.startAborted(att, aborted)
       else this.startFailed(att, e instanceof Setup ? e.message : `검토 시작 실패: ${String(e)}`)
     }
   }
