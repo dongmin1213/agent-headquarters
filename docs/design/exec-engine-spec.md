@@ -131,7 +131,7 @@ reconcile은 1분마다 실행한다.
 - DB 이전(§4 VACUUM INTO).
 - `HQ_TOKEN_FILE`, `HQ_PORT`.
 - 시작 순서: recover → runner → 엔진 → 서버.
-- 데몬 단일 인스턴스: `$HQ_HOME/daemon.lock`에 flock. 흉내라도 좋다: 파일에 pid를 적고, 살아 있으면 종료.
+- 데몬 단일 인스턴스: `$HQ_HOME/daemon.lock` 내용은 **pid 정수 한 줄**(개행 포함, 다른 내용 없음). 시작 시 그 pid가 살아 있고 명령줄에 `src/main.ts`가 있으면 종료, 아니면 덮어쓴다. 종료 시 자기 pid일 때만 지운다.
 - SIGTERM이면 runner.stop만 한다. 작업자 프로세스는 살려 둔다.
 - API 전체(§15)
   - 경로 id는 한 번만 decode한다.
