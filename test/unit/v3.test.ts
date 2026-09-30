@@ -13,6 +13,9 @@ import { atomicWrite } from '../../src/exec/fsx.ts'
 import { checkVerdict } from '../../src/exec/review.ts'
 import { sandboxProfile } from '../../src/exec/sandbox.ts'
 import { commitFile, harness, req, sh, task, tmp, tsk, type Harness } from './helpers.ts'
+import { NESTED_SKIP, nestedSandbox, useFakeSandboxIfNested } from '../nested.ts'
+
+useFakeSandboxIfNested()
 
 const mgit = (h: Harness, ...args: string[]) => execFileSync('git', ['--git-dir', join(h.runner.home, 'repos', 'p.git'), ...args], { encoding: 'utf8' }).trim()
 
@@ -22,7 +25,7 @@ async function toMergeCard(h: Harness, id: string): Promise<void> {
   await h.waitFor(() => h.store.approval(`merge:${id}:p`)?.state === 'open', 'merge card')
 }
 
-test('v3-1. escape attempts (hooks, core.fsmonitor, .git gitfile swap, git replace) have no effect through fetch → verify → integrate → merge', async () => {
+test('v3-1. escape attempts (hooks, core.fsmonitor, .git gitfile swap, git replace) have no effect through fetch → verify → integrate → merge', { skip: nestedSandbox && NESTED_SKIP }, async () => {
   const mark = tmp('hq-mark-')
   const h = harness()
   try {
@@ -42,7 +45,7 @@ test('v3-1. escape attempts (hooks, core.fsmonitor, .git gitfile swap, git repla
   } finally { await h.close() }
 })
 
-test('v3-1b. a check cannot write the mirror index (assume-unchanged fails); source changes are caught by the before/after comparison', async () => {
+test('v3-1b. a check cannot write the mirror index (assume-unchanged fails); source changes are caught by the before/after comparison', { skip: nestedSandbox && NESTED_SKIP }, async () => {
   const h = harness()
   try {
     const id = h.plan([task('A', { acceptance: [
@@ -59,7 +62,7 @@ test('v3-1b. a check cannot write the mirror index (assume-unchanged fails); sou
   } finally { await h.close() }
 })
 
-test('v3-2. metadata lstat allowed: node import and npm test succeed in a verification worktree under $HQ_HOME', async () => {
+test('v3-2. metadata lstat allowed: node import and npm test succeed in a verification worktree under $HQ_HOME', { skip: nestedSandbox && NESTED_SKIP }, async () => {
   const dir = tmp('hq-meta-')
   const home = join(dir, 'hqhome')
   const wt = join(home, 'worktrees', 'req-1', 'A.v1')
@@ -77,7 +80,7 @@ test('v3-2. metadata lstat allowed: node import and npm test succeed in a verifi
   assert.match(npm.outputTail, /x-ok/)
 })
 
-test('v3-3. ~/.claude control files are write-protected (fake HOME); runtime dirs and ~/.claude.json stay writable; secrets unreadable', async () => {
+test('v3-3. ~/.claude control files are write-protected (fake HOME); runtime dirs and ~/.claude.json stay writable; secrets unreadable', { skip: nestedSandbox && NESTED_SKIP }, async () => {
   const dir = tmp('hq-home-')
   const home = join(dir, 'fakehome')
   const wt = join(dir, 'wt')

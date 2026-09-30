@@ -26,9 +26,21 @@ export function claudeArgs(cfg: HqConfig, o: { role: Role; model: string; sessio
     '--json-schema', JSON.stringify(o.schema), ...guard]
 }
 
+/** Start time of a live pid, or null when the process is gone or `ps` cannot run (never rejects). */
 export function psLstart(pid: number): Promise<string | null> {
-  return new Promise((resolve) => execFile('ps', ['-o', 'lstart=', '-p', String(pid)], { env: { ...process.env, LC_ALL: 'C' } },
-    (err, out) => resolve(err ? null : String(out).trim() || null)))
+  return new Promise((resolve) => {
+    try {
+      execFile('ps', ['-o', 'lstart=', '-p', String(pid)], { env: { ...process.env, LC_ALL: 'C' } },
+        (err, out) => resolve(err ? null : String(out).trim() || null))
+    } catch { resolve(null) } // execFile throws synchronously on EPERM (setuid ps inside a sandbox)
+  })
+}
+
+export type PsLstart = (pid: number) => Promise<string | null>
+
+/** Calls a ps function, turning a synchronous throw or a rejection into null. */
+async function safeLstart(ps: PsLstart, pid: number): Promise<string | null> {
+  try { return await ps(pid) } catch { return null }
 }
 
 export function pidAlive(pid: number): boolean {
@@ -36,10 +48,11 @@ export function pidAlive(pid: number): boolean {
 }
 
 /** Alive and the same process we started: pid reuse is ruled out by the recorded start time. */
-export async function sameProcessAlive(pid: number, lstart: string | null, startedAt: string | null): Promise<boolean> {
+export async function sameProcessAlive(pid: number, lstart: string | null, startedAt: string | null, ps: PsLstart = psLstart): Promise<boolean> {
   if (!pidAlive(pid)) return false
-  const now = await psLstart(pid)
-  if (!now) return false
+  const now = await safeLstart(ps, pid)
+  // ps failed (or the process just exited): weaker check, kill(pid, 0) liveness only — pid reuse is not ruled out.
+  if (!now) return pidAlive(pid)
   if (lstart) return now === lstart
   return !!startedAt && Math.abs(Date.parse(now) - Date.parse(startedAt)) <= 2_000
 }
@@ -70,7 +83,7 @@ export interface Launched { info: ProcessInfo; child: ChildProcess }
  * Writes prompt.md, spec.json and the sandbox profile into hq/, spawns the CLI inside the sandbox
  * as its own process group, and records process.json atomically. Throws when the process cannot start.
  */
-export async function launch(o: { claudeBin: string; argv: string[]; cwd: string; hqDir: string; outDir: string | null; prompt: string; sessionId: string; spec: object; sandbox: SandboxOpts }): Promise<Launched> {
+export async function launch(o: { claudeBin: string; argv: string[]; cwd: string; hqDir: string; outDir: string | null; prompt: string; sessionId: string; spec: object; sandbox: SandboxOpts }, ps: PsLstart = psLstart): Promise<Launched> {
   mkdirSync(o.hqDir, { recursive: true })
   if (o.outDir) mkdirSync(o.outDir, { recursive: true })
   atomicWrite(join(o.hqDir, 'prompt.md'), o.prompt)
@@ -89,7 +102,9 @@ export async function launch(o: { claudeBin: string; argv: string[]; cwd: string
     child.once('error', reject)
   })
   child.unref()
-  const info: ProcessInfo = { pid, startedAt: new Date().toISOString(), sessionId: o.sessionId, lstart: await psLstart(pid) }
+  // ps may be unavailable (e.g. setuid exec denied inside a sandbox); the worker is already running and must be tracked.
+  // A null lstart falls back to startedAt in sameProcessAlive.
+  const info: ProcessInfo = { pid, startedAt: new Date().toISOString(), sessionId: o.sessionId, lstart: await safeLstart(ps, pid) }
   atomicJson(join(o.hqDir, 'process.json'), info)
   return { info, child }
 }

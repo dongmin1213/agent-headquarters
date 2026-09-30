@@ -4,6 +4,7 @@ import { chmodSync, existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { sandboxSmoke, smokeProfile } from '../../src/cli/sandbox.ts'
 import { tmp } from './helpers.ts'
+import { NESTED_SKIP, nestedSandbox } from '../nested.ts'
 
 test('profile denies the secret read and all writes except the allowed dir', () => {
   const p = smokeProfile('/t/secret.txt', '/t/allowed')
@@ -11,7 +12,7 @@ test('profile denies the secret read and all writes except the allowed dir', () 
   assert.match(p, /\(deny file-write\*\)\n\(allow file-write\* \(subpath "\/t\/allowed"\)/)
 })
 
-test('real Seatbelt smoke test passes on macOS', { skip: process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec') }, async () => {
+test('real Seatbelt smoke test passes on macOS', { skip: (process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec')) || (nestedSandbox && NESTED_SKIP) }, async () => {
   const r = await sandboxSmoke()
   assert.equal(r.ok, true, r.detail)
 })

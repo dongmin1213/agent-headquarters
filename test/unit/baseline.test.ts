@@ -6,6 +6,9 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { BaseResult } from '../../src/exec/checks.ts'
 import { harness, req, sh, task, tsk, type Harness } from './helpers.ts'
+import { useFakeSandboxIfNested } from '../nested.ts'
+
+useFakeSandboxIfNested()
 
 const baselineRows = (h: Harness) => h.store.raw().prepare("select key, value from kv where key like 'baseline:%'").all() as { key: string; value: string }[]
 const workAttempts = (h: Harness, taskId: string) => h.store.attempts(taskId).filter((a) => a.kind === 'work')
@@ -115,6 +118,37 @@ test('T5. a regression check failing on the base and on the candidate goes to re
     assert.match(prompt, /후보 출력/)
     assert.match(prompt, /base 출력/)
     assert.match(prompt, /base 출력:\n````text\n.*missing\.txt/)
+  } finally { await h.close() }
+})
+
+const taskEvents = (h: Harness) => (h.store.raw().prepare("select text from events where kind = 'task' order by id").all() as { text: string }[]).map((r) => r.text)
+const ADDED = '기존 실패 항목이 있어 검토를 추가해요 · sonnet'
+
+test('T5b. manual items with review none → a sonnet review is added instead of passing', async () => {
+  const h = harness()
+  try {
+    const id = h.plan([task('A', { review: { brief: '', model: 'none' }, acceptance: [{ id: 'R1', text: '기존에 깨진 검사', check: 'ls missing.txt', kind: 'regression' }] })])
+    await h.approve(id)
+    assert.equal(tsk(h, `${id}.A`).review_model, 'none')
+    await h.waitFor(() => taskEvents(h).includes(ADDED), 'review added')
+    const t = tsk(h, `${id}.A`)
+    assert.equal(t.review_model, 'sonnet')
+    assert.ok(['reviewing', 'passed'].includes(t.status), t.status)
+    await h.waitFor(() => h.store.attempts(`${id}.A`).some((a) => a.kind === 'review'), 'review attempt')
+    assert.equal(h.store.attempts(`${id}.A`).find((a) => a.kind === 'review')!.model, 'sonnet')
+  } finally { await h.close() }
+})
+
+test('T5c. no manual items with review none → passed without review, as before', async () => {
+  const h = harness()
+  try {
+    const id = h.plan([task('A', { review: { brief: '', model: 'none' } })])
+    await h.approve(id)
+    await h.waitFor(() => tsk(h, `${id}.A`).status === 'passed', 'passed')
+    const t = tsk(h, `${id}.A`)
+    assert.equal(t.review_model, 'none')
+    assert.equal(h.store.attempts(`${id}.A`).filter((a) => a.kind === 'review').length, 0)
+    assert.equal(taskEvents(h).includes(ADDED), false)
   } finally { await h.close() }
 })
 

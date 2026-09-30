@@ -4,6 +4,9 @@ import assert from 'node:assert/strict'
 import { buildHeadline, decisionItems, type HeadlineInput } from '../../src/exec/decisions.ts'
 import type { DecisionItem, WorkerView } from '../../src/types.ts'
 import { harness, task } from './helpers.ts'
+import { useFakeSandboxIfNested } from '../nested.ts'
+
+useFakeSandboxIfNested()
 
 const q = { mode: 'normal' as const, until: null, window: null, pct: null }
 const base: HeadlineInput = { decisions: [], failures: [], workers: [], ceoThinking: false, waiting: 0, quota: q, recentMerged: null }

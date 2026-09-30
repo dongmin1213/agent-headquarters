@@ -29,11 +29,13 @@ export function readPid(ctx: Ctx): number | null {
 export function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM' }
 }
-/** Command line of a live pid, or null when the process is gone. */
+/** Command line of a live pid, or null when the process is gone or `ps` cannot run (callers re-check alive()). */
 export async function pidCommand(pid: number): Promise<string | null> {
   if (!alive(pid)) return null
-  const r = await runCmd('ps', ['-p', String(pid), '-o', 'command='], { timeoutMs: 5000 })
-  return r.code === 0 ? r.stdout.trim() : null
+  try {
+    const r = await runCmd('ps', ['-p', String(pid), '-o', 'command='], { timeoutMs: 5000 })
+    return r.code === 0 ? r.stdout.trim() : null
+  } catch { return null } // execFile throws synchronously on EPERM (setuid ps inside a sandbox)
 }
 
 /** First integer in $HQ_HOME/daemon.lock (plain "123" or JSON like {"pid":123}); null if absent or unreadable. */
@@ -51,24 +53,25 @@ export type KillTarget = { pid: number; source: 'lock' | 'pidfile' } | { refuse:
  * The only process `stop` may signal. With a daemon lock present that is the lock's pid and nothing else;
  * without one (older daemon) the CLI's own pidfile. Either way the command line must contain src/main.ts.
  */
-export async function killTarget(ctx: Ctx): Promise<KillTarget> {
+export async function killTarget(ctx: Ctx, cmdOf: (pid: number) => Promise<string | null> = pidCommand): Promise<KillTarget> {
   if (existsSync(lockFile(ctx))) {
     const pid = readLockPid(ctx)
     if (!pid) return null
-    const cmd = await pidCommand(pid)
+    const cmd = await cmdOf(pid)
+    if (cmd === null && alive(pid)) return { refuse: `pid ${pid}의 프로그램을 확인할 수 없어 종료하지 않습니다 (ps 실행 불가)` }
     if (cmd === null) return null // stale lock
     if (!cmd.includes('src/main.ts')) return { refuse: `잠금 파일 ${lockFile(ctx)}의 pid ${pid}는 hq 데몬이 아닙니다 (${cmd.slice(0, 80)}). 종료하지 않습니다. 오래된 잠금이면: rm ${lockFile(ctx)}` }
     return { pid, source: 'lock' }
   }
   const pid = readPid(ctx)
   if (!pid) return null
-  const cmd = await pidCommand(pid)
+  const cmd = await cmdOf(pid)
   return cmd !== null && cmd.includes('src/main.ts') ? { pid, source: 'pidfile' } : null
 }
 
 /** Signals the kill target and waits; returns the pid it stopped, null if none, or an error message. */
-export async function stopTarget(ctx: Ctx): Promise<{ pid: number } | { error: string } | null> {
-  const t = await killTarget(ctx)
+export async function stopTarget(ctx: Ctx, cmdOf: (pid: number) => Promise<string | null> = pidCommand): Promise<{ pid: number } | { error: string } | null> {
+  const t = await killTarget(ctx, cmdOf)
   if (!t) return null
   if ('refuse' in t) return { error: t.refuse }
   if (ctx.dryRun) ctx.out(`[dry-run] kill -TERM ${t.pid}`)

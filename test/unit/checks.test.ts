@@ -8,6 +8,9 @@ import { baseline, runChecks, secretScan } from '../../src/exec/checks.ts'
 import { ensureMirror, verifyWorktree } from '../../src/exec/repos.ts'
 import type { SandboxOpts } from '../../src/exec/sandbox.ts'
 import { commitFile, makeRepo, sh, tmp } from './helpers.ts'
+import { useFakeSandboxIfNested } from '../nested.ts'
+
+useFakeSandboxIfNested()
 
 async function env() {
   const dir = tmp('hq-checks-')

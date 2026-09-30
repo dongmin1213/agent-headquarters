@@ -6,6 +6,9 @@ import { execFileSync } from 'node:child_process'
 import { mkdtempSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { useFakeSandboxIfNested } from '../nested.ts'
+
+useFakeSandboxIfNested()
 
 const fakeHome = mkdtempSync(join(realpathSync(tmpdir()), 'hq-idhome-'))
 process.env.HOME = fakeHome

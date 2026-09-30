@@ -934,9 +934,13 @@ export class Runner {
       this.store.tx(() => {
         const cur = this.store.task(t.id)
         if (!cur || cur.status !== 'verifying' || cur.generation !== t.generation || cur.head_sha !== t.head_sha) return
-        if (file.pass) this.tset(cur, { status: cur.review_model === 'none' ? 'passed' : 'reviewing', checks_state: 'passed' })
+        // Manual items (failed on base and candidate) need a judge: with no reviewer, add a sonnet review instead of passing.
+        const addReview = file.pass && cur.review_model === 'none' && (file.manual?.length ?? 0) > 0
+        if (addReview) this.tset(cur, { status: 'reviewing', review_model: 'sonnet', checks_state: 'passed' })
+        else if (file.pass) this.tset(cur, { status: cur.review_model === 'none' ? 'passed' : 'reviewing', checks_state: 'passed' })
         else { this.tset(cur, { checks_state: 'failed' }); this.rework(this.store.task(cur.id)!, `기계 검증 실패: ${failed.join('; ')}`) }
         this.emitTask(cur, `${cur.title}: 검증 ${file.pass ? '통과' : '실패'}`)
+        if (addReview) this.emitTask(cur, '기존 실패 항목이 있어 검토를 추가해요 · sonnet')
       })
     } catch (e) {
       this.store.tx(() => {
