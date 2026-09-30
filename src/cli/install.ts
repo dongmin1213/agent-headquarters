@@ -1,5 +1,5 @@
 // `hq install` / `hq uninstall`: pet build, sprites, LaunchAgents, verification.
-import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmdirSync, rmSync, symlinkSync } from 'node:fs'
 import { delimiter, join, resolve } from 'node:path'
 import { loadConfig } from '../config.ts'
 import { probeHq, waitFor } from './api.ts'
@@ -76,6 +76,23 @@ function linkHint(ctx: Ctx): void {
   ctx.out(`hq 명령을 어디서나 쓰려면 PATH에 추가하세요: export PATH="${join(ctx.root, 'bin')}:$PATH"`)
 }
 
+/** Entries hq itself creates in $HQ_HOME (`hq.db*` covers -wal/-shm). `--purge` deletes only these. */
+const HQ_ENTRIES = new Set(['repos', 'work', 'worktrees', 'runs', 'logs', 'daemon.lock', 'daemon.pid', '.hq-install', 'cache'])
+export const isHqEntry = (name: string) => HQ_ENTRIES.has(name) || name.startsWith('hq.db')
+
+/**
+ * Why `install` must not claim $HQ_HOME, or null. A non-empty folder without an install marker may hold the user's
+ * own files, which a later `--purge` would treat as hq data; only the default ~/.hq holding nothing but hq-made
+ * entries (a daemon run before markers existed) is adopted.
+ */
+export function homeRefusal(ctx: Ctx): string | null {
+  let names: string[]
+  try { names = readdirSync(ctx.home) } catch { return null } // absent: created fresh
+  if (!names.length || existsSync(installMarker(ctx))) return null
+  if (samePath(ctx.home, join(ctx.userHome, '.hq')) && names.every(isHqEntry)) return null
+  return `HQ_HOME(${ctx.home})에 hq가 만들지 않은 파일이 있어요 · 빈 폴더나 새 경로를 지정해 주세요`
+}
+
 export interface InstallOpts {
   sprites: boolean
   probes?: Probes
@@ -86,6 +103,8 @@ export interface InstallOpts {
 }
 
 export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
+  const refused = homeRefusal(ctx)
+  if (refused) { ctx.err(refused); return 1 }
   ctx.out('1/6 환경 진단')
   const checks = await runDoctor(ctx, opts.probes ?? realProbes(ctx))
   if (checks.some((c) => c.status === 'fail')) {
@@ -216,6 +235,37 @@ export function purgePlan(ctx: Ctx): PurgePlan | { error: string } {
   return { home, token, petApp: pet, notes }
 }
 
+/** Deletes only hq-made entries of $HQ_HOME, then the folder itself when nothing else is left; other files are reported. */
+function purgeHome(ctx: Ctx, home: string): void {
+  const names = readdirSync(home)
+  const foreign = names.filter((n) => !isHqEntry(n)).sort()
+  for (const n of names.filter(isHqEntry)) {
+    // The marker goes last: an interrupted purge can be retried.
+    if (n === '.hq-install') continue
+    if (ctx.dryRun) ctx.out(`[dry-run] rm -rf ${join(home, n)}`)
+    else rmSync(join(home, n), { recursive: true, force: true })
+  }
+  if (names.includes('.hq-install')) {
+    if (ctx.dryRun) ctx.out(`[dry-run] rm ${installMarker(ctx)}`)
+    else rmSync(installMarker(ctx), { force: true })
+  }
+  if (foreign.length) {
+    ctx.out(`삭제: ${home} 안의 hq 데이터`)
+    ctx.out(`hq가 만들지 않은 파일은 남겨 뒀어요: ${foreign.slice(0, 10).map((n) => join(home, n)).join(', ')}${foreign.length > 10 ? ` 외 ${foreign.length - 10}개` : ''}`)
+    return
+  }
+  if (ctx.dryRun) ctx.out(`[dry-run] rmdir ${home}`)
+  else {
+    // Non-recursive: a file that appeared meanwhile keeps the folder.
+    try { rmdirSync(home) } catch {
+      ctx.out(`삭제: ${home} 안의 hq 데이터`)
+      ctx.out(`hq가 만들지 않은 파일은 남겨 뒀어요: ${readdirSync(home).map((n) => join(home, n)).join(', ')}`)
+      return
+    }
+  }
+  ctx.out(`삭제: ${home}`)
+}
+
 /** True once this installation's daemon is gone: the lock pid is dead and the port no longer answers as hq. */
 async function daemonDown(ctx: Ctx, waitMs = 10_000): Promise<boolean> {
   return waitFor(async () => {
@@ -272,7 +322,8 @@ export async function uninstall(ctx: Ctx, opts: { purge: boolean; yes: boolean; 
       return 1
     }
     for (const n of plan.notes) ctx.out(n)
-    for (const f of [plan.home, plan.token, plan.petApp]) {
+    if (plan.home) purgeHome(ctx, plan.home)
+    for (const f of [plan.token, plan.petApp]) {
       if (!f) continue
       if (ctx.dryRun) ctx.out(`[dry-run] rm -rf ${f}`)
       else if (f === plan.token) rmSync(f, { force: true })

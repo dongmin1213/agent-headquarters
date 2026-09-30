@@ -257,6 +257,10 @@ test('F2. one command rule on raw strings, shared by plan checks and tests_run',
   const projects = [{ id: 'p', name: 'P', path: '/tmp' }]
   for (const c of ['npm test\nexit 0', 'npm test & wait', 'npm test; exit 0'])
     assert.match(ceo.validateTasks([task('A', { acceptance: [{ id: 'A1', text: 't', check: c, kind: 'regression' }] })], projects) ?? '', /명령 하나여야 합니다/, c)
+  // N6: quoting does not help (kept conservative); the rejection says how to get such arguments through.
+  const quoted = ceo.validateTasks([task('A', { acceptance: [{ id: 'A1', text: 't', check: "grep -E 'a|b' x.txt", kind: 'regression' }] })], projects) ?? ''
+  assert.match(quoted, /명령 하나여야 합니다 \(\| 사용 금지\)/)
+  assert.ok(quoted.endsWith(' · 인자에 | ; & 같은 문자가 필요하면 스크립트 파일로 감싸 한 명령으로 실행하게 해 주세요'), quoted)
   assert.equal(ceo.validateTasks([task('A', { acceptance: [{ id: 'A1', text: 't', check: 'manual', kind: 'new' }] })], projects), null)
 })
 

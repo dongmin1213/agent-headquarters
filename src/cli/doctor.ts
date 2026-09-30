@@ -1,13 +1,13 @@
 // `hq doctor`: environment checks, each with a one-line fix. Probes are injectable for tests.
 import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { loadConfig } from '../config.ts'
 import { probeHq, tokenMismatchMsg, type HqProbe } from './api.ts'
-import { pidCommand, readLockPid } from './daemon.ts'
+import { pidCommand, readLock, readLockPid } from './daemon.ts'
 import { sandboxSmoke, type SmokeResult } from './sandbox.ts'
 import { hqReadPaths, protectedFolders, tccLabels, tccPathList } from './tcc.ts'
 import {
-  daemonLabel, expandHome, launchdJob, petLabel, findBin, lockFile, petApp, plistPath, projectsFile, runCmd, type Ctx, type ExecResult,
+  daemonLabel, expandHome, launchdJob, launchdTarget, petLabel, findBin, lockFile, petApp, plistPath, projectsFile, runCmd, type Ctx, type ExecResult,
 } from './ctx.ts'
 import { josa } from '../josa.ts'
 
@@ -56,6 +56,9 @@ function nearestExisting(p: string): string {
   while (!existsSync(cur) && dirname(cur) !== cur) cur = dirname(cur)
   return cur
 }
+
+/** Tracked file names treated as secrets: .env*, *.pem, id_rsa*, *.p12, *.key. */
+const SECRET_NAME = /^\.env|\.pem$|^id_rsa|\.p12$|\.key$/
 
 export const MIN_MACOS = 14
 export const MIN_NODE = 26
@@ -165,6 +168,12 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
           continue
         }
         add(`project:${id}`, `프로젝트 ${id}`, 'ok', `${String(pr.path)} (git, 커밋 있음)`)
+        // Workers can read every tracked file in their clone: committed secrets are not supported (read-only listing).
+        const ls = await p.run(git!, ['-C', path, 'ls-files', '-z'])
+        const secrets = ls.code === 0 ? ls.stdout.split('\0').filter((f) => SECRET_NAME.test(basename(f))) : []
+        if (secrets.length) add(`project-secrets:${id}`, `비밀 파일 ${id}`, 'warn',
+          `git이 추적하는 비밀 파일 같은 것이 있어요: ${secrets.slice(0, 5).join(', ')}${secrets.length > 5 ? ` 외 ${secrets.length - 5}개` : ''} · 작업자는 clone에서 추적 파일을 읽을 수 있어요`,
+          `git rm --cached로 추적을 멈추고 .gitignore에 넣은 뒤, 이미 커밋된 값은 바꿔 주세요 (docs/SETUP.md "비밀 파일")`)
         const st = await p.run(git!, ['-C', path, 'status', '--porcelain'])
         if (st.code === 0 && !st.stdout.trim()) add(`project-tree:${id}`, `작업 트리 ${id}`, 'ok', '깨끗함')
         else add(`project-tree:${id}`, `작업 트리 ${id}`, 'warn',
@@ -212,6 +221,9 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
     else if (cmd === null && pidAlive(pid)) add('lock', '데몬 잠금', 'warn', `pid ${pid}의 프로그램을 확인할 수 없음 (ps 실행 불가)`, 'ps가 동작하는 터미널에서 hq doctor를 다시 실행하세요')
     else if (cmd === null) add('lock', '데몬 잠금', 'warn', `오래된 잠금 (pid ${pid} 종료됨)`, `hq start (데몬이 넘겨받음). 안 되면 rm ${lf}`)
     else if (!cmd.includes('src/main.ts')) add('lock', '데몬 잠금', 'warn', `pid ${josa(pid, '이/가')} hq가 아닌 프로세스 (pid 재사용: 오래된 잠금)`, `rm ${lf} 후 hq start`)
+    // A pre-upgrade daemon still holds a plain-pid lock: hq stop/restart cannot verify it; one launchd restart rewrites it.
+    else if (readLock(ctx)?.format === 'legacy') add('lock', '데몬 잠금', 'warn', `예전 형식이에요 (pid ${pid} 실행 중) · hq stop·restart가 신원을 확인할 수 없어요`,
+      `launchctl kickstart -k ${launchdTarget(ctx, daemonLabel(ctx))} 로 한 번 재시작하면 새 형식이 돼요`)
     else add('lock', '데몬 잠금', 'ok', `pid ${pid} 실행 중`)
   }
 

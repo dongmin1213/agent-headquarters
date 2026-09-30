@@ -1,7 +1,7 @@
 // Worker and reviewer prompts (execution.md §6 §8 §10 §11).
 import type { PlanTask } from '../ceo.ts'
 import type { Verdict } from '../types.ts'
-import type { ChecksFile } from './checks.ts'
+import { setupCreatedLine, type ChecksFile } from './checks.ts'
 
 /** Output of an upstream task handed to a dependent (§11): sealed report content and/or its head commit. */
 export interface Upstream { key: string; title: string; project: string; headSha: string | null; reportSha: string | null; report: string | null }
@@ -158,6 +158,7 @@ function manualTailLines(x: { candidate: string; base: string } | undefined): st
 export function reviewPrompt(o: ReviewPromptInput): string {
   const t = o.task
   const judge = [...new Set([...t.acceptance.filter((a) => !a.check.trim() || a.check.trim() === 'manual').map((a) => a.id), ...(o.manualIds ?? [])])]
+  const created = setupCreatedLine(o.checks?.setupCreated)
   const checkLines = o.checks ? o.checks.checks.map((c) => `- [${c.id}] \`${c.command}\` → ${c.pass ? '통과' : '실패'} (종료 코드 ${c.exitCode ?? '시간 초과'})`) : []
   return [
     `# 교차 검토: ${t.title}`,
@@ -177,10 +178,11 @@ export function reviewPrompt(o: ReviewPromptInput): string {
     `전체 diff는 \`git diff ${o.base} ${o.head}\`로 직접 본다.`,
     '', '## hq가 직접 다시 실행한 기계 검사 결과',
     checkLines.length ? checkLines.join('\n') : '- (명령 검사 없음)',
+    ...(created ? [`- ${created} — 추적되지 않는 파일이라 내용 비교에서 빠져요. 설정·소스처럼 검사 결과를 바꿀 수 있는 파일인지 확인할 것`] : []),
     ...(o.protectedChanges.length ? ['', '## 보호 경로 변경: 테스트·설정 약화 여부 반드시 판정', bullet(o.protectedChanges)] : []),
     ...(t.review?.brief ? ['', '## 검토 지시 (사장)', t.review.brief] : []),
     '', '## 판정 규칙',
-    '- 관련 테스트를 Bash로 직접 실행하고, 실행한 명령·종료 코드·결과를 `tests_run`에 적는다. 테스트 명령은 하나씩, 이어 붙이지 말고(`&&`·`|`·`;`·`|| true` 금지), 실행한 문자열 그대로 tests_run에 적을 것. hq가 실제 실행 기록과 정확히 대조한다. 코드 변경이 있는데 tests_run이 비면 무효.',
+    '- 관련 테스트를 Bash로 직접 실행하고, 실행한 명령·종료 코드·결과를 `tests_run`에 적는다. 테스트 명령은 하나씩, 이어 붙이지 말고(`&&`·`|`·`;`·`|| true` 금지), 실행한 문자열 그대로 tests_run에 적을 것. 인자에 | ; & 같은 문자가 필요하면 스크립트 파일로 감싸 한 명령으로 실행한다. hq가 실제 실행 기록과 정확히 대조한다. 코드 변경이 있는데 tests_run이 비면 무효.',
     '- pass=true이면 tests_run의 모든 종료 코드가 0이어야 한다.',
     `- \`criteria\`에는 수용 기준 id(${t.acceptance.map((a) => a.id).join(', ')})를 빠짐없이 한 번씩, 결과(pass|fail|manual)와 근거를 적는다.`,
     ...(judge.length ? [`- 확인 방법이 manual인 기준(${judge.join(', ')})은 사람 대신 네가 판정하는 항목이다. 결과는 반드시 pass 또는 fail이고 근거를 한 줄 이상 적는다. manual로 두거나 빠뜨리면 판정 전체가 무효다.`] : []),

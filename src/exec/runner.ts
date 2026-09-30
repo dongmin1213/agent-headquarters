@@ -1484,6 +1484,7 @@ export class Runner {
         t.review_model === 'none' ? '검토 없음(기계 검증만)' : verdict ? `검토 통과(${review!.model}${verdict.advisory.length ? `, 참고 ${verdict.advisory.length}건` : ''})` : '검토 기록 없음']
       if (checks?.manual?.length) parts.push(`기존 실패(검토자 판단): ${checks.manual.join(', ')}`)
       if (checks?.warnings?.length) parts.push(`경고: ${checks.warnings.join(' / ')}`)
+      if (checks?.setupCreated?.count) parts.push(`setup이 만든 파일 ${checks.setupCreated.count}개`)
       if (result?.protectedChanges?.length) parts.push(`보호 경로 변경: ${result.protectedChanges.join(', ')}`)
       const judged = [...new Set([...manualIds(specOf(t)), ...(checks?.manual ?? [])])].map((id) => {
         const c = verdict?.criteria.find((x) => x.id === id)

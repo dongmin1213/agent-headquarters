@@ -1,10 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { daemonLabel, installMarker, lockFile, makeCtx, markerContent, petApp, petLabel, plistPath, type Ctx } from '../../src/cli/ctx.ts'
 import type { Probes } from '../../src/cli/doctor.ts'
-import { buildPlists, install, purgePlan, uninstall } from '../../src/cli/install.ts'
+import { buildPlists, homeRefusal, install, purgePlan, uninstall } from '../../src/cli/install.ts'
 import { fakeDaemon, freePort, spawnMain, testCtx, tmp, writeToken } from './helpers.ts'
 import { NESTED_PS_SKIP, nestedSandbox } from '../nested.ts'
 
@@ -68,7 +68,7 @@ test('install with our launchd job loaded never signals the lock pid (legacy loc
   } })
   const d = await spawnMain(ctx.root)
   try {
-    mkdirSync(ctx.home, { recursive: true }); writeFileSync(lockFile(ctx), `${d.pid}\n`)
+    mkdirSync(ctx.home, { recursive: true }); writeFileSync(lockFile(ctx), `${d.pid}\n`); writeFileSync(installMarker(ctx), markerContent(ctx))
     assert.equal(await install(ctx, { sprites: false, probes: okProbes }), 0, ctx.text())
     assert.match(ctx.text(), /launchd 데몬은 5\/6에서 새 설정으로 다시 띄웁니다/)
     assert.doesNotMatch(ctx.text(), /kill -TERM|잠금 파일 형식/)
@@ -317,4 +317,55 @@ test('dry-run install prints bootout/bootstrap without polling launchctl print o
     assert.ok(ctx.text().includes(`[dry-run] launchctl bootout gui/${ctx.uid}/${l}`))
     assert.equal(calls.filter((c) => c === `launchctl print gui/${ctx.uid}/${l}`).length, n, calls.join('\n'))
   }
+})
+
+// ---- N4: install claims only an empty or hq-made HQ_HOME; purge deletes only hq-made entries ----
+
+test('N4. install refuses a non-empty HQ_HOME without an install marker and writes nothing', async () => {
+  const ctx = testCtx({ port: await freePort(), dryRun: false })
+  mkdirSync(ctx.home, { recursive: true }); writeFileSync(join(ctx.home, 'notes.txt'), 'mine')
+  assert.equal(await install(ctx, { sprites: false, probes: okProbes }), 1)
+  assert.ok(ctx.errors.join('\n').includes(`HQ_HOME(${ctx.home})에 hq가 만들지 않은 파일이 있어요 · 빈 폴더나 새 경로를 지정해 주세요`), ctx.text())
+  assert.equal(existsSync(installMarker(ctx)), false)
+  assert.doesNotMatch(ctx.text(), /1\/6/)
+  // Only hq-made entries, but not the default ~/.hq: still refused.
+  rmSync(join(ctx.home, 'notes.txt')); writeFileSync(join(ctx.home, 'hq.db'), 'db')
+  assert.equal(homeRefusal(ctx) !== null, true)
+  // An empty folder, or one carrying a marker, is fine.
+  rmSync(join(ctx.home, 'hq.db'))
+  assert.equal(homeRefusal(ctx), null)
+  writeFileSync(join(ctx.home, 'notes.txt'), 'mine'); writeFileSync(installMarker(ctx), markerContent(ctx))
+  assert.equal(homeRefusal(ctx), null)
+})
+
+test('N4. the default ~/.hq is adopted when it holds only hq-made entries (pure check, temp user home)', () => {
+  const user = tmp(), root = tmp()
+  // HQ_HOME is always explicit here: a missing one would resolve to the real ~/.hq.
+  const def = makeCtx({ HOME: user, PATH: process.env.PATH, HQ_HOME: join(user, '.hq'), HQ_PORT: '7777' }, { root })
+  mkdirSync(join(def.home, 'logs'), { recursive: true }); mkdirSync(join(def.home, 'worktrees'))
+  for (const f of ['hq.db', 'hq.db-wal', 'hq.db-shm', 'daemon.lock']) writeFileSync(join(def.home, f), '')
+  assert.equal(homeRefusal(def), null)
+  writeFileSync(join(def.home, 'todo.md'), 'mine')
+  assert.match(homeRefusal(def) ?? '', /hq가 만들지 않은 파일이 있어요/)
+})
+
+test('N4. purge deletes only hq-made entries, keeps and reports other files, and keeps the folder', async () => {
+  const ctx = await purgeCtx()
+  mkdirSync(join(ctx.home, 'runs/r1'), { recursive: true }); writeFileSync(join(ctx.home, 'runs/r1/x'), '')
+  writeFileSync(join(ctx.home, 'hq.db-wal'), '')
+  writeFileSync(join(ctx.home, 'mine.txt'), 'keep'); mkdirSync(join(ctx.home, 'photos')); writeFileSync(join(ctx.home, 'photos/a.jpg'), '')
+  assert.equal(await uninstall(ctx, { purge: true, yes: true }), 0, ctx.text())
+  assert.deepEqual(readdirSync(ctx.home).sort(), ['mine.txt', 'photos'])
+  assert.ok(existsSync(join(ctx.home, 'photos/a.jpg')))
+  assert.ok(ctx.text().includes(`hq가 만들지 않은 파일은 남겨 뒀어요: ${join(ctx.home, 'mine.txt')}, ${join(ctx.home, 'photos')}`), ctx.text())
+  assert.equal(existsSync(ctx.tokenFile), false)
+})
+
+test('N4. purge removes the folder once only hq-made entries were in it', async () => {
+  const ctx = await purgeCtx()
+  mkdirSync(join(ctx.home, 'worktrees/r'), { recursive: true }); writeFileSync(join(ctx.home, 'daemon.pid'), '1')
+  assert.equal(await uninstall(ctx, { purge: true, yes: true }), 0, ctx.text())
+  assert.equal(existsSync(ctx.home), false)
+  assert.ok(ctx.lines.includes(`삭제: ${ctx.home}`), ctx.text())
+  assert.doesNotMatch(ctx.text(), /남겨 뒀어요/)
 })
