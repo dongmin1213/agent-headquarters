@@ -47,6 +47,9 @@ struct DecisionItem: Decodable {
     let kind: String; let id: String
     var revision: Int? = nil; var requestId: String? = nil; var taskId: String? = nil
     var title: String? = nil; var detail: String? = nil; var options: [String]? = nil; var subjectHash: String? = nil
+    var situation: String? = nil; var cause: String? = nil; var causeConfirmed: Bool? = nil
+    var recommendation: Recommendation? = nil; var optionHelp: [String: String]? = nil; var detailPath: String? = nil
+    struct Recommendation: Decodable { let option: String; let reason: String }
     var key: String { "\(id)#\(revision ?? 0)" }
 }
 struct Snapshot: Decodable {
@@ -294,6 +297,45 @@ func firstLine(_ s: String?, max: Int = 90) -> String {
     return l.count > max ? String(l.prefix(max)) + "…" : l
 }
 
+@MainActor enum Palette {
+    static let panel = NSColor(calibratedRed: 0.985, green: 0.965, blue: 0.93, alpha: 1)
+    static let card = NSColor(calibratedRed: 1, green: 0.996, blue: 0.985, alpha: 1)
+    static let border = NSColor(calibratedRed: 0.89, green: 0.84, blue: 0.76, alpha: 1)
+    static let text = NSColor(calibratedRed: 0.19, green: 0.15, blue: 0.11, alpha: 1)
+    static let muted = NSColor(calibratedRed: 0.44, green: 0.38, blue: 0.31, alpha: 1)
+    static let recBg = NSColor(calibratedRed: 1, green: 0.93, blue: 0.80, alpha: 1)
+    static let rec = NSColor(calibratedRed: 0.52, green: 0.26, blue: 0.0, alpha: 1)
+    static let alert = NSColor(calibratedRed: 0.84, green: 0.40, blue: 0.0, alpha: 1)
+}
+
+/// Rounded fill (+ optional hairline border), drawn in draw() so offscreen renders include it.
+final class FillView: NSView {
+    let fill: NSColor; let stroke: NSColor?; let radius: CGFloat
+    init(fill: NSColor, stroke: NSColor?, radius: CGFloat) { self.fill = fill; self.stroke = stroke; self.radius = radius; super.init(frame: .zero) }
+    required init?(coder: NSCoder) { fatalError() }
+    override func draw(_ dirtyRect: NSRect) {
+        let p = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: radius, yRadius: radius)
+        fill.setFill(); p.fill()
+        if let stroke { stroke.setStroke(); p.lineWidth = 1; p.stroke() }
+    }
+}
+
+/// Quota bar: warm track, fill turns orange at 70% and red at 90%.
+final class BarView: NSView {
+    let fraction: Double
+    init(fraction: Double) { self.fraction = min(max(fraction, 0), 1); super.init(frame: .zero) }
+    required init?(coder: NSCoder) { fatalError() }
+    override func draw(_ dirtyRect: NSRect) {
+        let r = bounds.height / 2
+        NSColor(calibratedRed: 0.90, green: 0.86, blue: 0.80, alpha: 1).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: r, yRadius: r).fill()
+        let color: NSColor = fraction >= 0.9 ? .systemRed : (fraction >= 0.7 ? .systemOrange : .systemGreen)
+        color.setFill()
+        let w = max(bounds.height, bounds.width * fraction)
+        if fraction > 0 { NSBezierPath(roundedRect: NSRect(x: 0, y: 0, width: w, height: bounds.height), xRadius: r, yRadius: r).fill() }
+    }
+}
+
 /// Scroll container whose document starts at the top.
 final class FlippedView: NSView { override var isFlipped: Bool { true } }
 
@@ -476,18 +518,19 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.snapshotRow(path) }
         }
         // Test hook: HQ_OPEN=ceo|worker opens that popover once after the first snapshot (screenshots without clicking).
+        // Test hooks: HQ_OPEN=ceo|worker|worker:<state> opens that panel once (HQ_TAB, HQ_FOCUS=<taskId>, HQ_PRESS=<kind>);
+        // with HQ_SNAPSHOT the panel is rendered offscreen afterwards.
         if let which = env["HQ_OPEN"], !openedForTest {
             openedForTest = true
-            let target = which == "ceo" ? ceo : critters.values.first { $0.kind == .worker && $0.look.mood == .busy }
+            let state = which.hasPrefix("worker:") ? String(which.dropFirst(7)) : nil
+            let target = which == "ceo" ? ceo : critters.values.first { $0.kind == .worker && (state == nil || $0.worker?.state == state) }
             if let target { DispatchQueue.main.async {
-                self.showDetail(for: target)
-                // HQ_PRESS=<kind>: press that decision's first option (exercises the POST / inline-error path).
+                if target.kind == .ceo { self.showCeo(for: target, tab: env["HQ_TAB"].flatMap { Int($0) }, focusTask: env["HQ_FOCUS"]) }
+                else { self.showDetail(for: target) }
                 if let kind = env["HQ_PRESS"], let i = self.shownDecisions.firstIndex(where: { $0.kind == kind }) {
                     let b = NSButton(); b.identifier = NSUserInterfaceItemIdentifier("\(i)\u{1F}0"); self.decisionButton(b)
-                }
-                // HQ_SCROLL=<points>: scroll a long popover down (screenshots of the lower part).
-                if let y = env["HQ_SCROLL"].flatMap(Double.init), let sv = self.popoverDoc?.enclosingScrollView {
-                    sv.contentView.scroll(to: NSPoint(x: 0, y: y)); sv.reflectScrolledClipView(sv.contentView)
+                } else if target.kind == .ceo {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { self.snapshotPopover() }
                 }
             } }
         }
@@ -608,7 +651,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
                 item.target = self; item.representedObject = t.id; item.toolTip = "클릭하면 지금 실행"
                 m.addItem(item)
             }
-            let web = NSMenuItem(title: "자세히 보기 (웹 화면)", action: #selector(openWeb), keyEquivalent: "")
+            let web = NSMenuItem(title: "사무실 열기 (웹 화면)", action: #selector(openWeb), keyEquivalent: "")
             web.target = self; m.addItem(web)
         }
         m.addItem(.separator())
@@ -659,93 +702,210 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         }
     }
 
-    func vstack() -> NSStackView {
-        let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 12, left: 14, bottom: 12, right: 14)
-        return stack
+    // Panel = header / scrollable body / footer on a warm light background.
+    static let panelWidth: CGFloat = 440
+    static let innerWidth: CGFloat = 408     // panel minus 16pt sides
+    static let cardText: CGFloat = 380       // card minus 14pt padding
+    let maxBody: CGFloat = 470
+    var panelView: NSView?
+    var bodyStack: NSStackView?
+    var bodyDoc: FlippedView?
+    var bodyHeight: NSLayoutConstraint?
+    var cardViews: [Int: NSView] = [:]
+
+    func text(_ s: String, size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = Palette.text,
+              width: CGFloat = Pet.innerWidth, mono: Bool = false) -> NSTextField {
+        let f = NSTextField(wrappingLabelWithString: s)
+        f.font = mono ? .monospacedSystemFont(ofSize: size - 1, weight: weight) : .systemFont(ofSize: size, weight: weight)
+        f.textColor = color; f.preferredMaxLayoutWidth = width; f.isSelectable = false
+        return f
     }
 
-    func present(_ stack: NSStackView, at c: Critter, maxHeight: CGFloat = 560, focus: NSView? = nil) {
-        let fit = stack.fittingSize
-        let vc = NSViewController()
-        popoverStack = stack; popoverDoc = nil
-        if fit.height > maxHeight {
-            let doc = FlippedView(frame: NSRect(origin: .zero, size: fit))
-            popoverDoc = doc
-            stack.frame = doc.bounds; stack.autoresizingMask = [.width]
-            doc.addSubview(stack)
-            let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: fit.width + 16, height: maxHeight))
-            scroll.hasVerticalScroller = true; scroll.drawsBackground = false; scroll.documentView = doc
-            vc.view = scroll
-        } else {
-            stack.frame.size = fit; vc.view = stack
-        }
-        let p = NSPopover(); p.contentViewController = vc; p.behavior = .transient; p.delegate = self
-        NSApp.activate()
-        p.show(relativeTo: c.view.bounds, of: c.view, preferredEdge: .maxY)
-        popover = p
-        if let focus { vc.view.window?.makeFirstResponder(focus) }
+    func vstack(_ views: [NSView] = [], spacing: CGFloat = 8) -> NSStackView {
+        let s = NSStackView(views: views); s.orientation = .vertical; s.alignment = .leading; s.spacing = spacing
+        return s
     }
 
-    var popoverStack: NSStackView?
-    var popoverDoc: FlippedView?
-    /// Re-fits the open popover after content changed (inline error, reason field shown).
-    func relayoutPopover() {
-        guard let stack = popoverStack, let p = popover else { return }
-        let fit = stack.fittingSize
-        if let doc = popoverDoc { doc.setFrameSize(fit); stack.frame = doc.bounds }
-        else { stack.setFrameSize(fit); p.contentSize = fit }
-    }
+    func row(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView { let r = NSStackView(views: views); r.spacing = spacing; return r }
 
-    /// HQ_SNAPSHOT=<png path>: render the whole popover content offscreen (works with the display asleep).
-    func snapshotPopover() {
-        guard let path = env["HQ_SNAPSHOT"], let v = popoverDoc ?? popoverStack,
-              let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
-        v.cacheDisplay(in: v.bounds, to: rep)
-        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
-    }
-
-    func heading(_ s: String, size: CGFloat = 13) -> NSTextField {
-        let t = NSTextField(labelWithString: s); t.font = .boldSystemFont(ofSize: size)
-        t.lineBreakMode = .byTruncatingTail; t.preferredMaxLayoutWidth = 380
-        return t
-    }
-
-    func button(_ title: String, _ action: Selector, _ id: String) -> NSButton {
+    func button(_ title: String, _ action: Selector, _ id: String, primary: Bool = false) -> NSButton {
         let b = NSButton(title: title, target: self, action: action)
         b.identifier = NSUserInterfaceItemIdentifier(id); b.isEnabled = !offline
+        b.font = .systemFont(ofSize: 13)
+        if primary { b.bezelColor = .controlAccentColor; b.keyEquivalent = "" }
         return b
     }
 
-    func row(_ views: [NSView]) -> NSStackView { let r = NSStackView(views: views); r.spacing = 6; return r }
+    func link(_ title: String, _ action: Selector, _ id: String) -> NSButton {
+        let b = NSButton(title: title, target: self, action: action)
+        b.identifier = NSUserInterfaceItemIdentifier(id); b.isBordered = false
+        b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: NSColor.linkColor, .font: NSFont.systemFont(ofSize: 12.5, weight: .medium)])
+        return b
+    }
+
+    /// Rounded filled box around a stack (cards, the recommendation block).
+    func boxed(_ content: NSStackView, fill: NSColor, stroke: NSColor?, width: CGFloat, pad: CGFloat = 14, radius: CGFloat = 10) -> FillView {
+        let box = FillView(fill: fill, stroke: stroke, radius: radius)
+        content.translatesAutoresizingMaskIntoConstraints = false
+        box.addSubview(content)
+        NSLayoutConstraint.activate([
+            box.widthAnchor.constraint(equalToConstant: width),
+            content.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: pad),
+            content.trailingAnchor.constraint(lessThanOrEqualTo: box.trailingAnchor, constant: -pad),
+            content.topAnchor.constraint(equalTo: box.topAnchor, constant: pad - 2),
+            content.bottomAnchor.constraint(equalTo: box.bottomAnchor, constant: -(pad - 2)),
+        ])
+        return box
+    }
+
+    func freeField(_ placeholder: String, _ action: Selector, _ id: String, width: CGFloat = Pet.cardText) -> NSTextField {
+        let f = NSTextField(string: ""); f.placeholderString = placeholder; f.font = .systemFont(ofSize: 13)
+        f.widthAnchor.constraint(equalToConstant: width).isActive = true
+        f.identifier = NSUserInterfaceItemIdentifier(id); f.target = self; f.action = action; f.isEnabled = !offline
+        return f
+    }
+
+    func footer() -> NSView {
+        let spacer = NSView(); spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let r = row([button("사무실 열기", #selector(openWeb), ""), spacer, button("닫기", #selector(closePopover), "")])
+        r.widthAnchor.constraint(equalToConstant: Pet.innerWidth).isActive = true
+        return r
+    }
+
+    /// Shows a panel next to a character. The body scrolls when taller than `maxBody`.
+    func openPanel(at c: Critter, header: [NSView], body: NSStackView, focus: NSView? = nil) {
+        let doc = FlippedView(frame: .zero)
+        doc.addSubview(body)
+        let scroll = NSScrollView(); scroll.hasVerticalScroller = true; scroll.drawsBackground = false
+        scroll.autohidesScrollers = true; scroll.documentView = doc
+        scroll.widthAnchor.constraint(equalToConstant: Pet.innerWidth).isActive = true
+        let h = scroll.heightAnchor.constraint(equalToConstant: 100); h.isActive = true
+        let root = vstack(header + [scroll, footer()], spacing: 12)
+        root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 14, right: 16)
+        let panel = FillView(fill: Palette.panel, stroke: nil, radius: 0)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        panel.addSubview(root)
+        NSLayoutConstraint.activate([root.leadingAnchor.constraint(equalTo: panel.leadingAnchor), root.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
+                                     root.topAnchor.constraint(equalTo: panel.topAnchor), root.bottomAnchor.constraint(equalTo: panel.bottomAnchor),
+                                     panel.widthAnchor.constraint(equalToConstant: Pet.panelWidth)])
+        panelView = panel; bodyStack = body; bodyDoc = doc; bodyHeight = h
+        relayoutBody()
+        panel.frame.size = panel.fittingSize
+        let vc = NSViewController(); vc.view = panel
+        let p = NSPopover(); p.contentViewController = vc; p.behavior = .transient; p.delegate = self
+        p.appearance = NSAppearance(named: .aqua)
+        NSApp.activate()
+        p.show(relativeTo: c.view.bounds, of: c.view, preferredEdge: .maxY)
+        popover = p
+        panel.window?.makeFirstResponder(focus)   // nil: no field grabs focus on open
+    }
+
+    /// Re-fits the body after its content changed (tab switch, inline error, reason field, activity loaded).
+    func relayoutBody() {
+        guard let body = bodyStack, let doc = bodyDoc, let panel = panelView else { return }
+        body.translatesAutoresizingMaskIntoConstraints = true
+        let fit = body.fittingSize
+        let size = NSSize(width: Pet.innerWidth, height: fit.height)
+        doc.setFrameSize(size); body.frame = NSRect(origin: .zero, size: size)
+        bodyHeight?.constant = min(size.height, maxBody)
+        panel.layoutSubtreeIfNeeded()
+        if let p = popover, p.isShown { p.contentSize = panel.fittingSize }
+    }
+    func relayoutPopover() { relayoutBody() }
+
+    func scrollBody(to v: NSView) {
+        guard let doc = bodyDoc, let sv = doc.enclosingScrollView else { return }
+        doc.layoutSubtreeIfNeeded()
+        let r = v.convert(v.bounds, to: doc)
+        sv.contentView.scroll(to: NSPoint(x: 0, y: max(0, min(r.minY - 6, doc.bounds.height - sv.contentView.bounds.height))))
+        sv.reflectScrolledClipView(sv.contentView)
+    }
+
+    /// HQ_SNAPSHOT=<png>: renders the open panel (as seen) and its full body (`-full.png`) offscreen.
+    func snapshotPopover() {
+        guard let path = env["HQ_SNAPSHOT"] else { return }
+        func write(_ v: NSView, _ p: String) {
+            guard let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
+            v.cacheDisplay(in: v.bounds, to: rep)
+            try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: p))
+        }
+        if let panel = panelView { write(panel, path) }
+        if let doc = bodyDoc { write(doc, path.replacingOccurrences(of: ".png", with: "-full.png")) }
+        log("popover snapshot → \(path)")
+    }
+
+    @objc func closePopover() { popover?.close() }
 
     func showTeam(for c: Critter) {
         guard let t = c.team else { return }
-        let stack = vstack()
-        stack.addArrangedSubview(heading("\(t.name) — \(label(t.state))"))
-        stack.addArrangedSubview(wrap(t.bubble))
-        if let r = t.lastRun, let sum = r.summary, !sum.isEmpty { stack.addArrangedSubview(wrap("최근 실행 (종료 코드 \(r.exitCode.map(String.init) ?? "-")):\n" + sum, mono: true)) }
-        for a in (snapshot?.approvals ?? []) where a.teamId == t.id {
-            stack.addArrangedSubview(heading("승인 요청: \(a.title)", size: 12))
-            if !a.body.isEmpty { stack.addArrangedSubview(wrap(a.body)) }
-            stack.addArrangedSubview(row(a.options.map { button($0, #selector(decide(_:)), "\(a.id)\u{1F}\($0)\u{1F}\(a.subjectHash)") }))
+        let header = [text(t.name, size: 15, weight: .bold), text(label(t.state), size: 12.5, color: Palette.muted)]
+        let body = vstack([text(t.bubble)])
+        if let r = t.lastRun, let sum = r.summary, !sum.isEmpty {
+            body.addArrangedSubview(text("최근 실행 (종료 코드 \(r.exitCode.map(String.init) ?? "-"))", size: 12.5, weight: .semibold))
+            body.addArrangedSubview(text(sum, size: 12, color: Palette.muted, mono: true))
         }
-        if !offline { stack.addArrangedSubview(button("지금 실행", #selector(runTeam(_:)), t.id)) }
-        present(stack, at: c)
+        for a in (snapshot?.approvals ?? []) where a.teamId == t.id {
+            body.addArrangedSubview(text("승인 요청: \(a.title)", weight: .semibold))
+            if !a.body.isEmpty { body.addArrangedSubview(text(a.body, size: 12.5, color: Palette.muted)) }
+            body.addArrangedSubview(row(a.options.map { button($0, #selector(decide(_:)), "\(a.id)\u{1F}\($0)\u{1F}\(a.subjectHash)") }))
+        }
+        if !offline { body.addArrangedSubview(button("지금 실행", #selector(runTeam(_:)), t.id)) }
+        openPanel(at: c, header: header, body: body)
+    }
+
+    func workerStateLabel(_ s: String) -> String {
+        ["running": "작업 중", "verifying": "검증 중", "reviewing": "검토 중", "held": "한도 보류 (쉬는 중)", "blocked": "! 확인 필요"][s] ?? s
     }
 
     func showWorker(for c: Critter) {
         guard let w = c.worker else { return }
         let task = (snapshot?.requests ?? []).flatMap { $0.tasks ?? [] }.first { $0.id == w.taskId }
-        let stack = vstack()
-        stack.addArrangedSubview(heading(w.title))
-        let kind = ["work": "구현", "review": "검토", "verify": "검증"][w.kind] ?? w.kind
-        let state = ["running": "작업 중", "verifying": "검증 중", "reviewing": "검토 중", "held": "한도 보류 (쉬는 중)"][w.state] ?? w.state
-        stack.addArrangedSubview(wrap("모델 \(w.model) · \(kind) · \(state)\n프로젝트 \(w.project) · 시도 \(task?.attempts.map(String.init) ?? "-")회 · 시작 \(timeText(w.startedAt))"))
-        let activity = w.bubble.isEmpty ? (task?.lastActivity ?? "") : w.bubble
-        if !activity.isEmpty { stack.addArrangedSubview(wrap("최근 활동: \(activity)", mono: true)) }
-        stack.addArrangedSubview(button("자세히 보기", #selector(openWeb), ""))
-        present(stack, at: c)
+        let blocked = w.state == "blocked"
+        let sub = text("\(w.model) · \(workerStateLabel(w.state))", size: 12.5, weight: blocked ? .semibold : .regular, color: blocked ? Palette.alert : Palette.muted)
+        let header = [text("\(w.project) · \(w.title)", size: 15, weight: .bold), sub]
+        let body = vstack(spacing: 10)
+        if blocked {
+            body.addArrangedSubview(text("사장에게 보고했어요 · 결정은 사장 카드에서 해요", weight: .semibold, color: Palette.alert))
+            body.addArrangedSubview(button("사장 카드 열기", #selector(openCeoCard(_:)), w.taskId, primary: true))
+        }
+        let kind = ["work": "구현", "review": "검토", "verify": "기계 검증"][w.kind] ?? w.kind
+        body.addArrangedSubview(text("\(kind) · 시도 \(task?.attempts.map(String.init) ?? "-")회 · 시작 \(timeText(w.startedAt))", size: 12.5, color: Palette.muted))
+        body.addArrangedSubview(text("최근 활동", size: 13, weight: .semibold))
+        let activity = text("불러오는 중…", size: 12.5, color: Palette.text, mono: true)
+        body.addArrangedSubview(boxed(vstack([activity]), fill: Palette.card, stroke: Palette.border, width: Pet.innerWidth, pad: 12, radius: 8))
+        openPanel(at: c, header: header, body: body)
+        loadActivity(w.attemptId, fallback: w.bubble, into: activity)
+    }
+
+    /// Last 5 lines of GET /api/attempts/:id/activity (pages through `next` when the log is long).
+    func loadActivity(_ attemptId: String, fallback: String, into label: NSTextField) {
+        Task { @MainActor in
+            var after = 0; var lines: [String] = []; var ok = false
+            for _ in 0..<20 {
+                guard let url = URL(string: "api/attempts/\(seg(attemptId))/activity?after=\(after)", relativeTo: base),
+                      let (data, resp) = try? await URLSession.shared.data(for: authed(url)),
+                      (resp as? HTTPURLResponse)?.statusCode == 200,
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any], let arr = obj["lines"] as? [Any] else { break }
+                ok = true
+                lines += arr.compactMap { item -> String? in
+                    if let s = item as? String { return s }
+                    guard let o = item as? [String: Any], let t = o["text"] as? String else { return nil }
+                    return (o["at"] as? String).map { "\(timeText($0))  \(t)" } ?? t
+                }
+                guard arr.count >= 500, let n = obj["next"] as? Int, n > after else { break }
+                after = n
+            }
+            label.stringValue = !lines.isEmpty ? lines.suffix(5).joined(separator: "\n")
+                : (ok ? "(아직 활동 기록이 없어요)" : (fallback.isEmpty ? "(활동을 불러오지 못했어요)" : fallback))
+            relayoutBody()
+            if env["HQ_SNAPSHOT"] != nil { DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.snapshotPopover() } }
+        }
+    }
+
+    @objc func openCeoCard(_ b: NSButton) {
+        guard let taskId = b.identifier?.rawValue, let ceo = critters["ceo"] else { return }
+        popover?.close()
+        showCeo(for: ceo, tab: 0, focusTask: taskId)
     }
 
     var requestInput: NSTextView?
@@ -753,110 +913,154 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     var rejectFields: [Int: NSTextField] = [:]
     var shownDecisions: [DecisionItem] = []
     var decisionErrors: [Int: NSTextField] = [:]
+    var ceoTab = 0
 
-    /// Chairman ↔ CEO: headline, every decision item, and the new-request box.
-    func showCeo(for c: Critter) {
-        let stack = vstack()
-        rejectFields = [:]
-        let top = row([heading("사장에게 지시"), button("자세히 보기", #selector(openWeb), "")])
-        stack.addArrangedSubview(top)
-        if offline { stack.addArrangedSubview(wrap("hq 데몬이 꺼져 있어요. 켜진 뒤에 요청할 수 있어요.")) }
-        else if let h = snapshot?.headline, !h.text.isEmpty { stack.addArrangedSubview(wrap(h.text, color: .labelColor)) }
-
+    /// Chairman ↔ CEO: tabs 내 차례 N / 새 요청 / 사용량 (§19).
+    func showCeo(for c: Critter, tab: Int? = nil, focusTask: String? = nil) {
         let items = offline ? [] : (snapshot?.decisions ?? [])
-        shownDecisions = items; decisionErrors = [:]
-        if !items.isEmpty {
-            stack.addArrangedSubview(separator())
-            stack.addArrangedSubview(heading("회장님 결정 \(items.count)건", size: 12))
+        ceoTab = tab ?? (items.isEmpty ? 1 : 0)
+        var header: [NSView] = [text("사장", size: 15, weight: .bold)]
+        if offline { header.append(text("hq 데몬이 꺼져 있어요. 켜진 뒤에 요청할 수 있어요.", size: 12.5, color: Palette.alert)) }
+        else if let h = snapshot?.headline, !h.text.isEmpty { header.append(text(h.text, size: 12.5, color: Palette.muted)) }
+        let seg = NSSegmentedControl(labels: ["내 차례 \(items.count)", "새 요청", "사용량"], trackingMode: .selectOne, target: self, action: #selector(tabChanged(_:)))
+        seg.segmentDistribution = .fillEqually; seg.font = .systemFont(ofSize: 13)
+        seg.widthAnchor.constraint(equalToConstant: Pet.innerWidth).isActive = true
+        seg.selectedSegment = ceoTab
+        header.append(seg)
+        let body = ceoBody(ceoTab)
+        openPanel(at: c, header: header, body: body, focus: ceoTab == 1 ? requestInput : nil)
+        if let focusTask, let i = shownDecisions.firstIndex(where: { $0.taskId == focusTask || $0.id == focusTask }), let card = cardViews[i] {
+            scrollBody(to: card)
         }
-        // Rendered in the daemon's order; each kind posts to its own endpoint (§15).
+    }
+
+    @objc func tabChanged(_ s: NSSegmentedControl) {
+        ceoTab = s.selectedSegment
+        guard let doc = bodyDoc else { return }
+        bodyStack?.removeFromSuperview()
+        let body = ceoBody(ceoTab)
+        doc.addSubview(body); bodyStack = body
+        relayoutBody()
+        doc.enclosingScrollView?.contentView.scroll(to: .zero)
+        if ceoTab == 1, let tv = requestInput { tv.window?.makeFirstResponder(tv) }
+    }
+
+    func ceoBody(_ tab: Int) -> NSStackView {
+        switch tab {
+        case 0: return decisionsBody()
+        case 1: return requestBody()
+        default: return usageBody()
+        }
+    }
+
+    func optionLabel(_ d: DecisionItem, _ o: String) -> String { d.kind == "blocked" ? (Pet.blockedLabels[o] ?? o) : o }
+
+    /// 내 차례: one card per DecisionItem in the daemon's order.
+    func decisionsBody() -> NSStackView {
+        let items = offline ? [] : (snapshot?.decisions ?? [])
+        shownDecisions = items; decisionErrors = [:]; rejectFields = [:]; cardViews = [:]
+        let body = vstack(spacing: 12)
+        if items.isEmpty { body.addArrangedSubview(text("지금 하실 결정은 없어요.", color: Palette.muted)); return body }
         for (i, d) in items.enumerated() {
-            let t = heading("• " + (d.title ?? d.kind), size: 12); t.font = .systemFont(ofSize: 12, weight: .semibold)
-            stack.addArrangedSubview(t)
-            if let detail = d.detail, !detail.isEmpty { stack.addArrangedSubview(wrap(detail)) }
+            let card = vstack(spacing: 8)
+            card.addArrangedSubview(text(d.title ?? d.kind, size: 14, weight: .bold, width: Pet.cardText))
+            let situation = (d.situation?.isEmpty == false ? d.situation : d.detail) ?? ""
+            if !situation.isEmpty { card.addArrangedSubview(text(situation, width: Pet.cardText)) }
+            if let cause = d.cause, !cause.isEmpty {
+                let t = text("", size: 12.5, color: Palette.muted, width: Pet.cardText)
+                let s = NSMutableAttributedString(string: d.causeConfirmed == true ? "원인(확인됨) " : "원인(추정) ",
+                                                  attributes: [.font: NSFont.systemFont(ofSize: 12.5, weight: .semibold), .foregroundColor: Palette.text])
+                s.append(NSAttributedString(string: cause, attributes: [.font: NSFont.systemFont(ofSize: 12.5), .foregroundColor: Palette.muted]))
+                t.attributedStringValue = s
+                card.addArrangedSubview(t)
+            }
             let opts = d.options ?? []
+            if let rec = d.recommendation, opts.contains(rec.option) {
+                let r = text("추천 · \(optionLabel(d, rec.option)). \(rec.reason)", size: 13, weight: .bold, color: Palette.rec, width: Pet.cardText - 24)
+                card.addArrangedSubview(boxed(vstack([r]), fill: Palette.recBg, stroke: nil, width: Pet.cardText, pad: 12, radius: 8))
+            }
+            let help = opts.compactMap { o in d.optionHelp?[o].map { "· \(optionLabel(d, o)): \($0)" } }
+            if !help.isEmpty { card.addArrangedSubview(vstack(help.map { text($0, size: 12.5, color: Palette.muted, width: Pet.cardText) }, spacing: 3)) }
             var buttons: [NSView] = []
             for (j, o) in opts.enumerated() {
                 if d.kind == "accept" && o == "반려" { buttons.append(button("반려…", #selector(rejectOpen(_:)), "\(i)")); continue }
-                let title = d.kind == "blocked" ? (Pet.blockedLabels[o] ?? o) : o
-                let b = button(title, #selector(decisionButton(_:)), "\(i)\u{1F}\(j)")
-                buttons.append(b)
+                buttons.append(button(optionLabel(d, o), #selector(decisionButton(_:)), "\(i)\u{1F}\(j)", primary: d.recommendation?.option == o))
             }
-            if ["accept", "merge", "integration"].contains(d.kind) { buttons.append(button("자세히 보기", #selector(openWeb), "")) }
-            if !buttons.isEmpty { stack.addArrangedSubview(row(buttons)) }
+            if !buttons.isEmpty { card.addArrangedSubview(row(buttons)) }
             if d.kind == "ceo_question" || d.kind == "worker_question" {
-                stack.addArrangedSubview(freeField("직접 답하기 (엔터)", #selector(decisionFree(_:)), "\(i)"))
+                card.addArrangedSubview(freeField("직접 답하기 (엔터)", #selector(decisionFree(_:)), "\(i)"))
             }
             if d.kind == "accept" {
                 let reason = freeField("반려 사유 (엔터로 반려)", #selector(rejectSubmit(_:)), "\(i)")
                 reason.isHidden = true; rejectFields[i] = reason
-                stack.addArrangedSubview(reason)
+                card.addArrangedSubview(reason)
             }
-            let err = wrap("", color: .systemRed); err.isHidden = true; decisionErrors[i] = err
-            stack.addArrangedSubview(err)
+            let err = text("", size: 12.5, weight: .medium, color: .systemRed, width: Pet.cardText); err.isHidden = true; decisionErrors[i] = err
+            card.addArrangedSubview(err)
+            if d.detailPath != nil { card.addArrangedSubview(link("원문 보기 ›", #selector(openDetail(_:)), "\(i)")) }
+            let box = boxed(card, fill: Palette.card, stroke: Palette.border, width: Pet.innerWidth)
+            cardViews[i] = box
+            body.addArrangedSubview(box)
         }
+        return body
+    }
 
-        // Recent results: finished or stopped requests keep their outcome here (§19).
-        let done: Set<String> = ["merged", "accepted", "failed", "cancelled", "blocked"]
-        let recent = (snapshot?.requests ?? []).filter { done.contains($0.status) }
-            .sorted { ($0.updatedAt ?? "") > ($1.updatedAt ?? "") }.prefix(3)
-        if !offline && !recent.isEmpty {
-            stack.addArrangedSubview(separator())
-            stack.addArrangedSubview(heading("최근 결과", size: 12))
-            for r in recent {
-                let note = r.note.map { firstLine($0) }.flatMap { $0.isEmpty ? nil : " — \($0)" } ?? ""
-                let h = NSTextField(labelWithString: "[\(statusLabel(r.status))] \(firstLine(r.text, max: 50))\(note)")
-                h.font = .systemFont(ofSize: 11)
-                h.textColor = ["failed", "blocked"].contains(r.status) ? .systemRed : .secondaryLabelColor
-                h.lineBreakMode = .byTruncatingTail
-                h.widthAnchor.constraint(lessThanOrEqualToConstant: 380).isActive = true
-                stack.addArrangedSubview(h)
-            }
-        }
-
-        stack.addArrangedSubview(separator())
+    /// 새 요청: input, project picker, 최근 결과.
+    func requestBody() -> NSStackView {
+        let body = vstack(spacing: 10)
+        body.addArrangedSubview(text("새 요청 (⌘↩ 보내기)", weight: .semibold))
+        let scroll = NSTextView.scrollableTextView()
+        scroll.widthAnchor.constraint(equalToConstant: Pet.innerWidth).isActive = true
+        scroll.heightAnchor.constraint(equalToConstant: 90).isActive = true
+        let tv = scroll.documentView as! NSTextView
+        tv.font = .systemFont(ofSize: 13); tv.isRichText = false; tv.textContainerInset = NSSize(width: 4, height: 6)
+        requestInput = tv
         let picker = NSPopUpButton(frame: .zero, pullsDown: false)
         for p in snapshot?.projects ?? [] { picker.addItem(withTitle: p.name); picker.lastItem?.representedObject = p.id }
         projectPicker = picker
-        let scroll = NSTextView.scrollableTextView()
-        scroll.frame = NSRect(x: 0, y: 0, width: 380, height: 70)
-        scroll.widthAnchor.constraint(equalToConstant: 380).isActive = true
-        scroll.heightAnchor.constraint(equalToConstant: 70).isActive = true
-        let tv = scroll.documentView as! NSTextView
-        tv.font = .systemFont(ofSize: 12); tv.isRichText = false
-        requestInput = tv
         let send = NSButton(title: "사장에게 보내기", target: self, action: #selector(sendRequest))
-        send.keyEquivalent = "\r"; send.keyEquivalentModifierMask = [.command]; send.isEnabled = !offline
-        stack.addArrangedSubview(NSTextField(labelWithString: "새 요청 (⌘↩ 보내기)"))
-        stack.addArrangedSubview(scroll)
-        stack.addArrangedSubview(row([picker, send]))
-        present(stack, at: c, focus: items.isEmpty ? tv : nil)
+        send.keyEquivalent = "\r"; send.keyEquivalentModifierMask = [.command]; send.isEnabled = !offline; send.font = .systemFont(ofSize: 13)
+        body.addArrangedSubview(scroll)
+        body.addArrangedSubview(row([picker, send]))
+        let done: Set<String> = ["merged", "accepted", "failed", "cancelled", "blocked"]
+        let recent = (snapshot?.requests ?? []).filter { done.contains($0.status) }.sorted { ($0.updatedAt ?? "") > ($1.updatedAt ?? "") }.prefix(3)
+        if !offline && !recent.isEmpty {
+            body.addArrangedSubview(text("최근 결과", weight: .semibold))
+            for r in recent {
+                let bad = ["failed", "blocked", "cancelled"].contains(r.status)
+                let line = vstack([text("[\(statusLabel(r.status))] \(firstLine(r.text, max: 50))", size: 13, weight: .medium, color: bad ? Palette.alert : Palette.text, width: Pet.cardText)], spacing: 3)
+                if let n = r.note, !n.isEmpty { line.addArrangedSubview(text(firstLine(n, max: 120), size: 12.5, color: Palette.muted, width: Pet.cardText)) }
+                body.addArrangedSubview(boxed(line, fill: Palette.card, stroke: Palette.border, width: Pet.innerWidth, pad: 12, radius: 8))
+            }
+        }
+        return body
     }
 
-    func separator() -> NSBox {
-        let sep = NSBox(); sep.boxType = .separator; sep.widthAnchor.constraint(equalToConstant: 380).isActive = true
-        return sep
-    }
-
-    func freeField(_ placeholder: String, _ action: Selector, _ id: String) -> NSTextField {
-        let f = NSTextField(string: ""); f.placeholderString = placeholder
-        f.widthAnchor.constraint(equalToConstant: 360).isActive = true
-        f.identifier = NSUserInterfaceItemIdentifier(id); f.target = self; f.action = action; f.isEnabled = !offline
-        return f
+    /// 사용량: every quota window with a bar, %, reset time; then the mode.
+    func usageBody() -> NSStackView {
+        let body = vstack(spacing: 12)
+        guard !offline, let q = snapshot?.quota else { body.addArrangedSubview(text("아직 사용량 관측이 없어요.", color: Palette.muted)); return body }
+        for w in q.allWindows {
+            let name = ["five_hour": "5시간", "seven_day": "7일", "seven_day_opus": "7일 (Opus)", "seven_day_sonnet": "7일 (Sonnet)"][w.name] ?? w.name
+            let v = vstack(spacing: 5)
+            v.addArrangedSubview(text("\(name)  \(pct(w.utilization) ?? "-")", size: 13, weight: .semibold))
+            let bar = BarView(fraction: w.utilization.map { $0 <= 1 ? $0 : $0 / 100 } ?? 0)
+            bar.widthAnchor.constraint(equalToConstant: Pet.innerWidth).isActive = true
+            bar.heightAnchor.constraint(equalToConstant: 8).isActive = true
+            v.addArrangedSubview(bar)
+            v.addArrangedSubview(text("리셋 \(timeText(w.resetsAt))", size: 12, color: Palette.muted))
+            body.addArrangedSubview(v)
+        }
+        let mode = ["normal": "보통", "save": "절약 (동시 1)", "hold": "보류 (쉬는 중)", "unobserved": "관측 전 (하나씩 실행)"][q.mode ?? ""] ?? (q.mode ?? "-")
+        body.addArrangedSubview(text("모드: \(mode)", weight: .semibold))
+        if let at = q.observedAt { body.addArrangedSubview(text("관측 \(timeText(at))", size: 12, color: Palette.muted)) }
+        return body
     }
 
     func statusLabel(_ s: String) -> String {
         ["queued": "대기", "thinking": "검토 중", "asking": "질문", "planned": "계획 승인 대기", "approved": "승인됨", "rejected": "반려됨",
          "failed": "실패", "executing": "실행 중", "awaiting_acceptance": "수락 대기", "accepted": "수락됨", "merging": "병합 중",
-         "merged": "병합됨", "blocked": "막힘", "cancelled": "중단됨"][s] ?? s
-    }
-
-    func wrap(_ s: String, mono: Bool = false, color: NSColor = .secondaryLabelColor) -> NSTextField {
-        let f = NSTextField(wrappingLabelWithString: s)
-        f.preferredMaxLayoutWidth = 370
-        f.font = mono ? .monospacedSystemFont(ofSize: 11, weight: .regular) : .systemFont(ofSize: 12)
-        f.textColor = color
-        return f
+         "merged": "병합됨", "blocked": "막힘", "cancelled": "중단됨", "expired": "만료"][s] ?? s
     }
 
     func label(_ state: String) -> String {
@@ -929,8 +1133,14 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     }
     @objc func runFromMenu(_ m: NSMenuItem) { if let id = m.representedObject as? String { post("api/teams/\(seg(id))/run", body: [:]) } }
 
-    /// "자세히 보기": one-time login code from the daemon, opened in the browser (§15).
-    @objc func openWeb() {
+    /// "사무실 열기" / "원문 보기": one-time login code from the daemon, opened in the browser (§16).
+    /// For a detail link the login fragment is kept and detailPath's fragment is appended: #code=<c>&request=…&task=…
+    @objc func openWeb() { openOffice(detailPath: nil) }
+    @objc func openDetail(_ b: NSButton) {
+        guard let (_, d, _) = decisionAt(b) else { return }
+        openOffice(detailPath: d.detailPath)
+    }
+    func openOffice(detailPath: String?) {
         guard !offline else { return }
         popover?.close()
         var req = authed(URL(string: "api/ui-code", relativeTo: base)!)
@@ -938,7 +1148,13 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         Task { @MainActor in
             guard let (data, _) = try? await URLSession.shared.data(for: req),
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let s = obj["url"] as? String, let url = URL(string: s, relativeTo: base) else { log("ui-code failed"); return }
+                  var s = obj["url"] as? String else { log("ui-code failed"); return }
+            if let dp = detailPath, let h = dp.firstIndex(of: "#") {
+                let frag = String(dp[dp.index(after: h)...])
+                if !frag.isEmpty { s += (s.contains("#") ? "&" : "#") + frag }
+            }
+            guard let url = URL(string: s, relativeTo: base) else { return }
+            if debug { log("open \(url.absoluteString)") }
             NSWorkspace.shared.open(url.absoluteURL)
         }
     }
