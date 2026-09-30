@@ -1,49 +1,53 @@
 // Restart recovery (execution.md §7 §12) and the once-a-minute invariant check (§5).
-import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { hqDirOf } from './decisions.ts'
-import { git, revParse, withRepo } from './git.ts'
+import { revParse } from './git.ts'
 import type { Runner } from './runner.ts'
-import { sameProcessAlive } from './worker.ts'
+import { killGroup, sameProcessAlive } from './worker.ts'
 import { readJson } from './fsx.ts'
 
 export interface Violation { requestId: string; taskId: string | null; problem: string }
 
-/** Re-adopts or closes attempts that were live when the daemon stopped, and resets interrupted in-memory work. */
+/** Re-adopts or closes attempts that were live when the daemon stopped, and resets interrupted in-memory work (§7.3, §9, §12). */
 export async function recover(d: Runner): Promise<void> {
   const s = d.store
   for (const att of s.liveAttempts()) {
     if (d.live.has(att.id) || d.launching.has(att.id)) continue
-    const pid = att.pid
-    const lstart = att.lstart
-    if (!pid) {
-      // Spawned but the pid never reached the DB: process.json, then a process running this session id (§7.3).
+    if (!att.pid) {
+      // Spawned but the pid never reached the DB: process.json, then a process running this session id.
       const info = readJson<{ pid: number; lstart: string | null; startedAt: string }>(join(hqDirOf(att), 'process.json'))
       const found = info && await sameProcessAlive(info.pid, info.lstart, info.startedAt) ? info.pid : await d.findOrphan(att.session_id)
       if (found) { await d.adopt(att, found); continue }
+      // No orphan: never restart automatically — a duplicate run is worse than a stop (§7.3).
       s.tx(() => {
-        s.updateAttempt(att.id, { status: 'start_failed', ended_at: d.iso(), reason: '시작 기록 없음 (재시작 복구)' })
+        s.updateAttempt(att.id, { status: 'start_failed', ended_at: d.iso(), reason: '시작 여부 불명확 (재시작 복구)' })
         const t = s.task(att.task_id)
-        if (att.kind === 'work' && t?.status === 'running') s.updateTask(t.id, { status: 'pending' })
+        if (t && t.generation === att.generation && ['running', 'reviewing'].includes(t.status)) d.block(t, '시작 여부 불명확: 작업자가 실제로 시작됐는지 확인할 수 없어요')
       })
       continue
     }
-    const alive = await sameProcessAlive(pid, lstart, att.started_at)
+    const alive = await sameProcessAlive(att.pid, att.lstart, att.started_at)
     if (att.status === 'starting') s.updateAttempt(att.id, { status: 'running' })
-    d.track({ ...att, status: 'running' }, pid, lstart, att.started_at, null, !alive)
+    d.track({ ...att, status: 'running' }, att.pid, att.lstart, att.started_at, null, !alive)
+  }
+  // Leftover check / setup / integration process groups from before the restart are killed; their jobs rerun.
+  for (const row of s.raw().prepare("select key, value from kv where key like 'proc:%'").all() as { key: string; value: string }[]) {
+    const p = JSON.parse(row.value) as { pid: number; startedAt: string }
+    if (await sameProcessAlive(p.pid, null, p.startedAt)) killGroup(p.pid, 'SIGKILL')
+    s.set(row.key, null)
   }
   // CEO turns do not survive a restart.
   for (const r of s.requestsByStatus(['thinking'])) s.updateRequest(r.id, { status: 'queued' })
-  // Interrupted integrations rerun; an interrupted merge is resolved by looking at the target.
+  // Interrupted integrations rerun; an interrupted merge is resolved from the target's HEAD (§12, V4).
   for (const r of s.requestsByStatus(['executing', 'accepted', 'blocked', 'merging'])) {
     for (const m of s.mergeRows(r.id)) {
       if (m.state === 'integrating') s.putMerge(r.id, m.project, { state: 'pending' })
-      if (m.state === 'merging') {
-        const p = d.project(m.project)
-        const head = p ? await revParse(p.path) : null
-        if (p && existsSync(join(p.path, '.git', 'MERGE_HEAD'))) await withRepo(p.path, () => git(p.path, ['merge', '--abort']))
-        s.putMerge(r.id, m.project, head && head === m.integration_sha ? { state: 'merged', result_sha: head } : { state: 'pending', note: '병합 중 재시작 — 다시 확인' })
-      }
+      if (m.state !== 'merging') continue
+      const p = d.project(m.project)
+      const head = p ? await revParse(p.path) : null
+      if (head && head === m.integration_sha) s.putMerge(r.id, m.project, { state: 'merged', result_sha: head })
+      else if (head && head === m.target_sha) s.putMerge(r.id, m.project, { state: 'integrated', note: '병합 중 재시작 — 대상이 그대로라 다시 제시해요' })
+      else s.putMerge(r.id, m.project, { state: 'pending', note: `병합 중 재시작 — 대상이 바뀌어(${head?.slice(0, 10) ?? '없음'}) 다시 통합해요` })
     }
     if (r.status === 'merging') {
       const done = s.mergeRows(r.id).every((m) => m.state === 'merged')
@@ -77,7 +81,7 @@ export function reconcile(d: Runner): Violation[] {
       }
     }
     if (r.status === 'blocked') {
-      const hasDecision = tasks.some((t) => t.status === 'blocked' || t.status === 'question') || [...openIds].some((id) => id.startsWith(`integration:${r.id}:`))
+      const hasDecision = tasks.some((t) => t.status === 'blocked' || t.status === 'question') || [...openIds].some((id) => id.startsWith(`integration:${r.id}:`) || id === 'system:login')
         || tasks.some((t) => openIds.has(`revise:${t.id}`))
       if (!hasDecision) flag(null, '막힌 요청인데 결정할 카드가 없음')
     }

@@ -135,9 +135,10 @@ export function createApi(d: ServerDeps): ApiRouter {
           return conflict(engine.answer(id, b.questionId, b.answer))
         }
         if (parts.length === 4 && parts[3] === 'reject') {
-          if (!str(b.reason)) throw new HttpError(400, 'reason이 필요합니다')
+          if (!str(b.reason) || !b.reason.trim()) throw new HttpError(400, '반려 사유(reason)가 필요합니다')
+          if (!str(b.subjectHash)) throw new HttpError(400, '수락 카드의 subjectHash가 필요합니다')
           if (b.tasks !== undefined && (!Array.isArray(b.tasks) || !b.tasks.every(str))) throw new HttpError(400, 'tasks는 작업 key 목록이어야 합니다')
-          return conflict(runner.rejectResult(id, b.reason.slice(0, 2000), b.tasks))
+          return conflict(runner.rejectResult(id, b.reason.trim().slice(0, 2000), b.subjectHash, b.tasks))
         }
         if (parts.length === 4 && parts[3] === 'cancel') return conflict(runner.cancelRequest(id))
         if (parts.length === 4 && parts[3] === 'merge') return conflict(runner.reofferMerge(id))
@@ -172,14 +173,17 @@ export function createApi(d: ServerDeps): ApiRouter {
         if (is('POST', 'api', 'approvals', null)) {
           const b = await body(req)
           if (!str(b.decision) || !str(b.subjectHash)) throw new HttpError(400, 'decision과 subjectHash가 필요합니다')
-          const a = store.decide(parts[2], b.decision, b.subjectHash, runner.now())
-          if (!a) throw new HttpError(409, '카드가 없거나, 만료·결정·교체됐거나, 내용이 바뀌었거나, 없는 선택지입니다')
-          bus.emit({ kind: 'approval', teamId: a.teamId, text: `결정: ${a.title} → ${a.decision}`, data: { id: a.id } })
-          let note: string | null = null
-          if (a.kind === 'plan') note = await engine.planDecided(a.subjectId ?? a.id.slice(5), a.decision!)
-          else if (a.kind === 'team') scheduler.runNow(a.teamId)
-          else note = await runner.onApproval(a)
-          return ok({ ...a, note })
+          const card = store.approval(parts[2])
+          if (card?.kind === 'team') {
+            const a = store.decide(parts[2], b.decision, b.subjectHash, runner.now())
+            if (!a) throw new HttpError(409, '카드가 없거나, 만료·결정·교체됐거나, 내용이 바뀌었거나, 없는 선택지입니다')
+            bus.emit({ kind: 'approval', teamId: a.teamId, text: `결정: ${a.title} → ${a.decision}`, data: { id: a.id } })
+            scheduler.runNow(a.teamId)
+            return ok(a)
+          }
+          // Card consumption and the state transition happen in one runner transaction; replays get the same answer.
+          const r = await runner.decide(parts[2], b.decision, b.subjectHash)
+          return json(res, r.status, r.body)
         }
       }
       if (is('POST', 'api', 'teams', null, 'run')) {

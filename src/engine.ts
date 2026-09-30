@@ -9,8 +9,6 @@ import type { Store } from './store.ts'
 const MAX_TURNS = 6
 const MAX_CORRECTIONS = 1
 const PLAN_TTL_MS = 7 * 24 * 60 * 60_000
-/** Back-off after a limit stop that left no quota observation (the quota table has nothing to hold on). */
-const UNOBSERVED_LIMIT_BACKOFF_MS = 5 * 60_000
 
 export class RequestEngine {
   private store: Store
@@ -19,7 +17,6 @@ export class RequestEngine {
   private hqRoot: string
   private runner: Runner
   private timer: NodeJS.Timeout | null = null
-  private backoffUntil = 0
 
   constructor(store: Store, bus: Bus, projects: Project[], hqRoot: string, runner: Runner) {
     this.store = store; this.bus = bus; this.projects = projects; this.hqRoot = hqRoot; this.runner = runner
@@ -52,7 +49,7 @@ export class RequestEngine {
   }
 
   async tick(): Promise<void> {
-    if (Date.now() < this.backoffUntil || !this.runner.canStartCeo()) return
+    if (!this.runner.canStartCeo()) return
     const r = this.store.nextQueued()
     if (!r || !this.runner.ceoLock.tryAcquire()) return
     try { await this.turn(r.id) } finally { this.runner.ceoLock.release() }
@@ -76,8 +73,13 @@ export class RequestEngine {
     if (this.store.request(id)?.status !== 'thinking') return // cancelled meanwhile
     this.store.updateRequest(id, { session_id: t.sessionId, cost_usd: r.cost_usd + (t.costUsd ?? 0) })
 
+    if (!t.ok && /Not logged in/i.test(t.error ?? '')) {
+      this.store.updateRequest(id, { status: 'queued', note: 'Claude 로그인 필요, 대기' })
+      this.runner.requireLogin(t.error ?? 'Not logged in')
+      return
+    }
     if (t.limited) {
-      if (this.runner.canStartCeo()) this.backoffUntil = Date.now() + UNOBSERVED_LIMIT_BACKOFF_MS
+      if (this.runner.quota().mode !== 'hold') this.runner.limitBackoff()
       this.store.updateRequest(id, { status: 'queued', note: '사용 한도, 대기' })
       this.bus.emit({ kind: 'limit', text: '사장 턴이 사용 한도에 걸림 — 한도가 풀리면 다시 해요' })
       return
@@ -110,17 +112,6 @@ export class RequestEngine {
     this.bus.emit({ kind: 'request', text: `계획 완성: 작업 ${p.tasks.length}개`, data: { id, state: 'planned' } })
   }
 
-  /** Called when the chairman decides the plan card. Returns a Korean reason when execution could not start. */
-  async planDecided(requestId: string, decision: string): Promise<string | null> {
-    if (decision !== '승인') {
-      this.store.updateRequest(requestId, { status: 'rejected' })
-      this.bus.emit({ kind: 'request', text: `계획 ${decision}`, data: { id: requestId, state: 'rejected' } })
-      return null
-    }
-    this.bus.emit({ kind: 'request', text: '계획 승인', data: { id: requestId } })
-    return this.runner.createTasks(requestId)
-  }
-
   private fail(id: string, why: string): void {
     this.runner.failRequest(id, why)
   }
@@ -132,7 +123,7 @@ export function planCardBody(p: CeoPlan, projects: Project[]): string {
   for (const t of p.tasks) {
     lines.push(`[${t.id}] ${t.title} · ${t.role}·${t.grade}·${t.model} · 검토 ${reviewModelOf(t)}${t.depends_on.length ? ` · 선행 ${t.depends_on.join(', ')}` : ''}`)
     if (t.owns.length) lines.push(`  소유: ${t.owns.join(', ')}`)
-    for (const a of t.acceptance) lines.push(`  - [${a.id}] ${a.text}\n    $ ${a.check}`)
+    for (const a of t.acceptance) lines.push(`  - [${a.id}] (${a.kind === 'new' ? 'new' : 'regression'}) ${a.text}\n    $ ${a.check}`)
   }
   const setups = [...new Set(p.tasks.map((t) => t.project))].map((id) => projects.find((x) => x.id === id)).filter((x) => x?.setup)
   if (setups.length) lines.push('', '프로젝트 setup (작업 폴더마다 샌드박스에서 실행):', ...setups.map((x) => `  ${x!.id}: $ ${x!.setup}`))

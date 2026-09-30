@@ -5,7 +5,7 @@ import type { DecisionItem, Headline, TaskView, WorkerView } from '../types.ts'
 import type { QuotaState } from './quota.ts'
 import { lastActivityOf } from './stream.ts'
 
-const ORDER: DecisionItem['kind'][] = ['plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge']
+const ORDER: DecisionItem['kind'][] = ['system', 'plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge']
 export const BLOCKED_OPTIONS = ['retry', 'skip', 'stop']
 
 function approvalRequestId(store: Store, a: ApprovalRow): string {
@@ -17,7 +17,7 @@ function approvalRequestId(store: Store, a: ApprovalRow): string {
 
 /** Fixed option texts (execution.md §17). */
 export const OPTION_HELP: Record<string, string> = {
-  retry: '같은 작업을 최상위 모델로 한 번 더 해요 · 사용량이 들어요',
+  retry: '같은 작업을 같은 모델로 한 번 더 해요 · 사용량이 들어요',
   skip: '이 작업과 여기에 의존하는 작업을 빼고 계속해요 · 나중에 새 요청으로 다시 할 수 있어요',
   stop: '요청 전체를 멈춰요 · 만든 브랜치는 남겨 둬요',
   수락: '통합본을 병합 대기로 넘겨요 · 병합은 따로 승인해요',
@@ -27,7 +27,8 @@ export const OPTION_HELP: Record<string, string> = {
 }
 const PLAN_HELP = { 승인: '계획대로 작업을 시작해요 · 사용량이 들어요', 반려: '계획을 버리고 이 요청을 끝내요' }
 const REVISE_HELP = { 승인: '고친 지시서로 이 작업을 다시 해요 · 사용량이 들어요', 반려: '수정안을 버리고 이 작업을 멈춤 상태로 둬요 · 다음 결정은 차단 카드에서 해요' }
-const INTEGRATION_HELP = { '다시 통합': '대상 브랜치의 최신 커밋 위에서 합치기와 검사를 다시 해요 · 사용량은 들지 않아요', '요청 중단': OPTION_HELP.stop }
+const INTEGRATION_HELP = { '다시 통합': '대상 브랜치의 최신 커밋 위에서 합치기와 검사를 다시 해요 · 사용량은 들지 않아요', '해당 작업 재작업': '문제가 된 작업을 대상 브랜치의 최신 커밋 위에서 처음부터 다시 해요 · 사용량이 들어요', '요청 중단': OPTION_HELP.stop }
+const SYSTEM_HELP = { '다시 확인': '로그인 후 누르면 다음 작업부터 다시 시도해요' }
 
 export const detailPath = (requestId: string, taskId: string | null) => `/ui/#request=${encodeURIComponent(requestId)}${taskId ? `&task=${encodeURIComponent(taskId)}` : ''}`
 
@@ -52,11 +53,13 @@ function diagnosed(raw: string | null, options: string[], fallback: Explain): Ex
 export function decisionItems(store: Store, now = Date.now()): DecisionItem[] {
   const items: DecisionItem[] = []
   for (const a of store.openApprovals(now)) {
-    if (!['plan', 'revise', 'integration', 'accept', 'merge'].includes(a.kind)) continue
+    if (!['system', 'plan', 'revise', 'integration', 'accept', 'merge'].includes(a.kind)) continue
     const requestId = approvalRequestId(store, a)
     const taskId = a.kind === 'revise' ? a.id.slice('revise:'.length) : null
     let ex: Explain
-    if (a.kind === 'plan') {
+    if (a.kind === 'system') {
+      ex = { situation: 'Claude CLI에 로그인되어 있지 않아 모든 작업을 멈췄어요', cause: a.body || 'Claude CLI가 "Not logged in"을 돌려줬어요', causeConfirmed: true, recommendation: null, optionHelp: SYSTEM_HELP }
+    } else if (a.kind === 'plan') {
       const plan = store.request(requestId)?.plan
       const n = plan ? (JSON.parse(plan).tasks as unknown[]).length : 0
       ex = { situation: `사장이 작업 ${n}개짜리 계획을 올렸어요 · 실행할 명령과 범위를 확인해 주세요`, cause: null, causeConfirmed: false, recommendation: null, optionHelp: PLAN_HELP }
@@ -80,8 +83,8 @@ export function decisionItems(store: Store, now = Date.now()): DecisionItem[] {
       ex = { situation: `${m?.target ?? '대상 브랜치'} (${m?.target_sha?.slice(0, 10) ?? '?'})에 작업 ${files}개의 통합본 ${m?.integration_sha?.slice(0, 10) ?? '?'}을(를) 반영할 준비가 됐어요`,
         cause: m?.note ?? null, causeConfirmed: !!m?.note, recommendation: null, optionHelp: { 병합: OPTION_HELP.병합, 보류: OPTION_HELP.보류 } }
     }
-    items.push({ kind: a.kind as DecisionItem['kind'], id: a.id, revision: a.revision, requestId, taskId, title: a.title, detail: a.body, ...ex,
-      detailPath: detailPath(requestId, taskId), options: a.options, subjectHash: a.subjectHash, createdAt: a.createdAt })
+    items.push({ kind: a.kind as DecisionItem['kind'], id: a.id, revision: a.revision, requestId: a.kind === 'system' ? '' : requestId, taskId, title: a.title, detail: a.body, ...ex,
+      detailPath: a.kind === 'system' ? null : detailPath(requestId, taskId), options: a.options, subjectHash: a.subjectHash, createdAt: a.createdAt })
   }
   for (const r of store.requestsByStatus(['asking'])) for (const q of store.questions(r.id)) {
     if (q.answer !== null) continue
@@ -100,7 +103,7 @@ export function decisionItems(store: Store, now = Date.now()): DecisionItem[] {
   for (const t of store.tasksByStatus(['blocked'])) {
     const ex = diagnosed(t.diagnosis, BLOCKED_OPTIONS, { situation: `작업 ${t.title}이(가) 멈췄어요 · 어떻게 할지 정해 주세요`, cause: t.note, causeConfirmed: true, recommendation: null,
       optionHelp: { retry: OPTION_HELP.retry, skip: OPTION_HELP.skip, stop: OPTION_HELP.stop } })
-    items.push({ kind: 'blocked', id: t.id, revision: t.revision, requestId: t.request_id, taskId: t.id, title: `작업 ${t.title}이(가) 막혔어요`, detail: t.note ?? '', ...ex,
+    items.push({ kind: 'blocked', id: t.id, revision: t.block_count, requestId: t.request_id, taskId: t.id, title: `작업 ${t.title}이(가) 막혔어요`, detail: t.note ?? '', ...ex,
       detailPath: detailPath(t.request_id, t.id), options: BLOCKED_OPTIONS, subjectHash: null, createdAt: t.updated_at })
   }
   return items.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || a.createdAt.localeCompare(b.createdAt))
