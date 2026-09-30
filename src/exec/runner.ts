@@ -5,7 +5,7 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join, dirname } from 'node:path'
+import { join } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import type { Bus } from '../bus.ts'
 import { reviewModelOf, validateTasks, type CeoPlan, type PlanTask, type Project } from '../ceo.ts'
@@ -18,7 +18,7 @@ import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, outDirOf, worke
 import { runDiagnoseTurn } from './diagnose.ts'
 import { atomicJson, atomicWrite, readJson, readText, sha256 } from './fsx.ts'
 import { addDetachedWorktree, branchExists, changedFiles, currentBranch, ensureWorktree, git, gitCommonDir, gitOk, isRepo, mergeHeads,
-  removeWorktree, resetClean, revParse, statusPorcelain, withRepo, worktreeDirtySnapshot } from './git.ts'
+  removeWorktree, resetClean, revParse, withRepo, worktreeDirtySnapshot } from './git.ts'
 import { integrate, integrationRef } from './integration.ts'
 import { applyMerge } from './merge.ts'
 import { resumePrompt, reviewPrompt, reworkEvidence, workPrompt, type Upstream } from './prompt.ts'
@@ -65,7 +65,6 @@ const MAX_START_FAILURES = 3
 const MAX_QUESTION_ROUNDS = 3
 const MAX_REVISE_TURNS = 2
 const MAX_LIMITED_STREAK = 3
-const PLAN_TTL_MS = 7 * 24 * 60 * 60_000
 const RECONCILE_MS = 60_000
 const LOG_RETENTION_MS = 30 * 24 * 60 * 60_000
 export const TERMINAL_REQUEST = new Set(['merged', 'rejected', 'failed', 'cancelled', 'expired'])
@@ -125,7 +124,9 @@ export class Runner {
     this.jobs.add(j)
   }
   /** Resolves when no background job (launch, checks, integration, CEO turn) is running. */
-  async drain(): Promise<void> { while (this.jobs.size) await Promise.allSettled([...this.jobs]) }
+  async drain(): Promise<void> {
+    while (this.jobs.size || this.current) await Promise.allSettled([...this.jobs, ...(this.current ? [this.current] : [])])
+  }
 
   recover(): Promise<void> { return recoverState(this) }
 
@@ -207,13 +208,21 @@ export class Runner {
   // ----- tick (§C order) -----
   kick(): void { void this.tick() }
 
-  async tick(): Promise<void> {
-    if (this.stopped) return
-    if (this.ticking) { this.again = true; return }
+  private current: Promise<void> | null = null
+
+  tick(): Promise<void> {
+    if (this.stopped) return Promise.resolve()
+    if (this.ticking) { this.again = true; return this.current ?? Promise.resolve() }
+    this.current = this.runTick().finally(() => { this.current = null })
+    return this.current
+  }
+
+  private async runTick(): Promise<void> {
     this.ticking = true
     try {
       do {
         this.again = false
+        if (this.stopped) break
         await this.step('live', () => this.pollLive())
         await this.step('verify', () => this.startVerifications())
         await this.step('integrate', () => this.startIntegrations())

@@ -81,12 +81,12 @@ export function harness(o: { cfg?: Partial<HqConfig>; repoFiles?: Record<string,
       const d = store.decide(id, decision, a.subjectHash, clock.t)
       if (!d) throw new Error(`cannot decide ${id}`)
       if (d.kind === 'plan') return engine.planDecided(d.subjectId!, decision)
-      return runner.onApproval(d)
+      return h.runner.onApproval(d)
     },
     async waitFor(pred, what = 'condition', ms = 60_000) {
       const end = Date.now() + ms
       while (Date.now() < end) {
-        await runner.tick()
+        await h.runner.tick()
         if (pred()) return
         await new Promise((r) => setTimeout(r, 40))
       }
@@ -95,10 +95,11 @@ export function harness(o: { cfg?: Partial<HqConfig>; repoFiles?: Record<string,
       throw new Error(`timeout waiting for ${what}\ntasks: ${JSON.stringify(dump, null, 1)}\nattempts: ${JSON.stringify(atts, null, 1)}`)
     },
     async close() {
-      runner.stop()
+      h.runner.stop()
       for (const a of store.liveAttempts()) if (a.pid) try { process.kill(-a.pid, 'SIGKILL') } catch { /* gone */ }
-      for (const l of runner.live.values()) try { process.kill(-l.pid, 'SIGKILL') } catch { /* gone */ }
+      for (const l of h.runner.live.values()) try { process.kill(-l.pid, 'SIGKILL') } catch { /* gone */ }
       await runner.drain()
+      await h.runner.drain()
       store.close()
     },
   }
