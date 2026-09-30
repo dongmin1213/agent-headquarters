@@ -15,9 +15,14 @@ async function setup() {
   const home = join(dir, 'home'), tok = join(dir, 'tok')
   mkdirSync(tok, { recursive: true }); writeFileSync(join(tok, 'token'), 'secret-token')
   const repo = makeRepo(join(dir, 'proj'))
-  const wt = join(home, 'worktrees', 'req-1', 'A'), other = join(home, 'worktrees', 'req-1', 'B')
-  mkdirSync(join(home, 'worktrees', 'req-1'), { recursive: true })
-  sh(repo, 'worktree', 'add', '-q', '-b', 'hq/req-1/A', wt)
+  writeFileSync(join(repo, '.env'), 'SECRET=1')
+  // v3 layout: the worker writes only its own clone of the hq mirror (§6.1).
+  const mirror = join(home, 'repos', 'p.git')
+  mkdirSync(join(home, 'repos'), { recursive: true })
+  sh(dir, 'clone', '-q', '--bare', '--no-local', repo, mirror)
+  const wt = join(home, 'work', 'req-1', 'A'), other = join(home, 'work', 'req-1', 'B')
+  mkdirSync(join(home, 'work', 'req-1'), { recursive: true })
+  sh(dir, 'clone', '-q', '--shared', mirror, wt)
   mkdirSync(other, { recursive: true })
   const out = join(home, 'runs', 'req-1', 'A', 'req-1.A~a1', 'out')
   mkdirSync(out, { recursive: true })
@@ -26,9 +31,9 @@ async function setup() {
   await new Promise((r) => server.once('listening', r))
   const port = (server.address() as { port: number }).port
   const profile = join(dir, 'p.sb')
-  atomicWrite(profile, sandboxProfile({ worktree: wt, out, repoGitDir: join(repo, '.git'), hqHome: home, tokenDir: tok, hqPort: port, extraWritable: [], claudeDir: join(homedir(), '.claude') }))
+  atomicWrite(profile, sandboxProfile({ worktree: wt, out, hqHome: home, tokenDir: tok, hqPort: port, extraWritable: [], projects: [repo] }))
   const run = (cmd: string) => runSandboxed(cmd, wt, 20_000, profile)
-  return { dir, home, tok, wt, other, out, port, run, server }
+  return { dir, home, tok, wt, other, out, port, run, server, repo, mirror }
 }
 
 test('1. sandbox denies token, hq port, writes outside the allow list, other worktrees and hq.db; allows own worktree commits and out/', async () => {
@@ -45,6 +50,10 @@ test('1. sandbox denies token, hq port, writes outside the allow list, other wor
     assert.equal((await s.run(`/usr/bin/curl -s -m 3 http://localhost:${s.port}/`)).pass, false, 'hq port (localhost)')
     const commit = await s.run('echo hi > f.txt && git add f.txt && git -c user.name=t -c user.email=t@t commit -q -m w && git rev-parse HEAD')
     assert.equal(commit.pass, true, commit.outputTail)
+    assert.equal((await s.run(`echo x > ${s.mirror}/config.evil`)).pass, false, 'mirror not writable')
+    assert.equal((await s.run(`echo x > ${s.repo}/pwn.txt`)).pass, false, 'user project not writable')
+    assert.equal((await s.run(`cat ${s.repo}/.env`)).pass, false, 'project .env unreadable')
+    assert.equal((await s.run(`git --git-dir=${s.mirror} log --oneline -1`)).pass, true, 'mirror readable (shared objects)')
     assert.equal((await s.run(`echo '{}' > ${s.out}/done.json`)).pass, true, 'own out write')
   } finally { s.server.close() }
 })

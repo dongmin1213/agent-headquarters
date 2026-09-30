@@ -7,7 +7,6 @@ import { decisionItems } from '../../src/exec/decisions.ts'
 import { commitFile, harness, req, sh, task, tsk, type Harness } from './helpers.ts'
 
 const firstArgv = (dir: string): string[] => JSON.parse(readFileSync(join(dir, 'hq', 'stream.jsonl'), 'utf8').split('\n')[0]).argv
-const branchExists = (repo: string, b: string) => sh(repo, 'branch', '--list', b) !== ''
 
 async function toMergeCard(h: Harness, id: string): Promise<void> {
   await h.waitFor(() => req(h, id).status === 'awaiting_acceptance', `${id} awaiting_acceptance`)
@@ -35,20 +34,20 @@ test('6. full success: plan → work → checks → review pass → integration 
     assert.ok(firstArgv(rv.dir).includes('--json-schema'))
     assert.equal(await h.decide(`accept:${id}`, '수락'), null)
     assert.equal(req(h, id).status, 'accepted')
-    assert.equal(h.store.approval(`merge:${id}:p`)?.state, 'open')
+    await h.waitFor(() => h.store.approval(`merge:${id}:p`)?.state === 'open', 'merge card')
     assert.equal(await h.decide(`merge:${id}:p`, '병합'), null)
     assert.equal(req(h, id).status, 'merged')
     assert.equal(sh(h.repo, 'rev-parse', 'HEAD'), h.store.mergeRow(id, 'p')!.integration_sha)
     assert.ok(existsSync(`${h.repo}/a/out.txt`))
-    assert.equal(existsSync(t.worktree!), false, 'worktree removed')
-    assert.equal(branchExists(h.repo, t.branch!), false, 'branch deleted')
+    assert.equal(existsSync(t.worktree!), false, 'worker clone removed')
+    assert.ok(t.worktree!.includes('/work/'), 'work happens in a clone under $HQ_HOME/work')
   } finally { await h.close() }
 })
 
 test('5. ladder: checks fail every time → sonnet, sonnet, opus → blocked, one notification; diagnosis fills the card', async () => {
   const h = harness()
   try {
-    const id = h.plan([task('A', { acceptance: [{ id: 'A1', text: '파일 없음', check: 'test ! -e a/out.txt' }] })])
+    const id = h.plan([task('A', { acceptance: [{ id: 'A1', text: '파일 없음', check: 'test ! -e a/out.txt', kind: 'regression' }] })])
     await h.approve(id)
     await h.waitFor(() => tsk(h, `${id}.A`).status === 'blocked', 'blocked')
     const works = h.store.attempts(`${id}.A`).filter((a) => a.kind === 'work')
@@ -63,7 +62,7 @@ test('5. ladder: checks fail every time → sonnet, sonnet, opus → blocked, on
     assert.equal(item.causeConfirmed, true)
     assert.deepEqual(item.recommendation, { option: 'skip', reason: '가짜 추천 이유' })
     assert.deepEqual(item.options, ['retry', 'skip', 'stop'])
-    assert.ok(item.optionHelp.retry.includes('최상위 모델'))
+    assert.ok(item.optionHelp.retry.includes('같은 모델'))
     assert.equal(item.detailPath, `/ui/#request=${id}&task=${encodeURIComponent(`${id}.A`)}`)
   } finally { await h.close() }
 })
@@ -89,29 +88,35 @@ test('7. multiple dependencies: C starts from hq merge of A and B heads; C owns 
     await h.approve(id)
     await h.waitFor(() => req(h, id).status === 'awaiting_acceptance', 'awaiting_acceptance', 90_000)
     const [a, b, c] = ['A', 'B', 'C'].map((k) => tsk(h, `${id}.${k}`))
-    const parents = sh(h.repo, 'rev-list', '--parents', '-n1', c.base_sha!).split(' ').slice(1)
+    const mirror = ['--git-dir', join(h.runner.home, 'repos', 'p.git')]
+    const parents = sh(h.repo, ...mirror, 'rev-list', '--parents', '-n1', c.base_sha!).split(' ').slice(1)
     assert.deepEqual(parents.sort(), [a.head_sha!, b.head_sha!].sort())
-    assert.deepEqual(sh(h.repo, 'diff', '--name-only', c.base_sha!, c.head_sha!).split('\n'), ['c/out.txt'])
+    assert.deepEqual(sh(h.repo, ...mirror, 'diff', '--name-only', c.base_sha!, c.head_sha!).split('\n'), ['c/out.txt'])
   } finally { await h.close() }
 })
 
-test('8. invalidation: rejecting A after C passed resets C (pending, attempts 0) and archives its branch as -v1', async () => {
+test('8. invalidation: rejecting A after C passed resets C (pending, attempts 0, new generation), drops its clone and keeps its mirror refs', async () => {
   const h = harness()
   try {
     const id = h.plan([task('A'), task('C', { depends_on: ['A'] })])
     await h.approve(id)
     await h.waitFor(() => req(h, id).status === 'awaiting_acceptance', 'awaiting_acceptance', 90_000)
     const c0 = tsk(h, `${id}.C`)
-    assert.equal(h.runner.rejectResult(id, '다시 해 주세요', ['A']), null)
+    const card = h.store.approval(`accept:${id}`)!
+    assert.equal(h.runner.rejectResult(id, '다시 해 주세요', card.subjectHash, ['A']), null)
     const c = tsk(h, `${id}.C`)
     assert.equal(c.status, 'pending')
     assert.equal(c.attempts, 0)
     assert.equal(c.head_sha, null)
+    assert.equal(c.generation, c0.generation + 1)
     assert.equal(tsk(h, `${id}.A`).status, 'rework')
     assert.equal(h.store.approval(`accept:${id}`)?.state, 'superseded')
-    await h.waitFor(() => branchExists(h.repo, `${c0.branch}-v1`), 'archived branch')
+    await h.waitFor(() => !existsSync(c0.worktree!), 'old clone removed')
+    const refs = sh(h.repo, '--git-dir', join(h.runner.home, 'repos', 'p.git'), 'for-each-ref', '--format=%(refname)', `refs/hq/${id}/C/`)
+    assert.match(refs, /\/a1$/m, 'old result ref kept in the mirror')
     await h.waitFor(() => req(h, id).status === 'awaiting_acceptance', 'awaiting_acceptance again', 90_000)
     assert.notEqual(tsk(h, `${id}.C`).base_sha, c0.base_sha)
+    assert.ok(h.store.attempts(`${id}.C`).filter((a) => a.kind === 'work').map((a) => a.n).join(',').startsWith('1,2'), 'attempt numbers keep growing')
   } finally { await h.close() }
 })
 
@@ -227,7 +232,7 @@ test('14. stale merge: target moved / dirty / detached → no merge, re-integrat
     const rev0 = h.store.approval(`merge:${id}:p`)!
     // (a) a new commit on the target
     const moved = commitFile(h.repo, 'other.txt', 'x\n', 'user work')
-    assert.equal(await h.decide(`merge:${id}:p`, '병합'), null)
+    assert.match((await h.decide(`merge:${id}:p`, '병합'))!, /새 커밋/)
     assert.equal(sh(h.repo, 'rev-parse', 'HEAD'), moved, 'not merged')
     await h.waitFor(() => h.store.approval(`merge:${id}:p`)!.revision > rev0.revision && h.store.approval(`merge:${id}:p`)!.state === 'open', 'new card')
     const rev1 = h.store.approval(`merge:${id}:p`)!
@@ -237,7 +242,7 @@ test('14. stale merge: target moved / dirty / detached → no merge, re-integrat
     // (b) dirty checkout
     const { writeFileSync, rmSync } = await import('node:fs')
     writeFileSync(join(h.repo, 'README.md'), 'dirty\n')
-    assert.equal(await h.decide(`merge:${id}:p`, '병합'), null)
+    assert.match((await h.decide(`merge:${id}:p`, '병합'))!, /커밋되지 않은/)
     await h.waitFor(() => h.store.approval(`merge:${id}:p`)!.revision > rev1.revision && h.store.approval(`merge:${id}:p`)!.state === 'open', 'card after dirty')
     assert.match(h.store.mergeRow(id, 'p')!.note ?? '', /커밋되지 않은|새 커밋/)
     sh(h.repo, 'checkout', '--', 'README.md')
@@ -245,7 +250,7 @@ test('14. stale merge: target moved / dirty / detached → no merge, re-integrat
     const head = sh(h.repo, 'rev-parse', 'HEAD')
     sh(h.repo, 'checkout', '-q', '--detach', head)
     const rev2 = h.store.approval(`merge:${id}:p`)!
-    assert.equal(await h.decide(`merge:${id}:p`, '병합'), null)
+    assert.equal(await h.decide(`merge:${id}:p`, '병합'), 'detached HEAD')
     assert.equal(h.store.mergeRow(id, 'p')!.state, 'detached')
     assert.equal(req(h, id).status, 'accepted')
     assert.equal(sh(h.repo, 'rev-parse', 'HEAD'), head)
@@ -266,17 +271,19 @@ test('15. integration conflict: two requests change the same file, accepted in s
     await h.approve(r1); await h.approve(r2)
     await h.waitFor(() => req(h, r1).status === 'awaiting_acceptance' && req(h, r2).status === 'awaiting_acceptance', 'both awaiting', 90_000)
     await h.decide(`accept:${r1}`, '수락')
+    await h.waitFor(() => h.store.approval(`merge:${r1}:p`)?.state === 'open', 'r1 merge card')
     assert.equal(await h.decide(`merge:${r1}:p`, '병합'), null)
     assert.equal(req(h, r1).status, 'merged')
     await h.decide(`accept:${r2}`, '수락')
-    await h.decide(`merge:${r2}:p`, '병합')
+    await h.waitFor(() => h.store.approval(`merge:${r2}:p`)?.state === 'open', 'r2 merge card')
+    assert.match((await h.decide(`merge:${r2}:p`, '병합'))!, /새 커밋/)
     await h.waitFor(() => req(h, r2).status === 'blocked', 'r2 blocked')
     const m = h.store.mergeRow(r2, 'p')!
     assert.equal(m.state, 'conflict')
     assert.match(m.note!, /shared\.txt/)
     const card = h.store.approval(`integration:${r2}:p`)!
     assert.equal(card.state, 'open')
-    assert.deepEqual(card.options, ['다시 통합', '요청 중단'])
+    assert.deepEqual(card.options, ['다시 통합', '해당 작업 재작업', '요청 중단'])
     const item = decisionItems(h.store, h.clock.t).find((d) => d.kind === 'integration')!
     assert.ok(item.optionHelp['다시 통합'] && item.optionHelp['요청 중단'])
   } finally { await h.close() }

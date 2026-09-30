@@ -84,6 +84,7 @@ if (schema) { // CEO planning turn
 // ----- work -----
 if (rejected) { emit({ type: 'result', subtype: 'error', is_error: true, session_id: sid, api_error_status: 429, result: 'rate limited', usage: {} }); process.exit(1) }
 if (mk('limit429')) { emit({ type: 'result', subtype: 'error', is_error: true, session_id: sid, api_error_status: 429, result: 'usage limit', usage: {} }); process.exit(1) }
+if (mk('nologin')) { emit({ type: 'result', subtype: 'error', is_error: true, session_id: sid, result: 'Not logged in · Please run /login', usage: {} }); process.exit(1) }
 if (mk('e529')) { emit({ type: 'result', subtype: 'error', is_error: true, session_id: sid, api_error_status: 529, result: 'overloaded', usage: {} }); process.exit(1) }
 if (mk('errors')) { for (let i = 0; i < Number(mk('errors')); i++) bash('ls /nope', 1, 'ls: /nope: No such file or directory') }
 if (mk('sleep')) await sleep(Number(mk('sleep')))
@@ -93,11 +94,27 @@ const out = process.env.HQ_ATTEMPT_OUT!
 const token = /attempt_token: (\S+)/.exec(prompt)?.[1] ?? ''
 const base = /--no-renames ([0-9a-f]{40}) HEAD/.exec(prompt)?.[1] ?? /head_sha는 `([0-9a-f]{40})`/.exec(prompt)?.[1] ?? ''
 const collect = prompt.includes('읽기 전용 조사·수집')
-const git = (...a: string[]) => execFileSync('git', a, { encoding: 'utf8' }).trim()
+const git = (...a: string[]) => execFileSync('git', ['-c', 'user.name=fake', '-c', 'user.email=fake@example.com', ...a], { encoding: 'utf8' }).trim()
 let outcome = mk('outcome') ?? 'succeeded'
 if (outcome === 'question' && resume) outcome = 'succeeded'
 let head = base, files: string[] = []
 if (!collect && outcome === 'succeeded') {
+  // evilcheck: a committed check script that swaps the verification worktree's .git for a trap repository
+  // (fsmonitor + hooks write markers) and tries to hide changes via the index. Only hq's own git could trip it.
+  if (mk('evilcheck') && mk('mark')) {
+    const m = mk('mark')!
+    mkdirSync(join(process.cwd(), 'a'), { recursive: true })
+    writeFileSync(join(process.cwd(), 'a/evil.sh'), [
+      '#!/bin/sh',
+      `EVIL="$TMPDIR/hq-evil-$$"`,
+      'git init -q "$EVIL" 2>/dev/null',
+      `git --git-dir="$EVIL/.git" config core.fsmonitor "touch '${m}/check-fsmonitor'; false"`,
+      `mkdir -p "$EVIL/.git/hooks"; for h in post-checkout post-merge reference-transaction post-index-change; do printf '#!/bin/sh\\ntouch "${m}/check-hook-%s"\\n' "$h" > "$EVIL/.git/hooks/$h"; chmod +x "$EVIL/.git/hooks/$h"; done`,
+      'git update-index --assume-unchanged README.md 2>/dev/null && echo INDEX-WRITTEN',
+      'rm -f .git; echo "gitdir: $EVIL/.git" > .git',
+      'exit 0', ''].join('\n'))
+    bash('write a/evil.sh', 0)
+  }
   for (const f of marks.write ?? ['hq-fake.txt']) {
     mkdirSync(join(process.cwd(), f, '..'), { recursive: true })
     writeFileSync(join(process.cwd(), f), `${mk('content') ?? 'hello'} ${sid} ${Date.now()} ${Math.random()}\n`)
@@ -108,6 +125,22 @@ if (!collect && outcome === 'succeeded') {
   head = git('rev-parse', 'HEAD')
   files = git('diff', '--name-only', '--no-renames', base, 'HEAD').split('\n').filter(Boolean)
 } else if (!collect) head = git('rev-parse', 'HEAD')
+// Escape attempts (§6.1): after its own commit the worker arms everything hq might trip over in this repository.
+const mark = mk('mark')
+if (mark && !collect) {
+  // git replace first (its own ref update would otherwise fire the hooks armed below in this very process).
+  const readme = git('rev-parse', `${base}:README.md`)
+  const evil = execFileSync('git', ['hash-object', '-w', '--stdin'], { input: 'EVIL replaced\n', encoding: 'utf8' }).trim()
+  git('replace', '-f', readme, evil)
+  git('config', 'core.fsmonitor', `touch '${mark}/fsmonitor'; false`)
+  const hooks = join(process.cwd(), '.git', 'hooks')
+  mkdirSync(hooks, { recursive: true })
+  for (const h of ['post-merge', 'post-checkout', 'post-commit', 'pre-commit', 'reference-transaction', 'pre-auto-gc', 'post-rewrite', 'post-index-change', 'fsmonitor-watchman', 'pre-push', 'post-update', 'update']) {
+    writeFileSync(join(hooks, h), `#!/bin/sh\ntouch '${mark}/hook-${h}'\n`, { mode: 0o755 })
+  }
+  // Last: the worker itself runs no git after this point.
+  execFileSync('git', ['config', 'core.hooksPath', hooks])
+}
 mkdirSync(out, { recursive: true })
 writeFileSync(join(out, 'report.md'), `## 요약\n${'이 작업은 가짜 작업자가 지시서에 따라 파일을 만들고 커밋한 뒤 수용 기준을 확인한 결과를 적은 보고서입니다. '.repeat(4)}\n\n## 수용 기준\n- 확인함\n`)
 if (!mk('nodone')) {

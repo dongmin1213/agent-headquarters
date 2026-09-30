@@ -37,7 +37,7 @@ export function commitFile(repo: string, file: string, content: string, msg = 'c
 
 export const task = (id: string, o: Partial<PlanTask> = {}): PlanTask => ({
   id, title: `작업 ${id}`, project: 'p', role: 'implement', grade: 'L1', model: 'sonnet', owns: [`${id.toLowerCase()}/**`],
-  acceptance: [{ id: 'A1', text: 'README 유지', check: 'test -f README.md' }], brief: `[[FAKE:write=${id.toLowerCase()}/out.txt]]`, depends_on: [], ...o,
+  acceptance: [{ id: 'A1', text: 'README 유지', check: 'test -f README.md', kind: 'regression' }], brief: `[[FAKE:write=${id.toLowerCase()}/out.txt]]`, depends_on: [], ...o,
 })
 
 export interface Harness {
@@ -78,10 +78,9 @@ export function harness(o: { cfg?: Partial<HqConfig>; repoFiles?: Record<string,
     async decide(id, decision) {
       const a = store.approval(id)
       if (!a) throw new Error(`no card ${id}`)
-      const d = store.decide(id, decision, a.subjectHash, clock.t)
-      if (!d) throw new Error(`cannot decide ${id}`)
-      if (d.kind === 'plan') return engine.planDecided(d.subjectId!, decision)
-      return h.runner.onApproval(d)
+      const r = await h.runner.decide(id, decision, a.subjectHash)
+      if (r.status !== 200) throw new Error(`cannot decide ${id}: ${JSON.stringify(r.body)}`)
+      return (r.body.error as string | undefined) ?? (r.body.note as string | null | undefined) ?? null
     },
     async waitFor(pred, what = 'condition', ms = 60_000) {
       const end = Date.now() + ms

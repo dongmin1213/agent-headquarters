@@ -43,8 +43,9 @@ test('17. API: encoded ids, question ownership, team card namespace, evidence al
     assert.equal((await call('POST', `/api/tasks/${enc(`${id}.A`)}/answer`, { questionId: q.id, answer: '예', revision: 0 })).status, 200)
     assert.equal(tsk(h, `${id}.A`).status, 'pending')
     // Circuit-break decision via encoded id; stale revision refused first.
-    assert.equal((await call('POST', `/api/tasks/${enc(`${id}.B`)}/decide`, { decision: 'skip', revision: 3 })).status, 409)
-    assert.equal((await call('POST', `/api/tasks/${enc(`${id}.B`)}/decide`, { decision: 'skip', revision: 0 })).status, 200)
+    const bc = tsk(h, `${id}.B`).block_count
+    assert.equal((await call('POST', `/api/tasks/${enc(`${id}.B`)}/decide`, { decision: 'skip', revision: bc + 5 })).status, 409)
+    assert.equal((await call('POST', `/api/tasks/${enc(`${id}.B`)}/decide`, { decision: 'skip', revision: bc })).status, 200)
     assert.equal(tsk(h, `${id}.B`).status, 'cancelled')
     // CEO answer with another request's question id.
     h.store.addRequest('req-ask00001', 'p', '하나'); h.store.addRequest('req-ask00002', 'p', '둘')
@@ -73,6 +74,12 @@ test('17. API: encoded ids, question ownership, team card namespace, evidence al
     const detail = await call('GET', `/api/requests/${id}`)
     assert.equal(detail.status, 200)
     assert.equal(detail.body.tasks.length, 2)
+    // Replayed plan decision returns the same answer; the accept card's 반려 is refused; /reject needs reason + subject.
+    const planCard = h.store.approval(`plan:${id}`)!
+    const replay = await call('POST', `/api/approvals/${enc(`plan:${id}`)}`, { decision: '승인', subjectHash: planCard.subjectHash })
+    assert.equal(replay.status, 200)
+    assert.equal((await call('POST', `/api/requests/${id}/reject`, { reason: '  ', subjectHash: 'x' })).status, 400)
+    assert.equal((await call('POST', `/api/requests/${id}/reject`, { reason: '다시' })).status, 400)
     // Body limit and bad JSON.
     assert.equal((await call('POST', '/api/requests', { text: 'x'.repeat(70_000) })).status, 413)
     assert.equal((await call('GET', '/api/nope')).body.error.length > 0, true)
