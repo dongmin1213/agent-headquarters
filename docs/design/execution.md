@@ -176,7 +176,7 @@ stream.jsonl → activity.jsonl `{at, kind: message|tool|error|usage, text}`. �
 | `POST /api/approvals` | 팀 전용: id는 `team:<teamId>:`로 시작해야 함, 예약 접두어 거부 |
 | `POST /api/ui-code` | 웹 로그인 코드 |
 | `GET /api/quota` | 창별 관측 |
-잘못된 상태·오래된 revision → 409(한국어 사유). 크기 초과 413. JSON 본문 64KB 제한.
+잘못된 상태·오래된 revision → 409. 모든 오류 응답 본문은 `{"error": "<한국어 사유>"}`. 크기 초과 413. JSON 본문 64KB 제한.
 
 ## 16. 웹 화면 인증
 - `POST /api/ui-code`(Bearer) → `http://127.0.0.1:<port>/ui/#code=<32바이트 랜덤, 60초, 1회>`. 코드는 fragment라 서버 로그·Referer에 남지 않는다.
@@ -186,6 +186,7 @@ stream.jsonl → activity.jsonl `{at, kind: message|tool|error|usage, text}`. �
 
 ## 17. 화면용 데이터 (src/types.ts가 권위)
 Snapshot: `workers`, `headline`, `quota`, `decisions: DecisionItem[]`, `RequestView.tasks`. `needsYou = decisions.length`.
+`DecisionItem.options`는 **서버에 그대로 보낼 값**이다: 승인형 카드는 카드 옵션 문자열(`승인`·`반려`, `수락`·`반려`, `병합`·`보류`, `다시 통합`·`요청 중단`), 질문은 선택지 문자열, blocked는 `retry`·`skip`·`stop`. blocked 표시 이름은 클라이언트가 고정 매핑한다: retry → `한 번 더 (최상위 모델)`, skip → `이 작업 건너뛰기`, stop → `요청 중단`.
 DecisionItem 순서: plan → ceo_question → worker_question → revise → blocked → integration → accept → merge (각 종류 안에서는 오래된 순). 알림은 `decision id + revision`으로 중복 방지.
 
 ## 18. 상황 문장 (headline)
