@@ -688,7 +688,7 @@ export class Runner {
     if (!claimed) return false
     this.launching.add(id)
     this.bg(this.prepareAndLaunch(id, !!resume, prev ?? null).finally(() => this.launching.delete(id)))
-    this.emitTask(t, `${t.model}가 ${t.title} 시작`)
+    this.emitTask(t, `${t.title} 시작 · ${t.model}`)
     return true
   }
 
@@ -963,7 +963,7 @@ export class Runner {
       dir: this.runDir(t.request_id, t.key, id), session_id: randomUUID(), generation: t.generation })
     this.launching.add(id)
     this.bg(this.launchReview(id).finally(() => this.launching.delete(id)))
-    this.emitTask(t, `${t.review_model}가 ${t.title} 검토 시작`)
+    this.emitTask(t, `${t.title} 검토 시작 · ${t.review_model}`)
     return true
   }
 
