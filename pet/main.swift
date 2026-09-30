@@ -639,6 +639,14 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         else { stack.setFrameSize(fit); p.contentSize = fit }
     }
 
+    /// HQ_SNAPSHOT=<png path>: render the whole popover content offscreen (works with the display asleep).
+    func snapshotPopover() {
+        guard let path = env["HQ_SNAPSHOT"], let v = popoverDoc ?? popoverStack,
+              let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { return }
+        v.cacheDisplay(in: v.bounds, to: rep)
+        try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+    }
+
     func heading(_ s: String, size: CGFloat = 13) -> NSTextField {
         let t = NSTextField(labelWithString: s); t.font = .boldSystemFont(ofSize: size)
         t.lineBreakMode = .byTruncatingTail; t.preferredMaxLayoutWidth = 380
@@ -712,9 +720,8 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
             var buttons: [NSView] = []
             for (j, o) in opts.enumerated() {
                 if d.kind == "accept" && o == "반려" { buttons.append(button("반려…", #selector(rejectOpen(_:)), "\(i)")); continue }
-                let title = d.kind == "blocked" ? (["retry": "한 번 더", "skip": "이 작업 건너뛰기", "stop": "요청 중단"][o] ?? o) : o
+                let title = d.kind == "blocked" ? (Pet.blockedLabels[o] ?? o) : o
                 let b = button(title, #selector(decisionButton(_:)), "\(i)\u{1F}\(j)")
-                if d.kind == "blocked" && blockedDecision(o, at: j) == nil { b.isEnabled = false; b.toolTip = "알 수 없는 선택지" }
                 buttons.append(b)
             }
             if ["accept", "merge", "integration"].contains(d.kind) { buttons.append(button("자세히 보기", #selector(openWeb), "")) }
@@ -810,15 +817,8 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         let project = projectPicker?.selectedItem?.representedObject as? String ?? ""
         post("api/requests", body: ["text": text, "project": project]); popover?.close()
     }
-    /// Blocked-card option → decision value. Accepts the raw values or the Korean labels from the design doc.
-    func blockedDecision(_ label: String, at i: Int) -> String? {
-        let l = label.lowercased()
-        if ["retry", "skip", "stop"].contains(l) { return l }
-        if l.contains("한 번 더") || l.contains("다시") || l.contains("재시도") { return "retry" }
-        if l.contains("건너") || l.contains("취소하고 계속") { return "skip" }
-        if l.contains("중단") { return "stop" }
-        return nil
-    }
+    /// Blocked-card options are the wire values retry | skip | stop; labels are fixed here.
+    static let blockedLabels = ["retry": "한 번 더 (최상위 모델)", "skip": "이 작업 건너뛰기", "stop": "요청 중단"]
 
     func decisionAt(_ v: NSView) -> (Int, DecisionItem, String?)? {
         guard !offline, let raw = v.identifier?.rawValue else { return nil }
@@ -833,8 +833,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     @objc func decisionButton(_ b: NSButton) {
         guard let (i, d, o) = decisionAt(b), let o else { return }
         if d.kind == "blocked" {
-            guard let decision = blockedDecision(o, at: 0) else { return }
-            post("api/tasks/\(seg(d.taskId ?? d.id))/decide", body: ["decision": decision, "revision": d.revision ?? 0], decision: i)
+            post("api/tasks/\(seg(d.taskId ?? d.id))/decide", body: ["decision": o, "revision": d.revision ?? 0], decision: i)
         } else { answer(d, o, index: i) }
     }
     @objc func decisionFree(_ f: NSTextField) {
@@ -912,7 +911,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 if code >= 400 {
                     let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                    let text = (obj?["error"] ?? obj?["reason"] ?? obj?["message"]) as? String
+                    let text = obj?["error"] as? String
                         ?? String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
                     failure = (text?.isEmpty == false ? text! : "요청이 거절됐어요") + (code == 409 ? "" : " (HTTP \(code))")
                     log("POST \(path) → \(code): \(failure!)")
@@ -921,6 +920,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
             if let i = decision {
                 if let failure, let label = decisionErrors[i] {
                     label.stringValue = failure; label.isHidden = false; relayoutPopover()
+                    snapshotPopover()
                 } else if failure == nil { popover?.close() }
             }
             refresh()
