@@ -11,7 +11,7 @@ struct Approval: Decodable { let id: String; let teamId: String; let title: Stri
 struct RequestQuestion: Decodable { let id: String; let question: String; let options: [String]; let `default`: String; let reason: String; let answer: String? }
 struct PlanTaskView: Decodable { let id: String; let title: String; let project: String; let role: String; let grade: String; let model: String }
 struct PlanView: Decodable { let summary: String; let assumptions: [String]; let tasks: [PlanTaskView] }
-struct TaskQuestion: Decodable { let question: String; var options: [String]? = nil; var `default`: String? = nil }
+struct TaskQuestion: Decodable { var id: String? = nil; let question: String; var options: [String]? = nil; var `default`: String? = nil }
 struct TaskView: Decodable {
     let id: String; let requestId: String; let title: String; let model: String; let status: String
     var key: String? = nil; var project: String? = nil; var attempts: Int? = nil; var currentAttemptId: String? = nil
@@ -20,7 +20,7 @@ struct TaskView: Decodable {
 struct RequestView: Decodable {
     let id: String; let project: String; let text: String; let status: String; let note: String?
     let questions: [RequestQuestion]; let plan: PlanView?
-    var tasks: [TaskView]? = nil
+    var tasks: [TaskView]? = nil; var updatedAt: String? = nil
 }
 struct ProjectRef: Decodable { let id: String; let name: String }
 struct WorkerView: Decodable, Equatable {
@@ -28,14 +28,32 @@ struct WorkerView: Decodable, Equatable {
     let role: String; let model: String; let kind: String; let state: String; let bubble: String; let startedAt: String
 }
 struct Headline: Decodable { let text: String; let needsYou: Int }
+struct QuotaWindow: Decodable { let name: String; var utilization: Double? = nil; var resetsAt: String? = nil; var status: String? = nil }
 struct QuotaView: Decodable {
-    let fiveHour: Double?; let sevenDay: Double?; let fiveHourResetsAt: String?; let sevenDayResetsAt: String?
-    let mode: String; let observedAt: String?
+    var windows: [QuotaWindow]? = nil
+    var fiveHour: Double? = nil; var sevenDay: Double? = nil; var fiveHourResetsAt: String? = nil; var sevenDayResetsAt: String? = nil
+    var mode: String? = nil; var observedAt: String? = nil
+    /// Every window to show: `windows` (v2), else the fixed 5h/7d pair (v1 daemon).
+    var allWindows: [QuotaWindow] {
+        if let w = windows { return w }
+        var out: [QuotaWindow] = []
+        if fiveHour != nil || fiveHourResetsAt != nil { out.append(QuotaWindow(name: "five_hour", utilization: fiveHour, resetsAt: fiveHourResetsAt)) }
+        if sevenDay != nil || sevenDayResetsAt != nil { out.append(QuotaWindow(name: "seven_day", utilization: sevenDay, resetsAt: sevenDayResetsAt)) }
+        return out
+    }
+}
+/// Everything the chairman can act on, already ordered by the daemon (execution.md §17).
+struct DecisionItem: Decodable {
+    let kind: String; let id: String
+    var revision: Int? = nil; var requestId: String? = nil; var taskId: String? = nil
+    var title: String? = nil; var detail: String? = nil; var options: [String]? = nil; var subjectHash: String? = nil
+    var key: String { "\(id)#\(revision ?? 0)" }
 }
 struct Snapshot: Decodable {
     let teams: [TeamView]; let approvals: [Approval]; let limit: Limit
     var requests: [RequestView]? = nil; var projects: [ProjectRef]? = nil
     var workers: [WorkerView]? = nil; var headline: Headline? = nil; var quota: QuotaView? = nil
+    var decisions: [DecisionItem]? = nil
     struct Limit: Decodable { let blockedUntil: String? }
 }
 
@@ -71,6 +89,7 @@ let characters: [String: CharSpec] = [
 ]
 func charSpec(model: String) -> CharSpec {
     let m = model.lowercased()
+    if m == "hq" { return CharSpec(file: "", initial: "hq", rgb: (0.45, 0.47, 0.55)) }   // hq's own acceptance checks
     for k in ["haiku", "sonnet", "opus"] where m.contains(k) { return characters[k]! }
     return CharSpec(file: "", initial: String(model.prefix(1)).uppercased(), rgb: (0.55, 0.55, 0.6))
 }
@@ -86,7 +105,7 @@ func charSpec(model: String) -> CharSpec {
         NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
         NSColor(calibratedRed: rgb.0, green: rgb.1, blue: rgb.2, alpha: 1).setFill()
         NSBezierPath(roundedRect: NSRect(x: 3, y: 3, width: 34, height: 34), xRadius: 9, yRadius: 9).fill()
-        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 20, weight: .bold), .foregroundColor: NSColor.white]
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: initial.count > 1 ? 16 : 20, weight: .bold), .foregroundColor: NSColor.white]
         let t = NSAttributedString(string: initial.isEmpty ? "?" : initial, attributes: attrs)
         let ts = t.size()
         t.draw(at: NSPoint(x: (40 - ts.width) / 2, y: (40 - ts.height) / 2))
@@ -261,59 +280,9 @@ struct Look: Equatable {
     func remove() { view.removeFromSuperview(); bubble.removeFromSuperview(); badge.removeFromSuperview(); tag.removeFromSuperview() }
 }
 
-// MARK: - Decision items (everything that waits for the chairman)
-struct Decision {
-    enum Kind { case plan(RequestView, Approval), ceoQuestion(RequestView, RequestQuestion), workerQuestion(TaskView, Int, TaskQuestion)
-        case accept(Approval), merge(Approval), blocked(TaskView), other(Approval) }
-    let id: String
-    let title: String
-    let context: String
-    let kind: Kind
-}
-
 func firstLine(_ s: String?, max: Int = 90) -> String {
     let l = (s ?? "").split(separator: "\n").first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
     return l.count > max ? String(l.prefix(max)) + "…" : l
-}
-
-func decisions(_ s: Snapshot) -> [Decision] {
-    var out: [Decision] = []
-    let reqs = s.requests ?? []
-    let byId = Dictionary(reqs.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-    var seenApprovals = Set<String>()
-    for r in reqs {
-        if r.status == "asking" {
-            for q in r.questions where q.answer == nil {
-                out.append(Decision(id: "ceoq:\(r.id):\(q.id)", title: "사장 질문: \(q.question)", context: q.reason.isEmpty ? firstLine(r.text) : q.reason, kind: .ceoQuestion(r, q)))
-            }
-        }
-        if let a = s.approvals.first(where: { $0.id == "plan:" + r.id }) {
-            seenApprovals.insert(a.id)
-            out.append(Decision(id: a.id, title: "계획 승인: \(firstLine(r.text, max: 60))", context: firstLine(r.plan?.summary ?? a.body), kind: .plan(r, a)))
-        }
-        for t in r.tasks ?? [] {
-            if t.status == "question" || !(t.questions ?? []).isEmpty {
-                for (i, q) in (t.questions ?? []).enumerated() {
-                    out.append(Decision(id: "taskq:\(t.id):\(i)", title: "작업자 질문: \(q.question)", context: "\(t.title) · \(t.model)", kind: .workerQuestion(t, i, q)))
-                }
-            }
-            if t.status == "blocked" {
-                out.append(Decision(id: "blocked:\(t.id):\(t.attempts ?? 0)", title: "막힌 작업: \(t.title)",
-                                    context: firstLine(t.note) .isEmpty ? "\(t.attempts ?? 0)번 시도 후 멈춤 · \(t.model)" : firstLine(t.note), kind: .blocked(t)))
-            }
-        }
-    }
-    for a in s.approvals where !seenApprovals.contains(a.id) {
-        if a.id.hasPrefix("accept:") {
-            let r = byId[String(a.id.dropFirst(7))]
-            out.append(Decision(id: a.id, title: "결과 수락: \(r.map { firstLine($0.text, max: 60) } ?? a.title)", context: firstLine(a.body), kind: .accept(a)))
-        } else if a.id.hasPrefix("merge:") {
-            out.append(Decision(id: a.id, title: "병합 승인: \(a.title)", context: firstLine(a.body), kind: .merge(a)))
-        } else if !a.id.hasPrefix("plan:") {
-            out.append(Decision(id: a.id, title: a.title, context: firstLine(a.body), kind: .other(a)))
-        }
-    }
-    return out
 }
 
 /// Scroll container whose document starts at the top.
@@ -423,8 +392,8 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         snapshot = s; self.offline = offline
         let content = panel.contentView!
         let reqs = s.requests ?? []
-        let items = offline ? [] : decisions(s)
-        let needsYou = offline ? 0 : (s.headline?.needsYou ?? items.count)
+        let items = offline ? [] : (s.decisions ?? [])
+        let needsYou = offline ? 0 : (s.decisions?.count ?? s.headline?.needsYou ?? 0)
 
         // CEO
         let active = reqs.first { ["thinking", "asking", "planned", "queued", "executing"].contains($0.status) } ?? reqs.first
@@ -502,7 +471,17 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         if let which = env["HQ_OPEN"], !openedForTest {
             openedForTest = true
             let target = which == "ceo" ? ceo : critters.values.first { $0.kind == .worker && $0.look.mood == .busy }
-            if let target { DispatchQueue.main.async { self.showDetail(for: target) } }
+            if let target { DispatchQueue.main.async {
+                self.showDetail(for: target)
+                // HQ_PRESS=<kind>: press that decision's first option (exercises the POST / inline-error path).
+                if let kind = env["HQ_PRESS"], let i = self.shownDecisions.firstIndex(where: { $0.kind == kind }) {
+                    let b = NSButton(); b.identifier = NSUserInterfaceItemIdentifier("\(i)\u{1F}0"); self.decisionButton(b)
+                }
+                // HQ_SCROLL=<points>: scroll a long popover down (screenshots of the lower part).
+                if let y = env["HQ_SCROLL"].flatMap(Double.init), let sv = self.popoverDoc?.enclosingScrollView {
+                    sv.contentView.scroll(to: NSPoint(x: 0, y: y)); sv.reflectScrolledClipView(sv.contentView)
+                }
+            } }
         }
         if debug { log("apply workers=\(workers.count) decisions=\(items.count) offline=\(offline) critters=\(critters.count)") }
     }
@@ -536,7 +515,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         var t = "hq"
         if offline { t = "hq 꺼짐" }
         else {
-            if let p = pct(s.quota?.fiveHour) { t += " \(p)" }
+            if let p = pct(s.quota?.allWindows.compactMap(\.utilization).max()) { t += " \(p)" }
             if needsYou > 0 { t += " · \(needsYou)" }
         }
         if status.button?.title != t { status.button?.title = t }
@@ -557,9 +536,11 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         if offline { m.addItem(withTitle: "hq 데몬에 연결할 수 없음", action: nil, keyEquivalent: "") }
         if !offline, let h = snapshot?.headline, !h.text.isEmpty { m.addItem(withTitle: h.text, action: nil, keyEquivalent: "") }
         if !offline, let q = snapshot?.quota {
-            m.addItem(withTitle: "5시간 사용: \(pct(q.fiveHour) ?? "-") · 리셋 \(timeText(q.fiveHourResetsAt))", action: nil, keyEquivalent: "")
-            m.addItem(withTitle: "7일 사용: \(pct(q.sevenDay) ?? "-") · 리셋 \(timeText(q.sevenDayResetsAt))", action: nil, keyEquivalent: "")
-            let mode = ["normal": "보통", "save": "절약 (동시 1)", "review_only": "검토만", "hold": "보류 (쉬는 중)"][q.mode] ?? q.mode
+            for w in q.allWindows {
+                let name = ["five_hour": "5시간", "seven_day": "7일", "seven_day_opus": "7일 (Opus)", "seven_day_sonnet": "7일 (Sonnet)"][w.name] ?? w.name
+                m.addItem(withTitle: "\(name) 사용: \(pct(w.utilization) ?? "-") · 리셋 \(timeText(w.resetsAt))", action: nil, keyEquivalent: "")
+            }
+            let mode = ["normal": "보통", "save": "절약 (동시 1)", "hold": "보류 (쉬는 중)", "unobserved": "관측 전 (하나씩 실행)"][q.mode ?? ""] ?? (q.mode ?? "-")
             m.addItem(withTitle: "모드: \(mode)", action: nil, keyEquivalent: "")
         }
         if !offline {
@@ -580,6 +561,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         m.addItem(idle)
         m.addItem(withTitle: "펫 종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         status.menu = m
+        if debug { log("menu: " + m.items.map(\.title).filter { !$0.isEmpty }.joined(separator: " | ")) }
     }
 
     // MARK: notifications
@@ -591,15 +573,16 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     }
 
     /// One notification per decision item the first time it appears (items present at launch are not announced).
-    func notifyNew(_ items: [Decision]) {
+    /// Dedupe key is id + revision (§17): a revised brief is a new decision.
+    func notifyNew(_ items: [DecisionItem]) {
         guard !offline else { return }
-        let ids = Set(items.map(\.id))
-        defer { knownDecisions = (knownDecisions ?? []).union(ids) }
+        let keys = Set(items.map(\.key))
+        defer { knownDecisions = (knownDecisions ?? []).union(keys) }
         guard let known = knownDecisions, notifyOK else { return }
-        for d in items where !known.contains(d.id) {
+        for d in items where !known.contains(d.key) {
             let c = UNMutableNotificationContent()
-            c.title = "회장님 결정 필요"; c.body = d.title; c.subtitle = d.context
-            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: d.id, content: c, trigger: nil)) { _ in }
+            c.title = "회장님 결정 필요"; c.body = d.title ?? d.kind; c.subtitle = firstLine(d.detail)
+            UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: d.key, content: c, trigger: nil)) { _ in }
         }
     }
 
@@ -627,8 +610,10 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     func present(_ stack: NSStackView, at c: Critter, maxHeight: CGFloat = 560, focus: NSView? = nil) {
         let fit = stack.fittingSize
         let vc = NSViewController()
+        popoverStack = stack; popoverDoc = nil
         if fit.height > maxHeight {
             let doc = FlippedView(frame: NSRect(origin: .zero, size: fit))
+            popoverDoc = doc
             stack.frame = doc.bounds; stack.autoresizingMask = [.width]
             doc.addSubview(stack)
             let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: fit.width + 16, height: maxHeight))
@@ -642,6 +627,16 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         p.show(relativeTo: c.view.bounds, of: c.view, preferredEdge: .maxY)
         popover = p
         if let focus { vc.view.window?.makeFirstResponder(focus) }
+    }
+
+    var popoverStack: NSStackView?
+    var popoverDoc: FlippedView?
+    /// Re-fits the open popover after content changed (inline error, reason field shown).
+    func relayoutPopover() {
+        guard let stack = popoverStack, let p = popover else { return }
+        let fit = stack.fittingSize
+        if let doc = popoverDoc { doc.setFrameSize(fit); stack.frame = doc.bounds }
+        else { stack.setFrameSize(fit); p.contentSize = fit }
     }
 
     func heading(_ s: String, size: CGFloat = 13) -> NSTextField {
@@ -689,7 +684,9 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
 
     var requestInput: NSTextView?
     var projectPicker: NSPopUpButton?
-    var rejectFields: [String: NSTextField] = [:]
+    var rejectFields: [Int: NSTextField] = [:]
+    var shownDecisions: [DecisionItem] = []
+    var decisionErrors: [Int: NSTextField] = [:]
 
     /// Chairman ↔ CEO: headline, every decision item, and the new-request box.
     func showCeo(for c: Critter) {
@@ -700,60 +697,55 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         if offline { stack.addArrangedSubview(wrap("hq 데몬이 꺼져 있어요. 켜진 뒤에 요청할 수 있어요.")) }
         else if let h = snapshot?.headline, !h.text.isEmpty { stack.addArrangedSubview(wrap(h.text, color: .labelColor)) }
 
-        let items = offline ? [] : decisions(snapshot!)
+        let items = offline ? [] : (snapshot?.decisions ?? [])
+        shownDecisions = items; decisionErrors = [:]
         if !items.isEmpty {
             stack.addArrangedSubview(separator())
             stack.addArrangedSubview(heading("회장님 결정 \(items.count)건", size: 12))
         }
-        for d in items {
-            let t = heading("• " + d.title, size: 12); t.font = .systemFont(ofSize: 12, weight: .semibold)
+        // Rendered in the daemon's order; each kind posts to its own endpoint (§15).
+        for (i, d) in items.enumerated() {
+            let t = heading("• " + (d.title ?? d.kind), size: 12); t.font = .systemFont(ofSize: 12, weight: .semibold)
             stack.addArrangedSubview(t)
-            if !d.context.isEmpty { stack.addArrangedSubview(wrap(d.context)) }
-            switch d.kind {
-            case .plan(let r, let a):
-                if let plan = r.plan {
-                    stack.addArrangedSubview(wrap(plan.tasks.map { "• \($0.id) [\($0.grade)·\($0.model)] \($0.title)" }.joined(separator: "\n"), mono: true))
-                }
-                stack.addArrangedSubview(row(a.options.map { button($0, #selector(decide(_:)), "\(a.id)\u{1F}\($0)\u{1F}\(a.subjectHash)") }))
-            case .ceoQuestion(let r, let q):
-                stack.addArrangedSubview(row(q.options.map { button($0 == q.default ? "\($0) (추천)" : $0, #selector(answerQ(_:)), "\(r.id)\u{1F}\(q.id)\u{1F}\($0)") }))
-                stack.addArrangedSubview(freeField("직접 답하기 (엔터)", #selector(answerFree(_:)), "\(r.id)\u{1F}\(q.id)"))
-            case .workerQuestion(let t, let i, let q):
-                let opts = q.options ?? []
-                if !opts.isEmpty {
-                    stack.addArrangedSubview(row(opts.map { button($0 == q.default ? "\($0) (추천)" : $0, #selector(answerTask(_:)), "\(t.id)\u{1F}\(i)\u{1F}\($0)") }))
-                }
-                stack.addArrangedSubview(freeField("직접 답하기 (엔터)", #selector(answerTaskFree(_:)), "\(t.id)\u{1F}\(i)"))
-            case .accept(let a):
-                let rid = String(a.id.dropFirst(7))
-                let reason = freeField("반려 사유 (엔터로 반려)", #selector(rejectSubmit(_:)), rid)
-                reason.isHidden = true; rejectFields[rid] = reason
-                let accept = a.options.first { $0 != "반려" } ?? "수락"
-                stack.addArrangedSubview(row([button(accept, #selector(decide(_:)), "\(a.id)\u{1F}\(accept)\u{1F}\(a.subjectHash)"),
-                                              button("반려…", #selector(rejectOpen(_:)), rid),
-                                              button("자세히 보기", #selector(openWeb), "")]))
-                stack.addArrangedSubview(reason)
-            case .merge(let a):
-                stack.addArrangedSubview(row(a.options.map { button($0, #selector(decide(_:)), "\(a.id)\u{1F}\($0)\u{1F}\(a.subjectHash)") } + [button("자세히 보기", #selector(openWeb), "")]))
-            case .blocked(let t):
-                stack.addArrangedSubview(row([button("한 번 더", #selector(decideTask(_:)), "\(t.id)\u{1F}retry"),
-                                              button("이 작업 건너뛰기", #selector(decideTask(_:)), "\(t.id)\u{1F}skip"),
-                                              button("요청 중단", #selector(decideTask(_:)), "\(t.id)\u{1F}stop")]))
-            case .other(let a):
-                stack.addArrangedSubview(row(a.options.map { button($0, #selector(decide(_:)), "\(a.id)\u{1F}\($0)\u{1F}\(a.subjectHash)") }))
+            if let detail = d.detail, !detail.isEmpty { stack.addArrangedSubview(wrap(detail)) }
+            let opts = d.options ?? []
+            var buttons: [NSView] = []
+            for (j, o) in opts.enumerated() {
+                if d.kind == "accept" && o == "반려" { buttons.append(button("반려…", #selector(rejectOpen(_:)), "\(i)")); continue }
+                let title = d.kind == "blocked" ? (["retry": "한 번 더", "skip": "이 작업 건너뛰기", "stop": "요청 중단"][o] ?? o) : o
+                let b = button(title, #selector(decisionButton(_:)), "\(i)\u{1F}\(j)")
+                if d.kind == "blocked" && blockedDecision(o, at: j) == nil { b.isEnabled = false; b.toolTip = "알 수 없는 선택지" }
+                buttons.append(b)
             }
+            if ["accept", "merge", "integration"].contains(d.kind) { buttons.append(button("자세히 보기", #selector(openWeb), "")) }
+            if !buttons.isEmpty { stack.addArrangedSubview(row(buttons)) }
+            if d.kind == "ceo_question" || d.kind == "worker_question" {
+                stack.addArrangedSubview(freeField("직접 답하기 (엔터)", #selector(decisionFree(_:)), "\(i)"))
+            }
+            if d.kind == "accept" {
+                let reason = freeField("반려 사유 (엔터로 반려)", #selector(rejectSubmit(_:)), "\(i)")
+                reason.isHidden = true; rejectFields[i] = reason
+                stack.addArrangedSubview(reason)
+            }
+            let err = wrap("", color: .systemRed); err.isHidden = true; decisionErrors[i] = err
+            stack.addArrangedSubview(err)
         }
 
-        // Recent requests at a glance (the decision items above carry the actions).
-        let recent = (snapshot?.requests ?? []).prefix(3)
-        if !recent.isEmpty {
+        // Recent results: finished or stopped requests keep their outcome here (§19).
+        let done: Set<String> = ["merged", "accepted", "failed", "cancelled", "blocked"]
+        let recent = (snapshot?.requests ?? []).filter { done.contains($0.status) }
+            .sorted { ($0.updatedAt ?? "") > ($1.updatedAt ?? "") }.prefix(3)
+        if !offline && !recent.isEmpty {
             stack.addArrangedSubview(separator())
+            stack.addArrangedSubview(heading("최근 결과", size: 12))
             for r in recent {
-                let h = NSTextField(labelWithString: "[\(statusLabel(r.status))] \(r.text)")
-                h.font = .systemFont(ofSize: 11); h.textColor = .secondaryLabelColor; h.lineBreakMode = .byTruncatingTail
+                let note = r.note.map { firstLine($0) }.flatMap { $0.isEmpty ? nil : " — \($0)" } ?? ""
+                let h = NSTextField(labelWithString: "[\(statusLabel(r.status))] \(firstLine(r.text, max: 50))\(note)")
+                h.font = .systemFont(ofSize: 11)
+                h.textColor = ["failed", "blocked"].contains(r.status) ? .systemRed : .secondaryLabelColor
+                h.lineBreakMode = .byTruncatingTail
                 h.widthAnchor.constraint(lessThanOrEqualToConstant: 380).isActive = true
                 stack.addArrangedSubview(h)
-                if let n = r.note, !n.isEmpty, r.status == "failed" || r.status == "blocked" { stack.addArrangedSubview(wrap(n)) }
             }
         }
 
@@ -818,39 +810,59 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         let project = projectPicker?.selectedItem?.representedObject as? String ?? ""
         post("api/requests", body: ["text": text, "project": project]); popover?.close()
     }
-    @objc func answerQ(_ b: NSButton) {
-        guard let p = parts(b, 3) else { return }
-        post("api/requests/\(seg(p[0]))/answer", body: ["questionId": p[1], "answer": p[2]]); popover?.close()
+    /// Blocked-card option → decision value. Accepts the raw values or the Korean labels from the design doc.
+    func blockedDecision(_ label: String, at i: Int) -> String? {
+        let l = label.lowercased()
+        if ["retry", "skip", "stop"].contains(l) { return l }
+        if l.contains("한 번 더") || l.contains("다시") || l.contains("재시도") { return "retry" }
+        if l.contains("건너") || l.contains("취소하고 계속") { return "skip" }
+        if l.contains("중단") { return "stop" }
+        return nil
     }
-    @objc func answerFree(_ f: NSTextField) {
+
+    func decisionAt(_ v: NSView) -> (Int, DecisionItem, String?)? {
+        guard !offline, let raw = v.identifier?.rawValue else { return nil }
+        let p = raw.split(separator: "\u{1F}", maxSplits: 1).map(String.init)
+        guard let i = Int(p[0]), i < shownDecisions.count else { return nil }
+        let d = shownDecisions[i]
+        guard p.count == 2 else { return (i, d, nil) }
+        guard let j = Int(p[1]), let opts = d.options, j < opts.count else { return nil }
+        return (i, d, opts[j])
+    }
+
+    @objc func decisionButton(_ b: NSButton) {
+        guard let (i, d, o) = decisionAt(b), let o else { return }
+        if d.kind == "blocked" {
+            guard let decision = blockedDecision(o, at: 0) else { return }
+            post("api/tasks/\(seg(d.taskId ?? d.id))/decide", body: ["decision": decision, "revision": d.revision ?? 0], decision: i)
+        } else { answer(d, o, index: i) }
+    }
+    @objc func decisionFree(_ f: NSTextField) {
         let text = f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let p = parts(f, 2) else { return }
-        post("api/requests/\(seg(p[0]))/answer", body: ["questionId": p[1], "answer": text]); popover?.close()
+        guard !text.isEmpty, let (i, d, _) = decisionAt(f) else { return }
+        answer(d, text, index: i)
     }
-    @objc func answerTask(_ b: NSButton) {
-        guard let p = parts(b, 3), let i = Int(p[1]) else { return }
-        post("api/tasks/\(seg(p[0]))/answer", body: ["questionIndex": i, "answer": p[2]]); popover?.close()
-    }
-    @objc func answerTaskFree(_ f: NSTextField) {
-        let text = f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let p = parts(f, 2), let i = Int(p[1]) else { return }
-        post("api/tasks/\(seg(p[0]))/answer", body: ["questionIndex": i, "answer": text]); popover?.close()
-    }
-    @objc func decideTask(_ b: NSButton) {
-        guard let p = parts(b, 2) else { return }
-        post("api/tasks/\(seg(p[0]))/decide", body: ["decision": p[1]]); popover?.close()
+    func answer(_ d: DecisionItem, _ a: String, index i: Int) {
+        switch d.kind {
+        case "ceo_question":
+            post("api/requests/\(seg(d.requestId ?? ""))/answer", body: ["questionId": d.id, "answer": a], decision: i)
+        case "worker_question":
+            post("api/tasks/\(seg(d.taskId ?? ""))/answer", body: ["questionId": d.id, "answer": a, "revision": d.revision ?? 0], decision: i)
+        default:   // plan, accept, merge, revise, integration: approval-backed
+            post("api/approvals/\(seg(d.id))", body: ["decision": a, "subjectHash": d.subjectHash ?? ""], decision: i)
+        }
     }
     @objc func rejectOpen(_ b: NSButton) {
-        guard let id = b.identifier?.rawValue, let f = rejectFields[id] else { return }
-        f.isHidden = false
-        if let v = popover?.contentViewController?.view { v.window?.makeFirstResponder(f) }
+        guard let (i, _, _) = decisionAt(b), let f = rejectFields[i] else { return }
+        f.isHidden = false; relayoutPopover()
+        f.window?.makeFirstResponder(f)
     }
     @objc func rejectSubmit(_ f: NSTextField) {
         let reason = f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !offline, !reason.isEmpty, let id = f.identifier?.rawValue else { return }
-        post("api/requests/\(seg(id))/reject", body: ["reason": reason]); popover?.close()
+        guard !reason.isEmpty, let (i, d, _) = decisionAt(f) else { return }
+        post("api/requests/\(seg(d.requestId ?? ""))/reject", body: ["reason": reason], decision: i)
     }
-    @objc func decide(_ b: NSButton) {
+    @objc func decide(_ b: NSButton) {   // team approvals (team popover)
         guard let p = parts(b, 3) else { return }
         post("api/approvals/\(seg(p[0]))", body: ["decision": p[1], "subjectHash": p[2]]); popover?.close()
     }
@@ -887,13 +899,29 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         if let s = snapshot { apply(s, offline: offline) }
     }
 
-    func post(_ path: String, body: [String: Any]) {
+    /// POST; for a decision the popover stays open until the daemon answers. A refusal (409: stale revision,
+    /// wrong state) shows the daemon's Korean reason under that item and the state is re-fetched.
+    func post(_ path: String, body: [String: Any], decision: Int? = nil) {
         var req = authed(URL(string: path, relativeTo: base)!)
         req.httpMethod = "POST"; req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         req.setValue("application/json", forHTTPHeaderField: "content-type")
         Task { @MainActor in
-            if let (data, resp) = try? await URLSession.shared.data(for: req), let code = (resp as? HTTPURLResponse)?.statusCode, code >= 400 {
-                log("POST \(path) → \(code): \(String(data: data, encoding: .utf8) ?? "")")
+            var failure: String? = nil
+            do {
+                let (data, resp) = try await URLSession.shared.data(for: req)
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                if code >= 400 {
+                    let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                    let text = (obj?["error"] ?? obj?["reason"] ?? obj?["message"]) as? String
+                        ?? String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    failure = (text?.isEmpty == false ? text! : "요청이 거절됐어요") + (code == 409 ? "" : " (HTTP \(code))")
+                    log("POST \(path) → \(code): \(failure!)")
+                }
+            } catch { failure = "hq에 연결하지 못했어요" }
+            if let i = decision {
+                if let failure, let label = decisionErrors[i] {
+                    label.stringValue = failure; label.isHidden = false; relayoutPopover()
+                } else if failure == nil { popover?.close() }
             }
             refresh()
         }
