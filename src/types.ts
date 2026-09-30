@@ -136,7 +136,8 @@ export interface WorkerView {
   model: string
   /** verify = hq's own acceptance checks (model "hq"). */
   kind: 'work' | 'review' | 'verify'
-  state: 'running' | 'verifying' | 'reviewing' | 'held'
+  /** blocked = stopped and waiting for a chairman decision (shown as "멈춤 · 사장에게 보고"). */
+  state: 'running' | 'verifying' | 'reviewing' | 'held' | 'blocked'
   bubble: string
   startedAt: string
 }
@@ -153,6 +154,17 @@ export interface DecisionItem {
   taskId: string | null
   title: string
   detail: string
+  /** Plain-language "what happened" (one or two sentences). */
+  situation: string
+  /** Why it happened; `causeConfirmed` false means it is the CEO's inference, shown as 추정. */
+  cause: string | null
+  causeConfirmed: boolean
+  /** Recommended option (one of `options`) and why, or null when there is no recommendation. */
+  recommendation: { option: string; reason: string } | null
+  /** One line per option: what happens if the chairman picks it (cost, reversibility). */
+  optionHelp: Record<string, string>
+  /** Web detail link path (e.g. "/ui/#request=req-x&task=req-x.A") for "원문 보기". */
+  detailPath: string | null
   /** Exact values to send (approval option, answer choice, or retry|skip|stop for blocked); see execution.md §17. */
   options: string[]
   /** For approval-backed kinds. */
