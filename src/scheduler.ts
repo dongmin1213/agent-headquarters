@@ -24,6 +24,9 @@ import {
 import { killGroup, pidAlive, psLstart, removeCacheDir, type PsLstart } from './exec/worker.ts'
 
 const LIMIT_BACKOFF_MS = 30 * 60_000
+/** The hq repository this daemon runs from (teams may never work inside it: it holds their own sandbox config and the daemon code). */
+export const HQ_ROOT = resolve(import.meta.dirname, '..')
+export const TEAM_CWD_OVERLAP = '실행할 수 없어요: 팀 폴더가 hq 저장소나 hq 데이터와 겹쳐요'
 const SPAWN_FAILED = '실행할 수 없어요:'
 const TIMED_OUT = '시간 초과'
 export const INTERRUPTED = '지난 실행이 중단됐어요 · 다음 실행 때 이어서 해요'
@@ -46,6 +49,8 @@ const MARKER_LINE = new RegExp(`^${EXIT_MARKER} (\\d+)$`)
 export interface TeamQuota { holdUntil(): string | null; teamLimited(untilIso: string): void }
 
 export interface TeamIsolation {
+  /** The hq repository (default HQ_ROOT): a team cwd equal to, above or inside it (or $HQ_HOME) is refused. */
+  hqRoot?: string
   /** $HQ_HOME: team logs live under logs/teams/; the team process cannot read or write it. */
   hqHome: string
   /** Folder holding the daemon token; the team process cannot read or write it. */
@@ -96,7 +101,19 @@ export interface TeamProfileOpts {
   mach?: string[]
   /** Home directory for ~ paths (tests use a fake one). */
   home?: string
+  /** The hq repository: never writable, whatever the other rules allow (last rule). */
+  hqRoot?: string
 }
+
+/** True when `a` and `b` are the same folder or one contains the other (resolved paths). */
+export function pathsOverlap(a: string, b: string): boolean {
+  const x = real(resolve(a)), y = real(resolve(b))
+  const inside = (p: string, q: string) => p === q || p.startsWith(q.endsWith('/') ? q : `${q}/`)
+  return inside(x, y) || inside(y, x)
+}
+
+/** A team cwd that is the hq repository or $HQ_HOME, or an ancestor or descendant of either: the team never runs. */
+export const teamCwdOverlaps = (cwd: string, hqRoot: string, hqHome: string): boolean => pathsOverlap(cwd, hqRoot) || pathsOverlap(cwd, hqHome)
 
 /**
  * Seatbelt profile for team commands: the worker v4 rules (sandbox.ts: signals only inside the sandbox, mach-lookup
@@ -122,6 +139,7 @@ export function teamProfile(o: TeamProfileOpts): string {
     ...claudeWriteRules(home, claude),
     `(deny file-read-data file-write* ${[...new Set([o.tokenDir, o.hqHome].map(subpathOf))].join(' ')} ${homeSecretFilters(home).join(' ')})`,
     ...launchRules(),
+    ...(o.hqRoot ? [`(deny file-write* ${subpathOf(o.hqRoot)}) ; the hq repository (daemon code, teams.json)`] : []),
     '',
   ].join('\n')
 }
@@ -183,6 +201,8 @@ export class Scheduler {
   private active = new Map<string, Active>()
   /** sha256(scoped token) → owner. Revoked when the run ends. */
   private tokens = new Map<string, { teamId: string; runId: number }>()
+  /** Teams whose cwd overlaps the hq repository or $HQ_HOME (TEAM_CWD_OVERLAP): shown as an error, never started. */
+  private badCwd: Set<string>
   private timer: NodeJS.Timeout | null = null
   private stopped = false
   /** Settles when every unfinished run found at startup has been adopted, finished, or marked unconfirmed. */
@@ -198,7 +218,8 @@ export class Scheduler {
   /** `quota` connects teams to the shared quota hold (execution.md §13); without it the legacy kv hold is used. */
   constructor(teams: TeamConfig[], store: Store, bus: Bus, hqUrl: string, iso: TeamIsolation, quota: TeamQuota | null = null) {
     this.teams = teams; this.store = store; this.bus = bus; this.hqUrl = hqUrl; this.quota = quota
-    this.iso = { pollMs: 1000, killGraceMs: 10_000, ps: psLstart, psCommand, now: Date.now, ...iso }
+    this.iso = { pollMs: 1000, killGraceMs: 10_000, ps: psLstart, psCommand, now: Date.now, hqRoot: HQ_ROOT, ...iso }
+    this.badCwd = new Set(teams.filter((t) => teamCwdOverlaps(t.cwd, this.iso.hqRoot, this.iso.hqHome)).map((t) => t.id))
     const pending: Promise<void>[] = []
     for (const t of teams) {
       const last = store.lastRun(t.id)
@@ -209,7 +230,8 @@ export class Scheduler {
         continue
       }
       // Restore each enabled team's last outcome so a daemon restart doesn't reset every pet to '대기 중'.
-      const o = last && t.enabled ? restoredOutcome(last) : { state: 'idle' as const, bubble: '대기 중' }
+      const o = this.badCwd.has(t.id) ? { state: 'error' as const, bubble: TEAM_CWD_OVERLAP }
+        : last && t.enabled ? restoredOutcome(last) : { state: 'idle' as const, bubble: '대기 중' }
       this.state.set(t.id, { ...o, running: false })
     }
     this.ready = Promise.all(pending).then(() => {})
@@ -259,6 +281,7 @@ export class Scheduler {
     }
     if (this.blockedUntil()) return
     for (const t of this.teams) {
+      if (this.refuseCwd(t)) continue
       if (!t.enabled || this.state.get(t.id)!.running) continue
       const last = this.store.lastRun(t.id)
       const due = !last?.endedAt || Date.now() - Date.parse(last.endedAt) >= t.everyMinutes * 60_000
@@ -272,9 +295,18 @@ export class Scheduler {
     // The server calls runNow right after a team card is decided: apply an unconfirmed-run decision first.
     const a = this.active.get(t.id)
     if (a?.unconfirmed) this.checkCard(a)
+    if (this.refuseCwd(t)) return false
     if (!t.enabled || this.state.get(t.id)!.running) return false
     if (this.blockedUntil()) return false
     void this.runTeam(t)
+    return true
+  }
+
+  /** True for a team whose cwd overlaps hq (it never starts); puts it back to the error bubble once no run is active. */
+  private refuseCwd(t: TeamConfig): boolean {
+    if (!this.badCwd.has(t.id)) return false
+    const s = this.state.get(t.id)!
+    if (!s.running && (s.state !== 'error' || s.bubble !== TEAM_CWD_OVERLAP)) this.set(t.id, 'error', TEAM_CWD_OVERLAP)
     return true
   }
 
@@ -293,6 +325,7 @@ export class Scheduler {
   }
 
   private runTeam(t: TeamConfig): Promise<void> {
+    if (this.refuseCwd(t)) return Promise.resolve()
     const s = this.state.get(t.id)!
     s.running = true
     const runId = this.store.startRun(t.id)
@@ -319,7 +352,7 @@ export class Scheduler {
         let argv = [exe, ...args]
         if (paths !== 'none') {
           const profile = join(dir, `${runId}.sb`)
-          writeFileSync(profile, teamProfile({ cwd: t.cwd, hqHome: this.iso.hqHome, tokenDir: this.iso.tokenDir, ...paths }))
+          writeFileSync(profile, teamProfile({ cwd: t.cwd, hqHome: this.iso.hqHome, tokenDir: this.iso.tokenDir, hqRoot: this.iso.hqRoot, ...paths }))
           argv = wrap(argv, profile)
         }
         fd = openSync(a.log, 'a')

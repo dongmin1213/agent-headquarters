@@ -14,7 +14,7 @@ import {
   claudeOwnFilters, claudeProjectDir, claudeWriteRules, hqPortRule, launchRules, machRules, real, signalRules,
 } from '../../src/exec/sandbox.ts'
 import { Bus } from '../../src/bus.ts'
-import { Scheduler, teamProfile, teamSandboxPaths } from '../../src/scheduler.ts'
+import { HQ_ROOT, pathsOverlap, Scheduler, TEAM_CWD_OVERLAP, teamCwdOverlaps, teamProfile, teamSandboxPaths } from '../../src/scheduler.ts'
 import { TEAM_MACH_ALLOWED } from '../../src/exec/sandbox.ts'
 import { Store } from '../../src/store.ts'
 import type { TeamConfig } from '../../src/types.ts'
@@ -72,7 +72,8 @@ test('TeamConfig.sandbox.mach: only TEAM_MACH_ALLOWED names (trustd) are added t
   // Through the scheduler: the run never starts and ends with the exact reason.
   const dir = tmp('hq-team-mach-')
   const store = new Store(join(dir, 'hq', 'hq.db'))
-  const t = { ...cfg(['com.apple.lsd']), cwd: dir }
+  const t = { ...cfg(['com.apple.lsd']), cwd: join(dir, 'team') }
+  mkdirSync(t.cwd, { recursive: true })
   const sched = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', { hqHome: join(dir, 'hq'), tokenDir: join(dir, 'tok'), pollMs: 20 }, { holdUntil: () => null, teamLimited: () => {} })
   try {
     assert.equal(sched.runNow('revenue'), true)
@@ -80,7 +81,7 @@ test('TeamConfig.sandbox.mach: only TEAM_MACH_ALLOWED names (trustd) are added t
     assert.equal(r.exitCode, -1)
     assert.equal(r.summary, '실행할 수 없어요: 허용되지 않은 mach 서비스 com.apple.lsd')
     assert.deepEqual([sched.views()[0].state, sched.views()[0].bubble], ['error', '실행할 수 없어요: 허용되지 않은 mach 서비스 com.apple.lsd'])
-    assert.equal(existsSync(join(dir, 'ran.txt')), false)
+    assert.equal(existsSync(join(t.cwd, 'ran.txt')), false)
   } finally { sched.stop(); store.close() }
 })
 
@@ -173,4 +174,55 @@ test('scheduler: default teams run in the team profile (per-run cache env, .sb w
     assert.equal(readFileSync(join(s.cwd, 'read.txt'), 'utf8'), 'READ\n', 'opt-out: no Seatbelt')
     assert.equal(existsSync(join(s.hqHome, 'logs', 'teams', 'revenue', '2.sb')), false)
   } finally { store.close(); s.cleanup() }
+})
+
+test('team cwd overlapping the hq repository or $HQ_HOME (equal, above, inside) is refused; siblings are fine', () => {
+  const R = '/nonexistent-hq-cwd'
+  const root = `${R}/code/hq`, home = `${R}/data/.hq`
+  for (const cwd of [root, `${root}/`, `${root}/teams`, `${R}/code`, R, '/', home, `${home}/work`, `${R}/data`])
+    assert.equal(teamCwdOverlaps(cwd, root, home), true, cwd)
+  for (const cwd of [`${R}/code/hq2`, `${R}/code/pipeline`, `${R}/data/.hq-other`, `${R}/other`])
+    assert.equal(teamCwdOverlaps(cwd, root, home), false, cwd)
+  assert.equal(pathsOverlap(`${root}/../hq/src`, root), true, 'resolved before comparing')
+})
+
+test('scheduler: a team whose cwd is the hq repository, contains $HQ_HOME, or sits inside it → error bubble, never runs (tick or runNow)', async () => {
+  const dir = tmp('hq-team-cwd-')
+  const store = new Store(join(dir, 'db', 'hq.db'))
+  const hqHome = join(dir, 'hq')
+  const mk = (id: string, cwd: string): TeamConfig => ({ id, name: id, pack: 'digimon', command: ['/bin/sh', '-c', 'echo ran > ran.txt; exit 0'], cwd, everyMinutes: 1, enabled: true })
+  mkdirSync(join(hqHome, 'x'), { recursive: true }); mkdirSync(join(dir, 'ok'), { recursive: true })
+  const teams = [mk('repo', HQ_ROOT), mk('above', dir), mk('inside', join(hqHome, 'x')), mk('ok', join(dir, 'ok'))]
+  const sched = new Scheduler(teams, store, new Bus(store), 'http://127.0.0.1:1', { hqHome, tokenDir: join(dir, 'tok'), pollMs: 20 }, { holdUntil: () => null, teamLimited: () => {} })
+  try {
+    for (const id of ['repo', 'above', 'inside']) {
+      const v = sched.views().find((x) => x.id === id)!
+      assert.deepEqual([v.state, v.bubble], ['error', TEAM_CWD_OVERLAP], id)
+      assert.equal(sched.runNow(id), false, id)
+      assert.equal(store.lastRun(id), null, `${id}: no run recorded`)
+    }
+    assert.equal(TEAM_CWD_OVERLAP, '실행할 수 없어요: 팀 폴더가 hq 저장소나 hq 데이터와 겹쳐요')
+    assert.equal(existsSync(join(HQ_ROOT, 'ran.txt')), false)
+    assert.equal(existsSync(join(hqHome, 'x', 'ran.txt')), false)
+    assert.notEqual(sched.views().find((x) => x.id === 'ok')!.state, 'error')
+  } finally { sched.stop(); store.close(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test('team profile: writes to the hq repository are denied by the last rule, even when configured writable', () => {
+  const R = '/nonexistent-hq-root-deny'
+  const lines = teamProfile({ cwd: `${R}/pipeline`, hqHome: `${R}/hq`, tokenDir: `${R}/tok`, home: `${R}/home`, writable: [`${R}/code/hq`], hqRoot: `${R}/code/hq` }).trimEnd().split('\n')
+  assert.equal(lines.at(-1), `(deny file-write* (subpath "${R}/code/hq")) ; the hq repository (daemon code, teams.json)`)
+})
+
+test('team profile, real Seatbelt: a writable path inside the hq root stays unwritable; the team cwd still works', { skip }, async () => {
+  const dir = tmp('hq-team-root-')
+  const cwd = join(dir, 'team'), fakeRoot = join(dir, 'hqroot')
+  mkdirSync(cwd, { recursive: true }); mkdirSync(join(fakeRoot, 'config'), { recursive: true })
+  const profile = join(dir, 'team.sb')
+  writeFileSync(profile, teamProfile({ cwd, hqHome: join(dir, 'hq'), tokenDir: join(dir, 'tok'), writable: [fakeRoot], hqRoot: fakeRoot }))
+  try {
+    const r = await runSandboxed(`echo x > "${fakeRoot}/config/teams.json"; echo ok > mine.txt`, cwd, 20_000, profile)
+    assert.equal(existsSync(join(fakeRoot, 'config', 'teams.json')), false, r.output ?? '')
+    assert.equal(readFileSync(join(cwd, 'mine.txt'), 'utf8'), 'ok\n')
+  } finally { rmSync(dir, { recursive: true, force: true }) }
 })

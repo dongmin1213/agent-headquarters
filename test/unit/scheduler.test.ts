@@ -1,6 +1,7 @@
 // Scheduler must survive team commands that cannot be spawned (live crash: ENOENT with no 'error' listener killed the daemon).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { Bus } from '../../src/bus.ts'
 import { Scheduler } from '../../src/scheduler.ts'
@@ -10,13 +11,15 @@ import { tmp } from './helpers.ts'
 import { useFakeSandboxIfNested } from '../nested.ts'
 
 useFakeSandboxIfNested()
+/** The team folder: beside $HQ_HOME (dir/home), never above it (a cwd containing hq data is refused). */
+const teamDir = (dir: string) => { const d = join(dir, 'team'); mkdirSync(d, { recursive: true }); return d }
 const iso = (dir: string) => ({ hqHome: join(dir, 'home'), tokenDir: join(dir, 'tokens'), pollMs: 50 })
 
 function setup(team: Partial<TeamConfig>) {
   const dir = tmp('hq-sched-')
   const store = new Store(join(dir, 'hq.db'))
   const bus = new Bus(store)
-  const t: TeamConfig = { id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', 'exit 0'], cwd: dir, everyMinutes: 60, enabled: true, ...team }
+  const t: TeamConfig = { id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', 'exit 0'], cwd: teamDir(dir), everyMinutes: 60, enabled: true, ...team }
   const sched = new Scheduler([t], store, bus, 'http://127.0.0.1:1', iso(dir), { holdUntil: () => null, teamLimited: () => {} })
   return { dir, store, sched }
 }
@@ -93,7 +96,7 @@ function restarted(seed: (store: Store) => void, team: Partial<TeamConfig> = {})
   seed(before)
   before.close()
   const store = new Store(path)
-  const t: TeamConfig = { id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', 'exit 0'], cwd: dir, everyMinutes: 60, enabled: true, ...team }
+  const t: TeamConfig = { id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', 'exit 0'], cwd: teamDir(dir), everyMinutes: 60, enabled: true, ...team }
   const sched = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', iso(dir), { holdUntil: () => null, teamLimited: () => {} })
   const v = sched.views()[0]
   store.close()
@@ -141,7 +144,7 @@ test('summary keeps the last STATUS line even after 10 more lines; restore shows
   const dir = tmp('hq-sched-')
   const path = join(dir, 'hq.db')
   const store = new Store(path)
-  const t: TeamConfig = { id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', 'echo "STATUS: 대본 준비 완료: X"; for i in 1 2 3 4 5 6 7 8 9 10; do echo "log $i"; done; exit 0'], cwd: dir, everyMinutes: 60, enabled: true }
+  const t: TeamConfig = { id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', 'echo "STATUS: 대본 준비 완료: X"; for i in 1 2 3 4 5 6 7 8 9 10; do echo "log $i"; done; exit 0'], cwd: teamDir(dir), everyMinutes: 60, enabled: true }
   const sched = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', iso(dir), { holdUntil: () => null, teamLimited: () => {} })
   assert.equal(sched.runNow('revenue'), true)
   await ended(store, 1)

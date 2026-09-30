@@ -19,8 +19,10 @@ useFakeSandboxIfNested()
 // Inside a sandbox `ps` (setuid) cannot run; identity then comes from a stand-in that still tracks liveness.
 const ps = nestedSandbox ? async (pid: number) => (pidAlive(pid) ? `fake-${pid}` : null) : psLstart
 const quota = { holdUntil: () => null, teamLimited: () => {} }
+/** The team folder: beside $HQ_HOME (dir/home), never above it (a cwd containing hq data is refused). */
+const teamDir = (dir: string) => { const d = join(dir, 'team'); mkdirSync(d, { recursive: true }); return d }
 const team = (dir: string, script: string, o: Partial<TeamConfig> = {}): TeamConfig =>
-  ({ id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', script], cwd: dir, everyMinutes: 60, enabled: true, ...o })
+  ({ id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', script], cwd: teamDir(dir), everyMinutes: 60, enabled: true, ...o })
 const iso = (dir: string, o: Partial<TeamIsolation> = {}): TeamIsolation => ({ hqHome: join(dir, 'home'), tokenDir: join(dir, 'tokens'), pollMs: 50, ps, ...o })
 
 async function until(pred: () => boolean, what: string, ms = 10_000): Promise<void> {
@@ -48,8 +50,8 @@ test('scoped team token: quota and own cards only, never decisions or state; rev
     // Chairman cards of every kind exist.
     h.store.upsertApproval({ id: 'team:revenue:c1', teamId: 'revenue', title: 't', body: '', options: ['승인', '반려'], subjectHash: 'h1', expiresAt: new Date(Date.now() + 3600_000).toISOString(), createdAt: new Date().toISOString() })
     assert.equal(sched.runNow('revenue'), true)
-    await until(() => existsSync(join(dir, 'team-token.txt')) && readFileSync(join(dir, 'team-token.txt'), 'utf8').length > 0, 'token written')
-    const tok = readFileSync(join(dir, 'team-token.txt'), 'utf8')
+    await until(() => existsSync(join(dir, 'team', 'team-token.txt')) && readFileSync(join(dir, 'team', 'team-token.txt'), 'utf8').length > 0, 'token written')
+    const tok = readFileSync(join(dir, 'team', 'team-token.txt'), 'utf8')
     assert.notEqual(tok, MASTER)
     assert.equal(sched.teamOfToken(tok), 'revenue')
 
@@ -76,7 +78,7 @@ test('scoped team token: quota and own cards only, never decisions or state; rev
     assert.equal((await call(MASTER, 'POST', `/api/approvals/${encodeURIComponent('team:revenue:c2')}`, { decision: '승인', subjectHash: 'h2' })).status, 200)
     assert.equal((await call(MASTER, 'GET', '/api/state')).status, 200)
 
-    writeFileSync(join(dir, 'release'), '')
+    writeFileSync(join(dir, 'team', 'release'), '')
     await ended(h.store, 1)
     assert.equal(h.store.lastRun('revenue')!.exitCode, 0)
     assert.equal(sched.teamOfToken(tok), null, 'revoked in memory')
@@ -123,7 +125,7 @@ test('team profile: the command cannot read the token file or $HQ_HOME/hq.db, ca
     assert.doesNotMatch(r.summary ?? '', /secret-master/)
     assert.match(r.summary ?? '', /Operation not permitted/)
     assert.equal(existsSync(join(home, 'evil')), false)
-    assert.equal(readFileSync(join(dir, 'mine'), 'utf8'), 'ok\n')
+    assert.equal(readFileSync(join(dir, 'team', 'mine'), 'utf8'), 'ok\n')
   } finally { store.close() }
 })
 
@@ -134,7 +136,7 @@ test('restart: a live run is adopted (no duplicate), keeps its token, and ends w
   const s1store = new Store(db)
   const s1 = new Scheduler([t], s1store, new Bus(s1store), 'http://127.0.0.1:1', iso(dir), quota)
   assert.equal(s1.runNow('revenue'), true)
-  await until(() => existsSync(join(dir, 'team-token.txt')) && readFileSync(join(dir, 'team-token.txt'), 'utf8').length > 0, 'first run started')
+  await until(() => existsSync(join(dir, 'team', 'team-token.txt')) && readFileSync(join(dir, 'team', 'team-token.txt'), 'utf8').length > 0, 'first run started')
   await until(() => s1store.runProcess(1)?.lstart != null, 'lstart recorded')
   s1.stop(); s1store.close() // daemon goes away; the detached run keeps going
 
@@ -146,15 +148,15 @@ test('restart: a live run is adopted (no duplicate), keeps its token, and ends w
     let v = s2.views()[0]
     assert.equal(v.state, 'working'); assert.equal(v.bubble, '반쯤')
     assert.equal(s2.runNow('revenue'), false, 'no second run while the adopted one lives')
-    assert.equal(s2.teamOfToken(readFileSync(join(dir, 'team-token.txt'), 'utf8')), 'revenue', 'adopted run keeps API access')
-    writeFileSync(join(dir, 'release'), '')
+    assert.equal(s2.teamOfToken(readFileSync(join(dir, 'team', 'team-token.txt'), 'utf8')), 'revenue', 'adopted run keeps API access')
+    writeFileSync(join(dir, 'team', 'release'), '')
     await ended(store, 1)
     const r = store.lastRun('revenue')!
     assert.equal(r.id, 1); assert.equal(r.exitCode, 3)
     v = s2.views()[0]
     assert.equal(v.state, 'waiting'); assert.equal(v.bubble, '승인 요청 보냄')
-    assert.equal(readFileSync(join(dir, 'pids'), 'utf8').trim().split('\n').length, 1, 'exactly one process ever ran')
-    assert.equal(s2.teamOfToken(readFileSync(join(dir, 'team-token.txt'), 'utf8')), null)
+    assert.equal(readFileSync(join(dir, 'team', 'pids'), 'utf8').trim().split('\n').length, 1, 'exactly one process ever ran')
+    assert.equal(s2.teamOfToken(readFileSync(join(dir, 'team', 'team-token.txt'), 'utf8')), null)
   } finally { s2.stop(); store.close() }
 })
 
@@ -211,14 +213,14 @@ test('restart: pid alive but identity unconfirmable → no new run, error bubble
     assert.equal(s.runNow('revenue'), false)
     ;(s as unknown as { tick(): void }).tick()
     await new Promise((r) => setTimeout(r, 300))
-    assert.equal(existsSync(join(dir, 'started')), false, 'no new run')
+    assert.equal(existsSync(join(dir, 'team', 'started')), false, 'no new run')
     assert.equal(pidAlive(other.pid!), true, 'never signalled (not even on timeout)')
     assert.equal(store.lastRun('revenue')!.endedAt, null)
     other.kill('SIGKILL')
     await until(() => !pidAlive(other.pid!), 'sleep gone')
     ;(s as unknown as { tick(): void }).tick() // the old pid is gone: the run is closed and the (due) team starts again
     assert.equal(store.runProcess(1) && store.lastRun('revenue')!.id >= 1, true)
-    await until(() => existsSync(join(dir, 'started')), 'next run after the old pid disappeared')
+    await until(() => existsSync(join(dir, 'team', 'started')), 'next run after the old pid disappeared')
     await ended(store, 2)
   } finally { s.stop(); store.close(); try { other.kill('SIGKILL') } catch { /* gone */ } }
 })
@@ -289,7 +291,7 @@ test('N3: unconfirmed run → card; team token cannot decide it; chairman 끝난
     assert.equal(store.approval(CARD)!.state, 'open')
     const d = await call(MASTER, 'POST', `/api/approvals/${encodeURIComponent(CARD)}`, { decision: RELEASE, subjectHash: card.subjectHash })
     assert.equal(d.status, 200, JSON.stringify(d.body))
-    await until(() => existsSync(join(dir, 'started')), 'a new run starts right after the decision')
+    await until(() => existsSync(join(dir, 'team', 'started')), 'a new run starts right after the decision')
     await ended(store, 2)
     assert.equal(pidAlive(other.pid!), true, 'the old pid was never signalled')
     assert.equal(sched.teamOfToken(TEAM_TOK), null, 'the released run lost its token')
@@ -318,7 +320,7 @@ test('N3: 계속 기다림 → no new run; the card is asked again only after 24
     assert.equal(s.runNow('revenue'), false, 'still waiting')
     ;(s as unknown as { tick(): void }).tick()
     await new Promise((r) => setTimeout(r, 200))
-    assert.equal(existsSync(join(dir, 'started')), false)
+    assert.equal(existsSync(join(dir, 'team', 'started')), false)
     assert.equal(store.lastRun('revenue')!.endedAt, null)
     assert.equal(store.approval(CARD)!.revision, card.revision, 'not asked again yet')
     s.stop(); store.close()
@@ -334,7 +336,7 @@ test('N3: 계속 기다림 → no new run; the card is asked again only after 24
     await until(() => store.approval(CARD)!.revision === card.revision + 1, 'asked again after 24h')
     card = store.approval(CARD)!
     assert.equal(card.state, 'open')
-    assert.equal(existsSync(join(dir, 'started')), false, 'still no new run')
+    assert.equal(existsSync(join(dir, 'team', 'started')), false, 'still no new run')
     // The pid goes away on its own: the run closes as usual and its card is no longer open.
     other.kill('SIGKILL')
     await until(() => !pidAlive(other.pid!), 'sleep gone')
@@ -370,8 +372,8 @@ test('timeout: SIGTERM then SIGKILL to the whole process group, run ends -1 with
   const s = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', iso(dir, { killGraceMs: 300 }), quota)
   try {
     assert.equal(s.runNow('revenue'), true)
-    await until(() => existsSync(join(dir, 'child')) && readFileSync(join(dir, 'child'), 'utf8').trim().length > 0, 'child started')
-    const child = Number(readFileSync(join(dir, 'child'), 'utf8'))
+    await until(() => existsSync(join(dir, 'team', 'child')) && readFileSync(join(dir, 'team', 'child'), 'utf8').trim().length > 0, 'child started')
+    const child = Number(readFileSync(join(dir, 'team', 'child'), 'utf8'))
     await ended(store, 1)
     const r = store.lastRun('revenue')!
     assert.equal(r.exitCode, -1)
