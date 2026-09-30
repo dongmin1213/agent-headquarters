@@ -66,6 +66,15 @@ export const MACH_SERVICES: [string, string][] = [
 ]
 
 /**
+ * Extra mach services a team may add with TeamConfig.sandbox.mach — nothing outside this list is accepted.
+ * Measured on macOS 26.5: Go/Security.framework HTTPS clients (e.g. the Higgsfield CLI) fail certificate validation
+ * ("request failed (no response received)") without trustd, and succeed with only it added.
+ */
+export const TEAM_MACH_ALLOWED: [string, string][] = [
+  ['com.apple.trustd.agent', 'certificate validation for Security.framework TLS clients (e.g. Go binaries such as the Higgsfield CLI)'],
+]
+
+/**
  * ~ entries the sandbox may read; everything else under $HOME (~/.codex, ~/.config/*, ~/Library/Application Support,
  * cookies, browser profiles, ~/Documents, shell rc files …) is content-denied. Entries ending in '/' are folders.
  * Measured one at a time with the real worker run + git/npm/node workloads: only Library/Keychains is strictly

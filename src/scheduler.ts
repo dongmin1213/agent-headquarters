@@ -19,7 +19,7 @@ import type { Store } from './store.ts'
 import type { RunRecord, TeamConfig, TeamState, TeamView } from './types.ts'
 import {
   cacheEnv, claudeOwnFilters, claudeWriteRules, homeReadFilters, homeSecretFilters, launchRules, machRules, makeCacheDir, real,
-  signalRules, subpathOf, tempRoots, wrap,
+  signalRules, subpathOf, TEAM_MACH_ALLOWED, tempRoots, wrap,
 } from './exec/sandbox.ts'
 import { killGroup, pidAlive, psLstart, removeCacheDir, type PsLstart } from './exec/worker.ts'
 
@@ -92,6 +92,8 @@ export interface TeamProfileOpts {
   readable?: string[]
   /** Extra read-write roots (TeamConfig.sandbox.writable, already expanded). */
   writable?: string[]
+  /** Extra mach services (TeamConfig.sandbox.mach, already checked against TEAM_MACH_ALLOWED). */
+  mach?: string[]
   /** Home directory for ~ paths (tests use a fake one). */
   home?: string
 }
@@ -113,6 +115,7 @@ export function teamProfile(o: TeamProfileOpts): string {
     '(allow default)',
     ...signalRules(),
     ...machRules(),
+    ...(o.mach ?? []).map((n) => `(allow mach-lookup (global-name ${JSON.stringify(n)})) ; team config`),
     `(deny file-read-data ${subpathOf(home)} ${subpathOf(o.hqHome)})`,
     `(allow file-read-data ${[...homeReadFilters(home), ...[...readable, ...writable, o.cwd].map(subpathOf), claude.own].join(' ')})`,
     `(deny file-write* (require-not (require-any ${w.join(' ')} ${claude.own})))`,
@@ -123,19 +126,28 @@ export function teamProfile(o: TeamProfileOpts): string {
   ].join('\n')
 }
 
-/** TeamConfig.sandbox → profile paths (~ expanded, relative to cwd), or 'none'. Throws on a malformed value. */
-export function teamSandboxPaths(t: TeamConfig, home = homedir()): { readable: string[]; writable: string[] } | 'none' {
+/** A team's sandbox setting that cannot be applied; the run ends with `실행할 수 없어요: <message>`. */
+export class TeamSandboxError extends Error {}
+
+/**
+ * TeamConfig.sandbox → profile paths (~ expanded, relative to cwd) and allowed extra mach services, or 'none'.
+ * Throws TeamSandboxError on a malformed value or a mach service outside TEAM_MACH_ALLOWED.
+ */
+export function teamSandboxPaths(t: TeamConfig, home = homedir()): { readable: string[]; writable: string[]; mach: string[] } | 'none' {
   const sb = t.sandbox
   if (sb === 'none') return 'none'
-  if (sb === undefined) return { readable: [], writable: [] }
+  if (sb === undefined) return { readable: [], writable: [], mach: [] }
   const list = (v: unknown, key: string): string[] => {
     if (v === undefined) return []
-    if (!Array.isArray(v) || v.some((x) => typeof x !== 'string' || !x)) throw new Error(`teams.json sandbox.${key}는 경로 목록이어야 해요`)
-    return v.map((p: string) => resolve(t.cwd, p.replace(/^~(?=\/|$)/, home)))
+    if (!Array.isArray(v) || v.some((x) => typeof x !== 'string' || !x)) throw new TeamSandboxError(`teams.json sandbox.${key}는 목록이어야 해요`)
+    return v as string[]
   }
-  if (!sb || typeof sb !== 'object' || Array.isArray(sb)) throw new Error('teams.json sandbox는 {readable, writable} 또는 "none"이어야 해요')
-  for (const k of Object.keys(sb)) if (k !== 'readable' && k !== 'writable') throw new Error(`teams.json sandbox: 알 수 없는 키 "${k}"`)
-  return { readable: list(sb.readable, 'readable'), writable: list(sb.writable, 'writable') }
+  const path = (p: string) => resolve(t.cwd, p.replace(/^~(?=\/|$)/, home))
+  if (!sb || typeof sb !== 'object' || Array.isArray(sb)) throw new TeamSandboxError('teams.json sandbox는 {readable, writable, mach} 또는 "none"이어야 해요')
+  for (const k of Object.keys(sb)) if (!['readable', 'writable', 'mach'].includes(k)) throw new TeamSandboxError(`teams.json sandbox: 알 수 없는 키 "${k}"`)
+  const mach = list(sb.mach, 'mach')
+  for (const n of mach) if (!TEAM_MACH_ALLOWED.some(([name]) => name === n)) throw new TeamSandboxError(`허용되지 않은 mach 서비스 ${n}`)
+  return { readable: list(sb.readable, 'readable').map(path), writable: list(sb.writable, 'writable').map(path), mach: [...new Set(mach)] }
 }
 
 function psCommand(pid: number): Promise<string | null> {
@@ -328,7 +340,8 @@ export class Scheduler {
         a.timer = setInterval(() => this.poll(a), this.iso.pollMs)
         a.timer.unref()
       } catch (err) {
-        spawnFailed(err as NodeJS.ErrnoException)
+        if (err instanceof TeamSandboxError) this.finish(a, -1, `${SPAWN_FAILED} ${err.message}`)
+        else spawnFailed(err as NodeJS.ErrnoException)
       } finally {
         if (fd !== null) closeSync(fd)
       }

@@ -136,7 +136,11 @@ setup이 만든 추적되지 않는 파일·무시된 파일(검증 worktree 기
     - 데몬 토큰 폴더(`~/.config/hq`), `$HQ_HOME`, `~/.ssh`·`~/.aws`·`~/.config/gh`·`~/.netrc`·`~/.docker/config.json`은 어떤 설정으로도 열리지 않습니다. 팀 폴더를 `$HQ_HOME` 아래에 두지 마세요.
     - 네트워크는 열려 있습니다(웹 API, 그리고 범위 토큰으로 hq에 연결). npm·pip·XDG 캐시는 실행마다 새 임시 폴더를 쓰고 실행이 끝나면 지웁니다.
   - **경로 더 허용하기**: 팀이 홈의 다른 경로를 써야 하면 팀 항목에 `"sandbox": {"readable": ["~/경로"], "writable": ["~/경로"]}`를 넣습니다(`~` 가능, 상대 경로는 `cwd` 기준, `writable`은 읽기도 허용). 모두 공통 허용 목록이 아니라 그 팀에만 적용됩니다. 수익자동화 파이프라인(`hq_team.py`: 리서치·대본·승인 묶음)은 추가 경로 없이 돕니다(측정: `.venv` 가져오기, `hq_team.py`, `claude -p` haiku, 파이썬 https, 파이프라인 자체 테스트 12개, `yt-dlp` 조회, `ffmpeg-full` drawtext). 참고로 측정된 예외:
-    - **Higgsfield CLI**(유료 단계, 팀이 아니라 사용자가 직접 실행): `~/.config/higgsfield`를 `writable`로 줘도 HTTPS 인증서 확인에 macOS `trustd` 서비스가 필요해 샌드박스 안에서는 요청이 실패합니다(`request failed (no response received)`). mach 서비스는 팀 설정으로 열 수 없으므로, 팀이 Higgsfield를 직접 불러야 한다면 지금은 아래 `"none"`밖에 방법이 없습니다.
+    - **Higgsfield CLI**(유료 단계, 지금은 팀이 아니라 사용자가 직접 실행): 설정 폴더 쓰기와 함께, HTTPS 인증서 확인에 macOS `trustd` 서비스가 필요합니다. 없으면 `request failed (no response received)`로 실패합니다. 팀이 Higgsfield를 불러야 한다면 아래처럼 허용합니다(측정: `higgsfield account status` 성공).
+      ```json
+      "sandbox": { "writable": ["~/.config/higgsfield"], "mach": ["com.apple.trustd.agent"] }
+      ```
+  - **mach 서비스 더하기**: `"sandbox": {"mach": [...]}`에는 hq가 정한 허용 목록(`src/exec/sandbox.ts`의 `TEAM_MACH_ALLOWED`)에 있는 이름만 넣을 수 있습니다. 지금 목록은 `com.apple.trustd.agent`(인증서 확인) 하나뿐입니다. 다른 이름을 넣으면 실행하지 않고 `실행할 수 없어요: 허용되지 않은 mach 서비스 <이름>`으로 끝납니다. LaunchServices·launchd 같은 서비스는 샌드박스 밖 프로그램을 띄우는 통로라서 목록에 넣지 않습니다.
   - **샌드박스 끄기**: `"sandbox": "none"`이면 그 팀은 샌드박스 없이 돕니다(범위 토큰·환경 변수 정리는 그대로). 명시적인 예외이므로 `hq doctor`가 `[경고] 팀 <이름>: 샌드박스 없이 실행돼요 (config/teams.json sandbox: "none")`로 계속 알립니다.
   - **환경 변수**: 부모 환경에서 `HQ_TOKEN_FILE`과 이름이 `_TOKEN`·`_KEY`로 끝나거나 `ANTHROPIC_`·`OPENAI_`로 시작하는 변수는 빼고 넘깁니다(범위 토큰 `HQ_TOKEN`, `HQ_URL`, `HQ_TEAM`은 hq가 넣음). 팀에 필요한 키는 팀 폴더의 비밀 파일(예: `.env`)에서 읽으세요.
 - 팀 출력은 `$HQ_HOME/logs/teams/<팀 id>/<실행 번호>.log`에 쌓이고(팀마다 최근 50개), hq는 이 파일에서 `STATUS:` 줄과 종료 코드를 읽습니다. 팀 프로세스는 데몬과 따로 돌기 때문에 hq를 재시작해도 끊기지 않고, 재시작한 hq가 pid와 시작 시각으로 같은 프로세스인지 확인해 이어서 지켜봅니다(새 실행을 겹쳐 시작하지 않음). 이미 끝났다면 로그의 종료 코드로 마무리하고, 종료 코드가 없으면 `지난 실행이 중단됐어요 · 다음 실행 때 이어서 해요`로 둡니다. 같은 프로세스인지 확인할 수 없으면(`ps` 실패) 신호를 보내지 않고 새로 시작하지도 않으며, 회장에게 카드 `<팀>: 이전 실행을 확인할 수 없어요`(pid와 명령 줄 포함)를 올립니다.

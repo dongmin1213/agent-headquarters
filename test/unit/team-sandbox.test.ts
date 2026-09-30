@@ -15,6 +15,7 @@ import {
 } from '../../src/exec/sandbox.ts'
 import { Bus } from '../../src/bus.ts'
 import { Scheduler, teamProfile, teamSandboxPaths } from '../../src/scheduler.ts'
+import { TEAM_MACH_ALLOWED } from '../../src/exec/sandbox.ts'
 import { Store } from '../../src/store.ts'
 import type { TeamConfig } from '../../src/types.ts'
 import { tmp } from './helpers.ts'
@@ -49,10 +50,38 @@ test('team profile = the shared v4 rules (signals, mach-lookup, ~/.claude writes
 
 test('TeamConfig.sandbox: ~ and relative paths expand; "none" opts out; malformed values are refused', () => {
   const t = (sandbox: unknown): TeamConfig => ({ id: 'r', name: 'r', pack: 'digimon', command: ['x'], cwd: '/repo', everyMinutes: 1, enabled: true, sandbox: sandbox as TeamConfig['sandbox'] })
-  assert.deepEqual(teamSandboxPaths(t(undefined)), { readable: [], writable: [] })
+  assert.deepEqual(teamSandboxPaths(t(undefined)), { readable: [], writable: [], mach: [] })
   assert.equal(teamSandboxPaths(t('none')), 'none')
-  assert.deepEqual(teamSandboxPaths(t({ readable: ['~/.config/x', 'vendor'], writable: ['~'] }), '/Users/u'), { readable: ['/Users/u/.config/x', '/repo/vendor'], writable: ['/Users/u'] })
-  for (const bad of ['off', [], { readable: 'x' }, { readable: [''] }, { write: [] }]) assert.throws(() => teamSandboxPaths(t(bad)), /sandbox/, JSON.stringify(bad))
+  assert.deepEqual(teamSandboxPaths(t({ readable: ['~/.config/x', 'vendor'], writable: ['~'] }), '/Users/u'), { readable: ['/Users/u/.config/x', '/repo/vendor'], writable: ['/Users/u'], mach: [] })
+  for (const bad of ['off', [], { readable: 'x' }, { readable: [''] }, { write: [] }, { mach: 'com.apple.trustd.agent' }]) assert.throws(() => teamSandboxPaths(t(bad)), /sandbox/, JSON.stringify(bad))
+})
+
+test('TeamConfig.sandbox.mach: only TEAM_MACH_ALLOWED names (trustd) are added to the profile; any other name stops the run', async () => {
+  const cfg = (mach: string[]): TeamConfig => ({ id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', 'echo ran > ran.txt; exit 0'], cwd: '/repo', everyMinutes: 60, enabled: true, sandbox: { mach } })
+  assert.deepEqual(TEAM_MACH_ALLOWED.map(([n]) => n), ['com.apple.trustd.agent'])
+  const ok = teamSandboxPaths(cfg(['com.apple.trustd.agent', 'com.apple.trustd.agent'])) as { mach: string[] }
+  assert.deepEqual(ok.mach, ['com.apple.trustd.agent'])
+  const R = '/nonexistent-hq-team'
+  const lines = teamProfile({ cwd: `${R}/repo`, hqHome: `${R}/hq`, tokenDir: `${R}/tok`, home: `${R}/home`, mach: ok.mach }).split('\n')
+  const at = lines.indexOf('(allow mach-lookup (global-name "com.apple.trustd.agent")) ; team config')
+  assert.ok(at > lines.indexOf('(deny mach-lookup)'), 'added after the deny, so it takes effect')
+  assert.ok(!teamProfile({ cwd: `${R}/repo`, hqHome: `${R}/hq`, tokenDir: `${R}/tok`, home: `${R}/home` }).includes('trustd'), 'not in the default profile')
+  for (const bad of ['com.apple.lsd', 'com.apple.coreservices.launchservicesd', '*'])
+    assert.throws(() => teamSandboxPaths(cfg([bad])), new RegExp(`^Error: 허용되지 않은 mach 서비스 ${bad.replace('*', '\\*')}$`))
+
+  // Through the scheduler: the run never starts and ends with the exact reason.
+  const dir = tmp('hq-team-mach-')
+  const store = new Store(join(dir, 'hq', 'hq.db'))
+  const t = { ...cfg(['com.apple.lsd']), cwd: dir }
+  const sched = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', { hqHome: join(dir, 'hq'), tokenDir: join(dir, 'tok'), pollMs: 20 }, { holdUntil: () => null, teamLimited: () => {} })
+  try {
+    assert.equal(sched.runNow('revenue'), true)
+    const r = store.lastRun('revenue')!
+    assert.equal(r.exitCode, -1)
+    assert.equal(r.summary, '실행할 수 없어요: 허용되지 않은 mach 서비스 com.apple.lsd')
+    assert.deepEqual([sched.views()[0].state, sched.views()[0].bubble], ['error', '실행할 수 없어요: 허용되지 않은 mach 서비스 com.apple.lsd'])
+    assert.equal(existsSync(join(dir, 'ran.txt')), false)
+  } finally { sched.stop(); store.close() }
 })
 
 async function setup() {
