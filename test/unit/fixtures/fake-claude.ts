@@ -3,8 +3,9 @@
 // in the prompt (stdin). Markers are remembered per session in $TMPDIR so a `--resume` run keeps them.
 //   work:   write=<path> (repeatable), outcome=succeeded|failed|blocked|question, questions=<n>, sleep=<ms>, nodone, badtoken,
 //           limit429, e529, maxturns, errors=<n>, rejectfirst, rejectalways, resets=<epoch s>, util=<0..1>
-//   review: review=pass|block|invalid|faketest|badexit
-//   revise: revise=same|widen|question
+//   review: review=pass|block|invalid|faketest|badexit|manualall (every criterion answered `manual`)
+//   revise: revise=same|widen|question (questions until the prompt carries the chairman's answers)|role (changes the role)
+//   work:   evilgit (adds a commit whose tree has an entry named `.git`)
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -50,7 +51,7 @@ if (schema && prompt.includes('# 교차 검토')) {
   const mode = mk('review') ?? 'pass'
   bash('npm test', mode === 'badexit' ? 1 : 0)
   const tests = [{ command: mode === 'faketest' ? 'make secret-tests' : 'npm test', exit_code: 0, summary: 'ok' }]
-  const criteria = ids.map((id) => ({ id, result: mode === 'block' ? 'fail' : 'pass', evidence: 'checked' }))
+  const criteria = ids.map((id) => ({ id, result: mode === 'block' ? 'fail' : mode === 'manualall' ? 'manual' : 'pass', evidence: 'checked' }))
   const out = mode === 'block' ? { pass: false, blocking: [{ id: 'B1', summary: '결함 있음', evidence: 'x.ts:1' }], advisory: [], criteria, tests_run: tests }
     : mode === 'invalid' ? { pass: true, blocking: [{ id: 'B1', summary: 'x', evidence: 'y' }], advisory: [], criteria, tests_run: tests }
     : { pass: true, blocking: [], advisory: [], criteria, tests_run: tests }
@@ -62,7 +63,10 @@ if (schema && prompt.includes('## 이번 턴: 지시서 수정')) {
   const m = /## 원래 작업 \(PlanTask JSON\)\n```json\n([\s\S]*?)\n```/.exec(prompt)
   const task = JSON.parse(m![1])
   const mode = mk('revise') ?? 'same'
-  if (mode === 'question') result({ structured_output: { revised_task: null, questions: [{ question: '어느 쪽?', options: ['A', 'B'], default: 'A', reason: '모호' }] } })
+  const answered = /## 회장이 답한 질문\n((?:- .*\n?)+)/.exec(prompt)?.[1].trim()
+  if (mode === 'question' && !answered) result({ structured_output: { revised_task: null, questions: [{ question: '어느 쪽?', options: ['A', 'B'], default: 'A', reason: '모호' }] } })
+  else if (mode === 'question') result({ structured_output: { revised_task: { ...task, brief: `[[FAKE:write=${task.owns[0].replace('/**', '')}/out.txt]] (답 반영: ${answered.replace(/\n/g, ' ')})` }, questions: [] } })
+  else if (mode === 'role') result({ structured_output: { revised_task: { ...task, role: task.role === 'implement' ? 'collect' : 'implement' }, questions: [] } })
   else result({ structured_output: { revised_task: { ...task, brief: task.brief + ' (수정됨)', owns: mode === 'widen' ? [...task.owns, 'extra/**'] : task.owns }, questions: [] } })
   process.exit(0)
 }
@@ -122,6 +126,11 @@ if (!collect && outcome === 'succeeded') {
   }
   git('add', '-A')
   git('commit', '-q', '-m', `fake work ${sid}`)
+  if (mk('evilgit')) {
+    const blob = execFileSync('git', ['hash-object', '-w', '--stdin'], { input: 'evil\n', encoding: 'utf8' }).trim()
+    const tree = execFileSync('git', ['mktree'], { input: git('ls-tree', 'HEAD') + `\n100644 blob ${blob}\t.git\n`, encoding: 'utf8' }).trim()
+    git('update-ref', 'refs/heads/hq-work', git('commit-tree', tree, '-p', 'HEAD', '-m', 'evil tree'))
+  }
   head = git('rev-parse', 'HEAD')
   files = git('diff', '--name-only', '--no-renames', base, 'HEAD').split('\n').filter(Boolean)
 } else if (!collect) head = git('rev-parse', 'HEAD')
