@@ -28,12 +28,36 @@ export function buildPlists(ctx: Ctx) {
 
 const foreignMsg = (label: string) => `launchd 작업 ${label}는 다른 설치의 plist로 이미 로드돼 있어 건드리지 않습니다. 확인: launchctl print gui/<uid>/${label}`
 
-async function bootstrap(ctx: Ctx, label: string): Promise<boolean> {
-  if (await launchdJob(ctx, label) === 'foreign') { ctx.err(foreignMsg(label)); return false }
-  await ctx.act('launchctl', ['bootout', launchdTarget(ctx, label)]) // not loaded yet → error, ignored
-  const r = await ctx.act('launchctl', ['bootstrap', `gui/${ctx.uid}`, plistPath(ctx, label)])
-  if (r.code !== 0) { ctx.err(`launchctl bootstrap 실패 (${label}): ${r.stderr.trim()}`); return false }
-  return true
+/** launchd timing (tests shrink these): poll `print` after bootout until the job is gone, then retry a racing bootstrap. */
+export interface LaunchdTiming { pollMs: number; goneMs: number; retryMs: number; attempts: number }
+export const LAUNCHD_TIMING: LaunchdTiming = { pollMs: 250, goneMs: 10_000, retryMs: 1000, attempts: 4 }
+/** bootstrap stderr seen while launchd is still tearing the old job down (`Bootstrap failed: 5: Input/output error`). */
+const RACE_RE = /Bootstrap failed: 5|Input\/output error|already/i
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+type BootResult = { ok: true } | { ok: false; stderr: string }
+
+/** bootout → wait until `launchctl print` fails (job gone, max goneMs) → bootstrap, retrying the teardown race. */
+async function bootstrap(ctx: Ctx, label: string, t: LaunchdTiming): Promise<BootResult> {
+  if (await launchdJob(ctx, label) === 'foreign') { ctx.err(foreignMsg(label)); return { ok: false, stderr: foreignMsg(label) } }
+  const target = launchdTarget(ctx, label)
+  await ctx.act('launchctl', ['bootout', target]) // not loaded yet → error, ignored
+  if (!ctx.dryRun) {
+    // Gone = print exits non-zero. Still present after goneMs → try anyway (the retry below covers it).
+    await waitFor(async () => (await ctx.run('launchctl', ['print', target], { timeoutMs: 5000 })).code !== 0, t.goneMs, t.pollMs)
+  }
+  let stderr = ''
+  for (let i = 1; i <= t.attempts; i++) {
+    const r = await ctx.act('launchctl', ['bootstrap', `gui/${ctx.uid}`, plistPath(ctx, label)])
+    if (r.code === 0) return { ok: true }
+    stderr = (r.stderr || r.stdout).trim().split('\n')[0] ?? ''
+    // A failed bootstrap whose job is nevertheless loaded from our plist did its job.
+    if (await launchdJob(ctx, label) === 'ours') return { ok: true }
+    if (i === t.attempts || !RACE_RE.test(r.stderr)) break
+    await sleep(t.retryMs)
+  }
+  ctx.err(`launchctl bootstrap 실패 (${label}): ${stderr}`)
+  return { ok: false, stderr }
 }
 
 function linkHint(ctx: Ctx): void {
@@ -58,6 +82,7 @@ export interface InstallOpts {
   /** Step-6 daemon wait in ms (tests override): normal 10 s, 90 s when a macOS TCC dialog may appear. */
   daemonWaitMs?: number
   protectedWaitMs?: number
+  launchd?: Partial<LaunchdTiming>
 }
 
 export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
@@ -124,7 +149,14 @@ export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
     else writeAtomic(plistPath(ctx, label), content)
     ctx.out(`  ${plistPath(ctx, label)}`)
   }
-  if (!(await bootstrap(ctx, daemonLabel(ctx)))) return 1
+  const lt: LaunchdTiming = { ...LAUNCHD_TIMING, ...opts.launchd }
+  const d = await bootstrap(ctx, daemonLabel(ctx), lt)
+  if (!d.ok) {
+    ctx.err(`데몬을 다시 등록하지 못했어요: ${d.stderr} · 잠시 뒤 hq install을 다시 실행하거나 launchctl bootstrap gui/${ctx.uid} ${plistPath(ctx, daemonLabel(ctx))}를 실행해 주세요`)
+    // The pet needs the daemon: reload it only when a daemon still answers.
+    if ((await probeHq(ctx, 1000)).kind === 'hq') await bootstrap(ctx, petLabel(ctx), lt)
+    return 1
+  }
 
   ctx.out('6/6 데몬 응답 확인')
   if (ctx.dryRun) ctx.out('[dry-run] 데몬 응답 확인 생략')
@@ -141,7 +173,7 @@ export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
       return 1
     }
   }
-  if (!(await bootstrap(ctx, petLabel(ctx)))) return 1
+  if (!(await bootstrap(ctx, petLabel(ctx), lt)).ok) return 1
   ctx.out(`  데몬 응답 확인됨 (127.0.0.1:${ctx.port}), 펫 실행`)
 
   linkHint(ctx)
