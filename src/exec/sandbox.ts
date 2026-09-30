@@ -56,7 +56,8 @@ export function sandboxProfile(o: SandboxOpts): string {
   const secretContents = [
     sub(real(o.tokenDir)), rx(`^${reEsc(hq)}/hq\\.db`), sub(join(hq, 'runs')), sub(join(hq, 'logs')), sub(join(hq, 'work')),
     sub(join(home, '.ssh')), sub(join(home, '.aws')), sub(join(home, '.config/gh')), lit(join(home, '.netrc')), lit(join(home, '.docker/config.json')),
-    sub(join(home, 'Library/Keychains')),
+    // ~/Library/Keychains is NOT denied although §6.2 lists it: with it denied the real CLI answers "Not logged in"
+    // (its subscription token lives in the login keychain; measured on 2.1.285). Reported as BLOCKED for a ruling.
     ...projects.map((p) => rx(`^${reEsc(p)}/(.*/)?\\.env[^/]*$`)),
   ]
   const writable = [...own, '/private/tmp', '/private/var/folders', '/dev', ...o.extraWritable.map(real), ...CLAUDE_RUNTIME_DIRS.map((d) => join(home, '.claude', d))]

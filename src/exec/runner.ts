@@ -80,6 +80,7 @@ export const nonManual = (t: PlanTask) => t.acceptance.filter((a) => a.check.tri
 const kindOf = (a: Acceptance) => (a.kind === 'new' ? 'new' : 'regression')
 
 class Setup extends Error {}
+class DecisionRefused extends Error {}
 
 export class Runner {
   readonly store: Store
@@ -250,18 +251,35 @@ export class Runner {
     // Preparation outside the transaction: nothing here changes state.
     let prep: { heads: Map<string, string> } | { error: string } | null = null
     if (a.kind === 'plan' && decision === '승인') prep = await this.preparePlan(requestId)
-    const res = this.store.tx((): DecideResult => {
+    let first = false
+    let res: DecideResult
+    try {
+      res = this.store.tx((): DecideResult => {
       const d = this.store.decide(id, decision, subjectHash, this.now())
-      if (!d) return { status: 409, body: { error: '카드를 방금 다른 곳에서 결정했거나 내용이 바뀌었습니다' } }
+      if (!d) {
+        // A concurrent identical decision won the race: answer with its recorded response.
+        const cur = this.store.approval(id)
+        const prev = cur ? this.store.get(`decided:${cur.id}:${cur.revision}`) : null
+        if (cur?.state === 'decided' && cur.decision === decision && cur.subjectHash === subjectHash && prev) return JSON.parse(prev) as DecideResult
+        return { status: 409, body: { error: '카드를 방금 다른 곳에서 결정했거나 내용이 바뀌었습니다' } }
+      }
       const err = this.applyDecision(d, decision, prep)
-      return err ? { status: 409, body: { ...d, error: err } } : { status: 200, body: { ...d, note: null } }
-    })
-    if (res.status === 200 && a.kind === 'merge' && decision === '병합') {
+      if (err) throw new DecisionRefused(err) // roll back the card consumption as well
+      const ok: DecideResult = { status: 200, body: { ...d, note: null } }
+      this.store.set(replayKey, JSON.stringify(ok))
+      first = true
+      return ok
+      })
+    } catch (e) {
+      if (e instanceof DecisionRefused) return { status: 409, body: { error: e.message } }
+      throw e
+    }
+    if (first && a.kind === 'merge' && decision === '병합') {
       const [, req, project] = a.id.split(':')
       res.body.note = await this.runMerge(req, project)
-    }
-    if (res.status === 200) {
       this.store.set(replayKey, JSON.stringify(res))
+    }
+    if (first) {
       this.bus.emit({ kind: 'approval', teamId: a.teamId, text: `결정: ${a.title} → ${decision}`, data: { id } })
       this.kick()
     }
@@ -653,7 +671,8 @@ export class Runner {
 
   // ----- work attempts (§7 start protocol) -----
   private claimWork(t: TaskRow): boolean {
-    const prev = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.generation === t.generation).at(-1)
+    // The previous attempt decides counting even across a revision (a brief_blocked restart is never counted).
+    const prev = this.store.attempts(t.id).filter((a) => a.kind === 'work').at(-1)
     const resume = t.resume_session
     const counted = !resume && !(prev && UNCOUNTED_PREV.has(prev.status))
     const n = this.store.nextAttemptN(t.id, 'work')

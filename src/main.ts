@@ -58,7 +58,8 @@ const projects = (JSON.parse(readFileSync(projectsFile, 'utf8')) as Project[]).m
 
 const runner = new Runner({ store, bus, cfg, projects, hqRoot: root, hqPort: port, notify: cfg.notify ? notify : () => {}, now: Date.now, tokenDir: dirname(tokenPath) })
 const scheduler = new Scheduler(teams, store, bus, `http://127.0.0.1:${port}`, token, {
-  holdUntil: () => runner.holdUntil(),
+  // A login hold has no end time; teams still wait (checked again every scheduler tick).
+  holdUntil: () => (runner.quota().mode === 'hold' ? runner.holdUntil() ?? new Date(Date.now() + 60_000).toISOString() : null),
   teamLimited: (until) => store.setQuotaWindow({ window: 'team', utilization: null, resets_at: until, status: 'rejected', observed_at: new Date().toISOString() }),
 })
 const engine = new RequestEngine(store, bus, projects, root, runner)
