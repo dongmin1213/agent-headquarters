@@ -205,3 +205,87 @@ reconcile은 1분마다 실행한다.
 19. DB 이전: WAL에만 있는 커밋 행이 새 DB에 있다(VACUUM INTO). 두 번째 시작에서는 다시 복사하지 않는다.
 
 실행: `npx tsc --noEmit`, `node --test test/unit/`. 가짜 claude: `test/unit/fixtures/fake-claude.ts`. 프롬프트의 `[[FAKE:...]]` 마커나 argv(`--json-schema` 유무, `--resume`)로 동작을 고른다.
+
+---
+
+## v3 변경 지시 (execution.md v3 §21 반영)
+v2 구현(현재 main 통합본) 위에서 아래를 바꾼다. 판단은 여기까지, 구현은 작업자. 다르거나 불가능하면 멈추고 보고.
+
+### V1. 저장소 격리 (§6.1) — `git.ts`, `worker.ts`, `runner.ts`, `integration.ts`, `merge.ts`, `sandbox.ts`
+- 새 모듈 `exec/repos.ts`
+  - `ensureMirror(project): Promise<mirrorPath>`: 없으면 `git clone --bare --no-local <project> <mirror>`, 있으면 프로젝트에서 `fetch`(모든 브랜치·태그).
+  - `hqGit(gitDir, workTree?, args)`: hq의 모든 git 호출 진입점. §6.1의 `-c`·환경 옵션을 항상 붙인다. 기존 `git()` 호출을 전부 이것으로 옮긴다.
+  - `newWorkClone(mirror, path, baseSha)`: `git clone --shared --no-checkout <mirror> <path>` → 복제본에서 `checkout -b hq-work <baseSha>`. 이 한 번만 hq가 복제본 안에서 git을 실행한다. 생성 직후라 아직 작업자가 건드리지 않았다.
+  - `fetchWork(mirror, clonePath, attemptId, ref)`: 미러에서 `fetch <clone> +refs/heads/hq-work:<ref>`. 반환은 ref의 SHA.
+  - `verifyWorktree(mirror, path, sha)`: 미러에서 `worktree add --detach`.
+- 작업 시도 종료 후 판정(§8.8)의 git 사실은 모두 **fetch한 미러 ref 기준**으로 계산한다(`files_modified` = `diff --name-only base..<fetched>`, 작업 트리 깨끗함은 복제본에서 git을 돌리지 않고 확인할 수 없으므로 **요구 사항에서 뺀다**: 커밋되지 않은 변경은 fetch되지 않으므로 결과에 포함되지 않을 뿐이다. 대신 report에 "미커밋 변경 없음"을 쓰도록 프롬프트에 둔다).
+- 검증(§9)·검토(§10)·통합(§12)은 `verifyWorktree`로 만든 worktree에서. 샌드박스 프로필: 그 worktree 쓰기 허용, 미러는 읽기만.
+- 병합: `git -C <project> fetch <mirror> <integration_sha>` 후 `merge --ff-only`(사용자 hook은 그대로).
+- 기존 테스트의 git worktree 기반 fixture는 새 구조로 옮긴다. 테스트 추가(샌드박스 실제 실행):
+  - 작업자 복제본에서 `.git/hooks/post-merge`, `core.fsmonitor`, `.git` 파일 바꿔치기, `git replace`를 시도한 뒤 hq의 fetch·검증·통합·병합 전체 흐름을 실행한다. 표식 파일이 생기지 않고, replace가 결과에 영향이 없어야 한다.
+  - 검사 명령이 `git update-index --assume-unchanged`를 시도하면 실패한다(미러 index 쓰기 거부). 소스 변경은 전후 비교로 잡힌다.
+
+### V2. 샌드박스 프로필 (§6.2)
+- 보호 경로는 `file-read-data`·`file-write*`만 거부하고 `file-read-metadata`는 허용한다(조상 폴더 lstat). 실사용 회귀 테스트로 추가: `$HQ_HOME` 아래 검증 worktree에서 `node -e "import('./x.js')"`와 `npm test`가 성공해야 한다.
+- 읽기 거부 추가: `~/.ssh ~/.aws ~/.config/gh ~/.netrc ~/.docker/config.json ~/Library/Keychains`, 다른 프로젝트의 `.env*`, 토큰 파일 폴더(`HQ_TOKEN_FILE` 반영).
+- `~/.claude`: 쓰기는 런타임 하위 폴더만. 실측으로 최소 집합을 정한다. 방법: 쓰기 거부 상태에서 `claude -p --model haiku` 한 줄 응답을 실행하고, 실패하거나 경고하는 경로만 추가한다. 최종 집합과 근거를 보고한다. `settings*.json`, `CLAUDE.md`, `skills|agents|commands|plugins|hooks/`는 반드시 거부. `~/.claude.json*`은 허용(한계).
+- 실행 거부: `/usr/bin/open`, `/usr/bin/osascript`, `/bin/launchctl`, appleevent-send.
+
+### V3. 판정·검증 규칙
+- 기준선 면제 삭제(§9). acceptance `kind` 처리: `new`는 반드시 통과. base에서도 통과하면 경고를 기록한다. `regression`이 base에서 실패하면 그 항목을 `manual`로 바꿔 검토자에게 넘기고 "기존 실패"로 표시한다. 캐시 키는 `sha256(setup+check)`.
+- CEO 스키마(`ceo.ts`)
+  - acceptance에 `kind` 필수.
+  - `validate()`가 check의 `&&`, `||`, `|`, `;`, 백틱, `$(`, 줄바꿈을 거부한다(`manual` 제외).
+- verdict(§10)
+  - tests_run은 **정확 일치**만 인정한다. 공백 정규화 후 같은 명령이어야 하고, 부분 일치는 삭제한다.
+  - 종료 코드는 `is_error=false`면 0, `Exit code N` 접두어면 N, 그 외는 알 수 없음으로 보고 무효 처리한다.
+  - `|`, `||`, `;`, `true`로 끝나는 명령은 근거로 인정하지 않는다.
+  - `pass=true`면 모든 exit_code가 0이어야 한다.
+  - 판정 직전에 Bash 실행 기록을 DB(`bash_runs` 테이블 또는 attempt JSON 컬럼)에 저장한다.
+- 검토 프롬프트에 "테스트 명령은 하나씩, 이어 붙이지 말고, 실행한 문자열 그대로 tests_run에 적을 것"을 추가한다.
+- 형식 실수 자동 재시도 1회(§8.4).
+- L0 검토 none + 보호 경로 변경 → review_model sonnet.
+- collect L2 이상 → 검토한다.
+
+### V4. 수명·세대·결정 원자성
+- 시도 번호 n은 종류별 순번(`max+1`)이다. resume 프롬프트 첫 줄에 "이전 지시의 out 경로와 attempt_token은 폐기됨. 새 경로: …, 새 토큰: …"를 넣는다.
+- tasks `generation`(§7.7): 무효화·취소·수정 적용 시 증가시키고, 살아 있는 시도 종료를 확인한다. 모든 판정·전이 SQL은 `where generation = ?` 조건부로 쓴다.
+- 고아 없음 + pid 없음 → `blocked`("시작 여부 불명확"). `start_failed` 자동 재시작을 폐지한다.
+- 검사·통합 프로세스도 pid를 기록하고, 복구 때 남은 그룹을 종료한다.
+- 병합 intent에 기대 결과 SHA를 둔다. 복구 시 `HEAD == integration_sha`면 merged, `HEAD == target_sha`면 카드를 재제시하고, 그 밖은 stale로 처리한다.
+- `daemon.lock`은 `O_EXCL` 생성 + stale 판정(§7.8).
+- **결정 원자성**: `POST /api/approvals/:id`는 server에서 바로 decide하지 않는다. `runner.decide(id, decision, subjectHash)`가 한 트랜잭션에서 카드 소비와 상태 전이를 함께 처리한다. 같은 결정을 재전송하면 같은 응답을 준다.
+- accept 카드의 `반려` 결정은 409("사유와 함께 반려 버튼을 써 주세요")로 거부한다.
+- `/reject`에는 `reason`(비어 있으면 400)과 `subjectHash`가 필요하다. plan `반려`는 요청을 `rejected`로 바꾼다.
+- blocked 결정의 revision = task별 `block_count`(막힐 때마다 +1). DecisionItem.revision이 이 값이다.
+- 수정 턴 자동 적용은 brief·title 변경일 때만 한다. 적용 전에 전체 `validate()`를 실행한다.
+- 무효화 대상에 collect 보고서 해시 변경을 포함한다.
+
+### V5. 한도·슬롯 (§13)
+- `overageStatus` 무시. rejected 판정은 최상위 `rate_limit_info.status` + `rateLimitType`로 한다. resetsAt 없는 rejected·429 → 15·30·60분 지수 대기(kv 타이머).
+- "Not logged in" 결과 → 전역 hold + DecisionItem kind `blocked` 대신 새 종류? → **types 변경 없이** 요청 무관 카드로 approval `system:login`(옵션 `다시 확인`)을 만든다. 결정하면 hold를 풀고 다음 시작에서 재확인한다.
+- 슬롯: normal은 `maxWorkers`(작업·검토) + CEO 1. save·관측 없음은 전체 1이고 CEO 턴이 우선한다(배정 전에 CEO 대기 큐 확인).
+- 검토 limited 연속 3 → blocked. 작업 누적 시간은 3×wall 상한. hq가 kill했으면 runaway가 우선한다.
+- 사람 retry는 **같은 모델**, attempts = maxAttempts−1, rework.
+
+### V6. 기존 요청 호환
+DB에 v2 형식으로 남은 task·attempt는 마이그레이션으로 generation 0, block_count 0을 채운다. 진행 중인 v2 요청은 재시작 복구에서 `blocked` + "v3 전환: 다시 시작하려면 한 번 더"로 둔다.
+
+### 테스트 추가 (V1~V5 각각 최소 1개, 실제 sandbox-exec·임시 repo·가짜 claude)
+1. 탈출 시도 4종 무효
+2. 메타데이터 lstat 성공
+3. `~/.claude` 보호 파일 쓰기 거부(가짜 HOME으로)
+4. new 기준 미구현 → fail
+5. regression 기존 실패 → manual
+6. tests_run 부분 일치 → 무효, 파이프 → 무효, exit 1 + pass → 무효
+7. check `&&` → validate 오류
+8. 형식 실수 → 자동 재시도 1회 → 두 번째는 blocked
+9. generation: 무효화 중 늦게 끝난 시도 결과가 반영되지 않음
+10. pid 없음·고아 없음 → blocked
+11. 승인 결정 재전송 → 같은 응답, 전이 1번
+12. accept 반려 결정 → 409
+13. overageStatus rejected + status allowed → 정상
+14. resetsAt 없는 rejected → 15분 대기
+15. Not logged in → system:login 카드
+16. save 모드에서 CEO 우선
+17. 병합 복구 3가지
