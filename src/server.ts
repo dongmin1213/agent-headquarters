@@ -46,7 +46,7 @@ export function startServer(port: number, store: Store, bus: Bus, scheduler: Sch
       if (req.method === 'GET' && url.pathname === '/api/state') {
         const snap: Snapshot = { updatedAt: new Date().toISOString(), lastEventId: store.lastEventId(), teams: scheduler.views(),
           approvals: store.openApprovals(), requests: requestViews(store), projects: projects.map((p) => ({ id: p.id, name: p.name })),
-          limit: { blockedUntil: scheduler.blockedUntil() }, workers: [], headline: { text: '', needsYou: 0 }, quota: null }
+          limit: { blockedUntil: scheduler.blockedUntil() }, workers: [], headline: { text: '', needsYou: 0 }, quota: null, decisions: [] }
         return json(res, 200, snap)
       }
       if (req.method === 'GET' && url.pathname === '/api/events') return bus.subscribe(res)

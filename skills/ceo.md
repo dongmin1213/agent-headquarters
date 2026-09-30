@@ -23,10 +23,10 @@
 ## 역할별 모델
 | 역할 | L0 | L1 | L2 | L3 |
 |---|---|---|---|---|
-| collect (읽기 전용 수집) | haiku | haiku | haiku | haiku |
-| implement (구현·수정·초안) | sonnet | sonnet | opus | opus |
-| verify (검증) | none(기계 검사) | sonnet | opus | opus |
-정해진 변환·다운로드·렌더처럼 판단이 없는 일은 model을 `none`으로 두고 command로 처리한다.
+| collect (읽기 전용 조사·수집) | haiku | haiku | sonnet | sonnet |
+| implement (구현·수정·문서 작성) | sonnet | sonnet | opus | opus |
+| 검토 (task.review.model) | none(기계 검사만) | sonnet | opus | opus |
+판단이 모두 지시서에 확정된 기계적 구현이면 낮은 모델로 충분하다. 판단이 남는 작업만 opus.
 
 ## 작업(task) 작성 규칙
 - 작업 하나는 프로젝트 하나 안에서 끝난다. 순서는 depends_on으로 표현한다.
@@ -43,8 +43,8 @@
   확인하지 않은 것을 사실처럼 쓰지 않는다. 추측이 필요한 곳은 조사 작업(collect)을 먼저 둔다.
 - brief 마지막에 항상: "지시서와 코드 현실이 다르거나 지시가 모호하면 스스로 설계하지 말고 outcome blocked로 멈추고, 어느 지시가 무엇과 어떻게 다른지 증거와 함께 적을 것."
 - 지시가 구체적일수록 작업자 모델을 낮출 수 있다: 정해진 변경의 기계적 구현은 sonnet(L0~L1), 판단이 남는 작업만 opus.
-- 구현 작업마다 검증 작업(role verify, depends_on 그 작업)을 둔다. 검증자는 구현자와 다른 세션이며 코드를 고치지 않는다.
-- 외부 게시·업로드·결제·삭제가 포함되면 그 작업을 external: true로 표시한다(실행 전 회장 승인).
+- 검증 작업을 따로 만들지 않는다. 구현 작업의 `review`에 검토 지시(무엇을 특히 확인할지)와 검토 모델을 적는다. hq가 수용 기준 check를 직접 다시 실행하고, 새 세션·새 worktree에서 검토를 돌린다.
+- 외부 게시·업로드·결제·원격 삭제·push는 지원하지 않는다. 그런 요청이면 계획 대신 질문으로 범위를 좁히거나, 로컬 결과물까지만 계획한다.
 
 ## 금지
 - 비밀 파일(.env, 자격 증명) 읽기·인용

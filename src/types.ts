@@ -52,7 +52,7 @@ export interface RequestView {
   id: string
   project: string
   text: string
-  /** queued | thinking | asking | planned | approved | executing | awaiting_acceptance | accepted | merging | merged | rejected | failed | blocked | cancelled */
+  /** queued | thinking | asking | planned | approved | executing | awaiting_acceptance | accepted | merging | merged | rejected | failed | blocked | cancelled | expired */
   status: string
   note: string | null
   turns: number
@@ -65,10 +65,10 @@ export interface RequestView {
 }
 
 export type TaskStatus = 'pending' | 'running' | 'verifying' | 'reviewing' | 'passed' | 'rework' | 'revising' | 'question' | 'held' | 'blocked' | 'cancelled'
-export type AttemptStatus = 'starting' | 'running' | 'succeeded' | 'failed' | 'brief_blocked' | 'question' | 'limited' | 'runaway' | 'unverifiable' | 'start_failed'
+export type AttemptStatus = 'starting' | 'running' | 'succeeded' | 'failed' | 'brief_blocked' | 'question' | 'limited' | 'transient' | 'runaway' | 'unverifiable' | 'start_failed'
 
 export interface TaskView {
-  /** "<requestId>/<taskKey>" */
+  /** "<requestId>.<taskKey>" (URL-safe; clients still percent-encode path segments) */
   id: string
   key: string
   requestId: string
@@ -84,9 +84,12 @@ export interface TaskView {
   /** Last human-readable activity line of the current attempt. */
   lastActivity: string | null
   /** Worker questions waiting for the chairman (status = question). */
-  questions: { question: string; options: string[]; default: string }[]
+  questions: { id: string; question: string; options: string[]; default: string }[]
   note: string | null
   headSha: string | null
+  /** Brief revision (bumped by CEO revise turns); decisions must echo it. */
+  revision: number
+  reviewModel: string | null
   updatedAt: string
 }
 
@@ -111,6 +114,7 @@ export interface Verdict {
   criteria: { id: string; result: 'pass' | 'fail' | 'manual'; evidence: string }[]
   tests_run: { command: string; exit_code: number; summary: string }[]
   /** Filled by hq, never by the reviewer. */
+  protectedChanges?: string[]
   task?: string; head_sha?: string; base_sha?: string; reviewer_model?: string; implementer_model?: string; sameFamily?: boolean
 }
 
@@ -130,6 +134,7 @@ export interface WorkerView {
   role: string
   /** Model alias used for the character (haiku | sonnet | opus). */
   model: string
+  /** verify = hq's own acceptance checks (model "hq"). */
   kind: 'work' | 'review' | 'verify'
   state: 'running' | 'verifying' | 'reviewing' | 'held'
   bubble: string
@@ -138,12 +143,31 @@ export interface WorkerView {
 
 export interface Headline { text: string; needsYou: number }
 
+/** Everything the chairman can act on, in display order (see execution.md §17). */
+export interface DecisionItem {
+  kind: 'plan' | 'ceo_question' | 'worker_question' | 'revise' | 'blocked' | 'integration' | 'accept' | 'merge'
+  /** Stable id: approval id, question id, or task id. Notifications dedupe on id + revision. */
+  id: string
+  revision: number
+  requestId: string
+  taskId: string | null
+  title: string
+  detail: string
+  /** Button labels; answers/decisions go to the endpoint for this kind (execution.md §15). */
+  options: string[]
+  /** For approval-backed kinds. */
+  subjectHash: string | null
+  createdAt: string
+}
+
 export interface QuotaView {
+  /** Every observed window (five_hour, seven_day, …); expired windows are omitted. */
+  windows: { name: string; utilization: number | null; resetsAt: string | null; status: string | null }[]
   fiveHour: number | null
   sevenDay: number | null
   fiveHourResetsAt: string | null
   sevenDayResetsAt: string | null
-  /** normal | save | review_only | hold */
+  /** normal | save | hold | unobserved */
   mode: string
   observedAt: string | null
 }
@@ -160,6 +184,7 @@ export interface Snapshot {
   workers: WorkerView[]
   headline: Headline
   quota: QuotaView | null
+  decisions: DecisionItem[]
 }
 
 export interface HqEvent {
