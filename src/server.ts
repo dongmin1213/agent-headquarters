@@ -26,13 +26,28 @@ const RESERVED = /^(plan|accept|merge|revise|integration):/
 const FILES: Record<string, 'out' | 'hq'> = { 'report.md': 'out', 'done.json': 'out', 'checks.json': 'hq', 'verdict.json': 'hq', 'stderr.log': 'hq' }
 
 // Pet/CLI requests carry the app token and come from localhost without a browser Origin,
-// so a web page or another user cannot forge an approval.
-function authorized(req: IncomingMessage, token: string, port: number): boolean {
-  if ((req.headers.host ?? '') !== `127.0.0.1:${port}`) return false
-  if (req.headers.origin) return false
-  const got = Buffer.from(String(req.headers.authorization ?? '').replace(/^Bearer /, ''))
+// so a web page or another user cannot forge an approval. A team run's scoped token is a narrower caller.
+export type Caller = { kind: 'master' } | { kind: 'team'; teamId: string }
+const MASTER: Caller = { kind: 'master' }
+const TEAM_FORBIDDEN = '팀 토큰으로는 할 수 없는 요청이에요'
+
+function authorize(req: IncomingMessage, token: string, port: number, scheduler: Scheduler): Caller | null {
+  if ((req.headers.host ?? '') !== `127.0.0.1:${port}`) return null
+  if (req.headers.origin) return null
+  const raw = String(req.headers.authorization ?? '').replace(/^Bearer /, '')
+  const got = Buffer.from(raw)
   const want = Buffer.from(token)
-  return got.length === want.length && timingSafeEqual(got, want)
+  if (got.length === want.length && timingSafeEqual(got, want)) return MASTER
+  const teamId = scheduler.teamOfToken(raw)
+  return teamId ? { kind: 'team', teamId } : null
+}
+
+/** A team may read the quota, post its own cards and read them back — never decide or see anything else. */
+function teamMayCall(method: string, parts: string[], teamId: string): boolean {
+  const p = parts.join('/')
+  if (method === 'GET' && p === 'api/quota') return true
+  if (method === 'POST' && p === 'api/approvals') return true
+  return method === 'GET' && parts.length === 3 && parts[0] === 'api' && parts[1] === 'approvals' && parts[2].startsWith(`team:${teamId}:`)
 }
 
 class HttpError extends Error {
@@ -40,7 +55,7 @@ class HttpError extends Error {
   constructor(status: number, message: string) { super(message); this.status = status }
 }
 
-export type ApiRouter = (req: IncomingMessage, res: ServerResponse) => Promise<void>
+export type ApiRouter = (req: IncomingMessage, res: ServerResponse, caller?: Caller) => Promise<void>
 
 export interface ServerDeps { port: number; store: Store; bus: Bus; scheduler: Scheduler; token: string; engine: RequestEngine; runner: Runner; projects: Project[] }
 
@@ -74,7 +89,7 @@ function attemptView(a: { id: string; task_id: string; kind: string; n: number; 
 
 export function createApi(d: ServerDeps): ApiRouter {
   const { store, bus, scheduler, engine, runner, projects } = d
-  return async (req, res) => {
+  return async (req, res, caller = MASTER) => {
     try {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
       // Path ids are decoded exactly once.
@@ -84,6 +99,7 @@ export function createApi(d: ServerDeps): ApiRouter {
       const is = (method: string, ...shape: (string | null)[]) => m === method && parts.length === shape.length && shape.every((s, i) => s === null || s === parts[i])
       const ok = (data: unknown, status = 200) => json(res, status, data)
       const conflict = (err: string | null, data: unknown = { ok: true }) => (err ? json(res, 409, { error: err }) : json(res, 200, data))
+      if (caller.kind === 'team' && !teamMayCall(m, parts, caller.teamId)) throw new HttpError(403, TEAM_FORBIDDEN)
 
       if (is('GET', 'api', 'state')) return ok(snapshot(d))
       if (is('GET', 'api', 'events')) return bus.subscribe(res)
@@ -163,6 +179,7 @@ export function createApi(d: ServerDeps): ApiRouter {
           const b = await body(req)
           if (!str(b.id) || !str(b.teamId) || !str(b.title) || !str(b.subjectHash) || !Array.isArray(b.options) || b.options.length === 0)
             throw new HttpError(400, 'id, teamId, title, subjectHash, options가 필요합니다')
+          if (caller.kind === 'team' && b.teamId !== caller.teamId) throw new HttpError(403, TEAM_FORBIDDEN)
           if (RESERVED.test(b.id) || !b.id.startsWith(`team:${b.teamId}:`)) throw new HttpError(400, `팀 카드 id는 "team:${b.teamId}:"로 시작해야 합니다`)
           const minutes = Math.min(Math.max(Number(b.expiresInMinutes ?? 24 * 60), 1), 7 * 24 * 60)
           store.upsertApproval({ id: b.id, teamId: b.teamId, title: b.title, body: str(b.body) ? b.body : '', options: b.options.map(String),
@@ -216,9 +233,13 @@ export function startServer(d: ServerDeps) {
     try {
       const path = (req.url ?? '/').split('?')[0]
       if (path === '/ui' || path.startsWith('/ui/') || path.startsWith('/ui-api/')) return await web.handle(req, res)
-      if (!authorized(req, d.token, d.port)) return json(res, 401, { error: '인증되지 않았습니다' })
-      if (path === '/api/ui-code' && req.method === 'POST') return json(res, 200, { url: web.issueLoginUrl() })
-      await routeApi(req, res)
+      const caller = authorize(req, d.token, d.port, d.scheduler)
+      if (!caller) return json(res, 401, { error: '인증되지 않았습니다' })
+      if (path === '/api/ui-code' && req.method === 'POST') {
+        if (caller.kind !== 'master') return json(res, 403, { error: TEAM_FORBIDDEN })
+        return json(res, 200, { url: web.issueLoginUrl() })
+      }
+      await routeApi(req, res, caller)
     } catch (e) {
       json(res, 500, { error: `서버 오류: ${String(e).slice(0, 200)}` })
     }
