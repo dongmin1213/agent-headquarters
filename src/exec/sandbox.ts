@@ -69,11 +69,12 @@ export const MACH_SERVICES: [string, string][] = [
  * cookies, browser profiles, ~/Documents, shell rc files …) is content-denied. Entries ending in '/' are folders.
  * Measured one at a time with the real worker run + git/npm/node workloads: only Library/Keychains is strictly
  * required (denied → "Not logged in"); the rest are design allowances whose denial did not break a run today.
+ * ~/.claude and ~/.claude.json are NOT listed: the CLI (-p, --setting-sources "", then --resume) runs with both
+ * unreadable except its own projects/<encoded cwd>/ folder, which is granted separately (other projects'
+ * transcripts and memory stay unreadable).
  */
 export const HOME_READABLE: [string, string][] = [
   ['Library/Keychains/', 'REQUIRED: login keychain holds the subscription token (items stay ACL-gated by securityd)'],
-  ['.claude/', 'CLI state; --resume reads its own projects/<cwd>/ transcript (writes are limited separately)'],
-  ['.claude.json', 'CLI account/config file, read on start (writes denied: the CLI runs and resumes without them)'],
   ['.local/bin/', 'the `claude` launcher symlink (exec itself works without read access)'],
   ['.local/share/claude/', 'the CLI versions/<v> binary the launcher resolves to'],
   ['.gitconfig', 'user git config (identity fallback, aliases, safe.directory)'],
@@ -82,7 +83,7 @@ export const HOME_READABLE: [string, string][] = [
 ]
 
 /**
- * ~/.claude writes: only the worker's own projects/<encoded cwd>/ folder (transcript; --resume needs it).
+ * ~/.claude writes: only the worker's own projects/<encoded cwd>/ folder (transcript; --resume needs it), minus its memory/.
  * Measured on 2.1.285 (-p, haiku, Read + Bash + Write, then --resume): it tries backups/, cache/model-catalog/,
  * session-env/, sessions/, shell-snapshots/, ~/.local/state/claude/locks and ~/.claude.json(.lock|.tmp.*), and every
  * one of those writes can be denied without breaking the run.
@@ -120,6 +121,10 @@ export function sandboxProfile(o: SandboxOpts): string {
   const claudeOwn = proj.truncated
     ? rx(`^${reEsc(join(claudeDir, 'projects', proj.name))}-[^/]*(/|$)`)
     : sub(join(claudeDir, 'projects', proj.name))
+  // Its memory/ is loaded into later sessions in the same clone: never writable (a worker cannot plant instructions).
+  const claudeOwnMemory = proj.truncated
+    ? rx(`^${reEsc(join(claudeDir, 'projects', proj.name))}-[^/]*/memory(/|$)`)
+    : sub(join(claudeDir, 'projects', proj.name, 'memory'))
   const homeRead = HOME_READABLE.map(([p]) => (p.endsWith('/') ? sub(join(home, p.slice(0, -1))) : lit(join(home, p))))
   const secretContents = [
     sub(real(o.tokenDir)), rx(`^${reEsc(hq)}/hq\\.db`), sub(join(hq, 'runs')), sub(join(hq, 'logs')), sub(join(hq, 'work')),
@@ -139,7 +144,7 @@ export function sandboxProfile(o: SandboxOpts): string {
     ...MACH_SERVICES.map(([n, why]) => `(allow mach-lookup (global-name ${q(n)})) ; ${why}`),
     // S2: $HOME, $HQ_HOME and project checkouts are unreadable except the measured list, the mirror and own paths.
     `(deny file-read-data ${[sub(home), sub(hq), ...projects.map(sub)].join(' ')})`,
-    `(allow file-read-data ${[...homeRead, ...extra.map(sub), ...(o.mirror ? [sub(real(o.mirror))] : []), ...(o.readable ?? []).map((p) => sub(real(p)))].join(' ')})`,
+    `(allow file-read-data ${[...homeRead, ...extra.map(sub), ...(o.mirror ? [sub(real(o.mirror))] : []), ...(o.readable ?? []).map((p) => sub(real(p))), claudeOwn].join(' ')})`,
     `(deny file-read-data file-write* ${secretContents.join(' ')})`,
     `(allow file-read-data file-write* ${own.map(sub).join(' ')})`,
     // S3/S4: writes only to own paths, temp, the worker's own ~/.claude/projects/<cwd>/ folder and extraWritable.
@@ -150,7 +155,7 @@ export function sandboxProfile(o: SandboxOpts): string {
     `(allow file-write* ${own.map(sub).join(' ')})`,
     // ~/.claude and ~/.claude.json* are denied explicitly too, so the rule holds even when $HOME sits under a temp root.
     `(deny file-write* (require-all ${sub(claudeDir)} (require-not ${claudeOwn})) ${rx(`^${reEsc(home)}/\\.claude\\.json`)})`,
-    `(deny file-write* ${claudeControl.join(' ')})`,
+    `(deny file-write* ${[...claudeControl, claudeOwnMemory].join(' ')})`,
     '(deny process-exec (literal "/usr/bin/open") (literal "/usr/bin/osascript") (literal "/bin/launchctl"))',
     '(deny appleevent-send)',
     `(deny network-outbound (remote ip ${q(`localhost:${o.hqPort}`)}))`,
