@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { hqDirOf } from './decisions.ts'
 import { revParse } from './git.ts'
 import type { Runner } from './runner.ts'
-import { killGroup, sameProcessAlive } from './worker.ts'
+import { identify, killGroup } from './worker.ts'
 import { readJson } from './fsx.ts'
 
 export interface Violation { requestId: string; taskId: string | null; problem: string }
@@ -16,7 +16,14 @@ export async function recover(d: Runner): Promise<void> {
     if (!att.pid) {
       // Spawned but the pid never reached the DB: process.json, then a process running this session id.
       const info = readJson<{ pid: number; lstart: string | null; startedAt: string }>(join(hqDirOf(att), 'process.json'))
-      const found = info && await sameProcessAlive(info.pid, info.lstart, info.startedAt) ? info.pid : await d.findOrphan(att.session_id)
+      if (info) {
+        // It did start. Whatever its identity now, the tick judges it: `same` is supervised, `gone`/`other` are finished
+        // from their evidence without a signal, `unknown` stops the task (§22).
+        s.updateAttempt(att.id, { status: 'running', pid: info.pid, lstart: info.lstart, started_at: att.started_at ?? info.startedAt })
+        d.track({ ...att, status: 'running', pid: info.pid, lstart: info.lstart }, info.pid, info.lstart, info.startedAt, null)
+        continue
+      }
+      const found = await d.findOrphan(att.session_id)
       if (found) { await d.adopt(att, found); continue }
       // No orphan: never restart automatically — a duplicate run is worse than a stop (§7.3).
       s.tx(() => {
@@ -26,14 +33,15 @@ export async function recover(d: Runner): Promise<void> {
       })
       continue
     }
-    const alive = await sameProcessAlive(att.pid, att.lstart, att.started_at)
+    // Identity (same / gone / other / unknown) is decided by the tick on every poll; nothing is signalled here.
     if (att.status === 'starting') s.updateAttempt(att.id, { status: 'running' })
-    d.track({ ...att, status: 'running' }, att.pid, att.lstart, att.started_at, null, !alive)
+    d.track({ ...att, status: 'running' }, att.pid, att.lstart, att.started_at, null)
   }
-  // Leftover check / setup / integration process groups from before the restart are killed; their jobs rerun.
+  // Leftover check / setup / integration process groups from before the restart are killed only when their identity
+  // (pid + recorded start time) is confirmed; their jobs rerun.
   for (const row of s.raw().prepare("select key, value from kv where key like 'proc:%'").all() as { key: string; value: string }[]) {
-    const p = JSON.parse(row.value) as { pid: number; startedAt: string }
-    if (await sameProcessAlive(p.pid, null, p.startedAt)) killGroup(p.pid, 'SIGKILL')
+    const p = JSON.parse(row.value) as { pid: number; lstart?: string | null }
+    if (await identify(p.pid, p.lstart ?? null, d.probe.lstart) === 'same') killGroup(p.pid, 'SIGKILL')
     s.set(row.key, null)
   }
   // CEO turns do not survive a restart.

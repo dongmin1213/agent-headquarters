@@ -1,11 +1,11 @@
 // ps may be unavailable (setuid exec is denied inside a sandbox): a launched worker must still be tracked,
-// and liveness falls back to kill(pid, 0).
+// but its identity is then `unknown` (never treated as ours from liveness alone).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { killGroup, launch, pidAlive, readProcessInfo, sameProcessAlive } from '../../src/exec/worker.ts'
+import { identify, killGroup, launch, pidAlive, readProcessInfo } from '../../src/exec/worker.ts'
 import { tmp } from './helpers.ts'
 import { useFakeSandboxIfNested } from '../nested.ts'
 
@@ -31,18 +31,19 @@ for (const [name, ps] of [['throws synchronously', throwingPs], ['rejects', reje
       assert.ok(l.info.pid > 0)
       assert.deepEqual(readProcessInfo(hqDir), l.info, 'process.json records the running worker')
       assert.equal(pidAlive(l.info.pid), true)
-      assert.equal(await sameProcessAlive(l.info.pid, l.info.lstart, l.info.startedAt, ps), true)
+      assert.equal(await identify(l.info.pid, l.info.lstart, ps), 'unknown', 'alive but unconfirmable')
     } finally { killGroup(l.info.pid, 'SIGKILL') }
   })
 }
 
-test('sameProcessAlive: ps failing falls back to kill(pid, 0) liveness; a dead pid is dead; a real lstart mismatch is not the same process', async () => {
+test('identify: ps failing → unknown (no liveness fallback); a dead pid is gone; lstart mismatch is other; match is same', async () => {
   for (const ps of [throwingPs, rejectingPs, async () => null]) {
-    assert.equal(await sameProcessAlive(process.pid, 'Mon Jan  1 00:00:00 2001', null, ps), true)
+    assert.equal(await identify(process.pid, 'Mon Jan  1 00:00:00 2001', ps), 'unknown')
   }
   const c = spawn('/usr/bin/true')
   await new Promise((r) => c.on('exit', r))
-  assert.equal(await sameProcessAlive(c.pid!, null, new Date().toISOString(), throwingPs), false)
-  assert.equal(await sameProcessAlive(process.pid, 'A', null, async () => 'B'), false)
-  assert.equal(await sameProcessAlive(process.pid, 'A', null, async () => 'A'), true)
+  assert.equal(await identify(c.pid!, 'A', throwingPs), 'gone')
+  assert.equal(await identify(process.pid, 'A', async () => 'B'), 'other')
+  assert.equal(await identify(process.pid, 'A', async () => 'A'), 'same')
+  assert.equal(await identify(process.pid, null, async () => 'A'), 'unknown', 'no recorded start time')
 })
