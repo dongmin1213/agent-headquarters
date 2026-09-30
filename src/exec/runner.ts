@@ -25,9 +25,9 @@ import { isAllowedEvent, quotaState, quotaView, recordRateLimit, rejectedWithout
 import { ensureMirror, fetchWork, hqGit, hqGitOk, mirrorChanged, mirrorPath, mirrorRev, newWorkClone, removeMirrorWorktree, verifyWorktree, wtGit, wtMerge, wtStatus } from './repos.ts'
 import { canAutoApply, reviseDiff, reviseProblem, runReviseTurn } from './revise.ts'
 import { checkVerdict, ladderUp, VERDICT_SCHEMA } from './review.ts'
-import { real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
+import { claudeBinReadable, real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
 import { extractBashRuns, lastActivityOf, StreamTail } from './stream.ts'
-import { claudeArgs, findOrphan, killGroup, launch, psLstart, sameProcessAlive, terminateGroup } from './worker.ts'
+import { claudeArgs, findOrphan, killGroup, launch, psLstart, readProcessInfo, removeCacheDir, sameProcessAlive, terminateGroup } from './worker.ts'
 import { reconcile as reconcileInvariants, recover as recoverState, type Violation } from './reconcile.ts'
 
 export type Notify = (title: string, body: string) => void
@@ -165,8 +165,10 @@ export class Runner {
   /** Mirror ref of a fetched work result. Git ref names cannot contain `~`, so the attempt id's suffix (a<n>) is used. */
   resultRef(t: TaskRow, attemptId: string): string { return `refs/hq/${t.request_id}/${t.key}/${attemptId.split('~').pop()}` }
 
-  sandboxFor(worktree: string, out: string | null): SandboxOpts {
-    return { worktree, out, hqHome: this.home, tokenDir: this.tokenDir, hqPort: this.hqPort, extraWritable: this.cfg.sandbox.extraWritable, projects: this.projects.map((p) => p.path) }
+  /** `projectId` names the mirror the worktree borrows objects from — the only part of $HQ_HOME it may read. */
+  sandboxFor(worktree: string, out: string | null, projectId: string): SandboxOpts {
+    return { worktree, out, hqHome: this.home, tokenDir: this.tokenDir, hqPort: this.hqPort, extraWritable: this.cfg.sandbox.extraWritable,
+      projects: this.projects.map((p) => p.path), mirror: this.mirror(projectId), readable: claudeBinReadable(this.cfg.claudeBin) }
   }
 
   /** Check/integration processes are recorded so a restart can kill leftover groups (§9). */
@@ -473,6 +475,8 @@ export class Runner {
       l.tail.poll((line, s) => { if (s.rateLimit) this.observe(line) })
       this.live.delete(att.id)
       terminateGroup(l.pid, KILL_GRACE_MS) // background processes the worker left behind (§7.4)
+      const cacheDir = readProcessInfo(hqDirOf(att))?.cacheDir // per-launch package cache (§6.2), gone with the group
+      setTimeout(() => removeCacheDir(cacheDir), KILL_GRACE_MS + 1_000).unref()
       const fresh = this.store.attempt(att.id)!
       try {
         if (fresh.kind === 'review') await this.finalizeReview(fresh, l)
@@ -747,7 +751,7 @@ export class Runner {
   private async runSetup(project: Project, wt: string, hq: string, name: string): Promise<void> {
     if (!project.setup) return
     const prof = join(hq, `${name}.sb`)
-    atomicWrite(prof, sandboxProfile(this.sandboxFor(wt, null)))
+    atomicWrite(prof, sandboxProfile(this.sandboxFor(wt, null, project.id)))
     const p = this.procTracker(name)
     try {
       const s = await runSandboxed(project.setup, wt, this.cfg.checkTimeoutMinutes * 60_000, prof, 'setup', p.onSpawn)
@@ -797,7 +801,7 @@ export class Runner {
       }
       const argv = claudeArgs(this.cfg, { role, model: att.model, sessionId: att.session_id, resume, out })
       const { info, child } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd, hqDir: hq, outDir: out, prompt, sessionId: att.session_id,
-        sandbox: this.sandboxFor(cwd, out),
+        sandbox: this.sandboxFor(cwd, out, t.project),
         spec: { attemptId, kind: 'work', role, model: att.model, base: t.base_sha, generation: att.generation, attempt_token: att.attempt_token, resume, startedAt: this.iso() } })
       const startedAt = this.iso()
       this.store.tx(() => {
@@ -851,7 +855,7 @@ export class Runner {
     try {
       const res = await baseline({ mirror: this.mirror(t.project), base: t.base_sha!, path: this.worktreeDir(t.request_id, `${t.key}.baseline`),
         checks: missing.map((a) => ({ id: a.id, command: a.check })), setup: project.setup ?? null, timeoutMs: this.cfg.checkTimeoutMinutes * 60_000,
-        sandbox: (wt) => this.sandboxFor(wt, null), profilePath: join(hq, 'baseline.sb'), onSpawn: p.onSpawn })
+        sandbox: (wt) => this.sandboxFor(wt, null, t.project), profilePath: join(hq, 'baseline.sb'), onSpawn: p.onSpawn })
       for (const a of missing) {
         const b = res[a.id]
         if (!b) continue
@@ -951,7 +955,7 @@ export class Runner {
       await this.runSetup(project, wt.path, hq, 'verify-setup')
       const eff = this.effectiveChecks(t)
       const file = await runChecks({ wt, base: t.base_sha, head: t.head_sha, checks: eff.checks, basePassed: eff.basePassed,
-        timeoutMs: this.cfg.checkTimeoutMinutes * 60_000, sandbox: this.sandboxFor(wt.path, null), profilePath: checksProfile(hq), onSpawn: p.onSpawn })
+        timeoutMs: this.cfg.checkTimeoutMinutes * 60_000, sandbox: this.sandboxFor(wt.path, null, t.project), profilePath: checksProfile(hq), onSpawn: p.onSpawn })
       file.manual = file.checks.filter((c) => c.baseFailed).map((c) => c.id)
       file.baseTails = Object.fromEntries(file.manual.map((id) => [id, eff.baseTails[id] ?? '']))
       atomicJson(join(hq, 'checks.json'), file)
@@ -1020,7 +1024,7 @@ export class Runner {
         manualTails: Object.fromEntries((checks?.manual ?? []).map((id) => [id, { candidate: checks!.checks.find((c) => c.id === id)?.outputTail ?? '', base: checks!.baseTails?.[id] ?? '' }])) })
       const argv = claudeArgs(this.cfg, { role: 'review', model: att.model, sessionId: att.session_id, resume: false, out: null, schema: VERDICT_SCHEMA })
       const { info, child } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd: wt.path, hqDir: hq, outDir: null, prompt, sessionId: att.session_id,
-        sandbox: this.sandboxFor(wt.path, null),
+        sandbox: this.sandboxFor(wt.path, null, t.project),
         spec: { attemptId, kind: 'review', model: att.model, head_sha: t.head_sha, base_sha: t.base_sha, worktree: wt.path, generation: att.generation, startedAt: this.iso() } })
       const startedAt = this.iso()
       this.store.updateAttempt(attemptId, { status: 'running', pid: info.pid, lstart: info.lstart, started_at: startedAt })
@@ -1133,7 +1137,7 @@ export class Runner {
     try {
       res = await integrate({ mirror, requestId, project: projectId, path, target, heads: tasks.map((t) => ({ taskId: t.id, title: t.title, sha: t.head_sha! })),
         setup: project.setup ?? null, checks: eff.flatMap((x) => x.e.checks), timeoutMs: this.cfg.checkTimeoutMinutes * 60_000,
-        sandbox: this.sandboxFor(path, null), profilePath: join(hq, 'checks.sb'), onSpawn: p.onSpawn })
+        sandbox: this.sandboxFor(path, null, projectId), profilePath: join(hq, 'checks.sb'), onSpawn: p.onSpawn })
     } finally { p.done() }
     if (res.kind !== 'conflict' && res.checks) atomicJson(join(hq, 'checks.json'), res.checks)
     if (res.kind === 'conflict') {

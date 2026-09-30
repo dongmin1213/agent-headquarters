@@ -21,7 +21,7 @@ export interface HqConfig {
   workerDisallowedTools: string[]
   /** Globs whose changes are always flagged to the reviewer and on the acceptance card. */
   protectedPaths: string[]
-  /** Extra writable roots inside the worker sandbox (execution.md §6). */
+  /** Extra writable (and readable) roots inside the worker sandbox (execution.md §6). Package-manager caches are per run, not here. */
   sandbox: { extraWritable: string[] }
   notify: boolean
   /** Claude CLI executable (tests point this at a fake). */
@@ -39,7 +39,7 @@ export const DEFAULTS: Omit<HqConfig, 'home' | 'claudeBin'> = {
   quota: { saveAt: 0.85, holdAt: 0.95 },
   workerDisallowedTools: ['Bash(git push:*)', 'Bash(git remote:*)', 'Read(**/.env*)', 'Edit(**/.env*)', 'Write(**/.env*)'],
   protectedPaths: ['**/*.test.*', '**/*.spec.*', 'test/**', 'tests/**', '**/__tests__/**', 'package.json', '*.lock', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', '.github/**', 'tsconfig*.json', '**/*.config.*'],
-  sandbox: { extraWritable: ['~/.npm', '~/.cache', '~/Library/Caches'] },
+  sandbox: { extraWritable: [] },
   notify: true,
 }
 

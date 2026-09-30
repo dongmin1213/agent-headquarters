@@ -2,13 +2,13 @@
 // Acceptance `check` commands were shown verbatim on the approved plan card, so they run as approved —
 // but inside the sandbox, with a minimal env, stdin /dev/null, in their own process group.
 import { spawn } from 'node:child_process'
-import { lstatSync, readlinkSync } from 'node:fs'
+import { lstatSync, readlinkSync, rmSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { basename, join } from 'node:path'
 import type { CheckResult } from '../types.ts'
 import { atomicWrite } from './fsx.ts'
 import { hqGit, removeMirrorWorktree, SAFE_DIFF, verifyWorktree, wtGit, type MirrorWorktree } from './repos.ts'
-import { childEnv, sandboxProfile, wrap, type SandboxOpts } from './sandbox.ts'
+import { cacheEnv, childEnv, makeCacheDir, sandboxProfile, wrap, type SandboxOpts } from './sandbox.ts'
 
 /** `baseFailed`: a regression check that already failed on the base for an ordinary reason — still run; its failure alone does not fail the file. */
 export interface CheckSpec { id: string; command: string; kind?: 'new' | 'regression'; baseFailed?: boolean }
@@ -61,7 +61,8 @@ export function runSandboxed(command: string, cwd: string, timeoutMs: number, pr
   return new Promise((resolve) => {
     const out = new LineKeeper()
     const argv = wrap(['/bin/sh', '-c', command], profilePath)
-    const child = spawn(argv[0], argv.slice(1), { cwd, env: childEnv(), detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const cache = makeCacheDir() // per-command package-manager cache (§6.2), removed when the command ends
+    const child = spawn(argv[0], argv.slice(1), { cwd, env: childEnv(cacheEnv(cache)), detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     if (child.pid) onSpawn?.(child.pid)
     let timedOut = false
     const killGroup = (sig: NodeJS.Signals) => { try { if (child.pid) process.kill(-child.pid, sig) } catch { /* gone */ } }
@@ -73,6 +74,7 @@ export function runSandboxed(command: string, cwd: string, timeoutMs: number, pr
       clearTimeout(timer)
       // The shell may exit while its children linger in the group; make sure nothing survives.
       killGroup('SIGKILL')
+      rmSync(cache, { recursive: true, force: true })
       let tail = out.text()
       if (timedOut) tail += `\n[hq] 시간 초과 (${Math.round(timeoutMs / 1000)}초) — 프로세스 그룹 종료`
       resolve({ id, command, exitCode: timedOut ? null : code, durationMs: Date.now() - started, pass: !timedOut && code === 0, outputTail: tail, timedOut })
