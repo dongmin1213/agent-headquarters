@@ -51,6 +51,14 @@ export function loadConfig(root: string, env: NodeJS.ProcessEnv = process.env): 
   const raw: Record<string, unknown> = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {}
   const known = new Set([...Object.keys(DEFAULTS), 'home', 'claudeBin'])
   for (const k of Object.keys(raw)) if (!known.has(k)) throw new Error(`config/hq.json: 알 수 없는 키 "${k}"`)
+  // Nested objects are checked too, so removed keys (e.g. quota.reviewOnlyAt) surface instead of being ignored.
+  const nested = { attemptWallMinutes: DEFAULTS.attemptWallMinutes, models: DEFAULTS.models, quota: DEFAULTS.quota, sandbox: DEFAULTS.sandbox } as Record<string, object>
+  for (const [k, def] of Object.entries(nested)) {
+    const v = raw[k]
+    if (v === undefined) continue
+    if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`config/hq.json: "${k}"는 객체여야 합니다`)
+    for (const sub of Object.keys(v)) if (!(sub in def)) throw new Error(`config/hq.json: 알 수 없는 키 "${k}.${sub}"`)
+  }
   const c = {
     ...DEFAULTS, ...raw,
     attemptWallMinutes: { ...DEFAULTS.attemptWallMinutes, ...(raw.attemptWallMinutes as object | undefined) },
