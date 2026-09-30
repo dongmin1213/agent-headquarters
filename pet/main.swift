@@ -753,6 +753,26 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
 
     func row(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView { let r = NSStackView(views: views); r.spacing = spacing; return r }
 
+    /// Option buttons wrapped into rows (greedy, in order) so labels are never squeezed into "…".
+    /// Only a single button wider than `maxWidth` gets its own row and may truncate at the tail.
+    func buttonRows(_ buttons: [NSButton], maxWidth: CGFloat, spacing: CGFloat = 8) -> NSStackView {
+        var rows: [[NSButton]] = []; var used: CGFloat = 0
+        for b in buttons {
+            let w = b.fittingSize.width
+            if w > maxWidth {
+                b.lineBreakMode = .byTruncatingTail
+                b.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                b.widthAnchor.constraint(lessThanOrEqualToConstant: maxWidth).isActive = true
+                rows.append([b]); used = maxWidth; continue
+            }
+            b.setContentCompressionResistancePriority(.required, for: .horizontal)
+            if !rows.isEmpty, used + spacing + w <= maxWidth {
+                rows[rows.count - 1].append(b); used += spacing + w
+            } else { rows.append([b]); used = w }
+        }
+        return vstack(rows.map { row($0, spacing: spacing) }, spacing: spacing)
+    }
+
     func button(_ title: String, _ action: Selector, _ id: String, primary: Bool = false) -> NSButton {
         let b = NSButton(title: title, target: self, action: action)
         b.identifier = NSUserInterfaceItemIdentifier(id); b.isEnabled = !offline
@@ -872,7 +892,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         for a in (snapshot?.approvals ?? []) where a.teamId == t.id {
             body.addArrangedSubview(text("승인 요청: \(a.title)", weight: .semibold))
             if !a.body.isEmpty { body.addArrangedSubview(text(a.body, size: 12.5, color: Palette.muted)) }
-            body.addArrangedSubview(row(a.options.map { button($0, #selector(decide(_:)), "\(a.id)\u{1F}\($0)\u{1F}\(a.subjectHash)") }))
+            body.addArrangedSubview(buttonRows(a.options.map { button($0, #selector(decide(_:)), "\(a.id)\u{1F}\($0)\u{1F}\(a.subjectHash)") }, maxWidth: Pet.innerWidth))
         }
         if !offline { body.addArrangedSubview(button("지금 실행", #selector(runTeam(_:)), t.id)) }
         openPanel(at: c, header: header, body: body)
@@ -1009,12 +1029,12 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
             }
             let help = opts.compactMap { o in d.optionHelp?[o].map { "· \(optionLabel(d, o)): \($0)" } }
             if !help.isEmpty { card.addArrangedSubview(vstack(help.map { text($0, size: 12.5, color: Palette.muted, width: Pet.cardText) }, spacing: 3)) }
-            var buttons: [NSView] = []
+            var buttons: [NSButton] = []
             for (j, o) in opts.enumerated() {
                 if d.kind == "accept" && o == "반려" { buttons.append(button("반려…", #selector(rejectOpen(_:)), "\(i)")); continue }
                 buttons.append(button(optionLabel(d, o), #selector(decisionButton(_:)), "\(i)\u{1F}\(j)", primary: d.recommendation?.option == o))
             }
-            if !buttons.isEmpty { card.addArrangedSubview(row(buttons)) }
+            if !buttons.isEmpty { card.addArrangedSubview(buttonRows(buttons, maxWidth: Pet.cardText)) }
             if d.kind == "ceo_question" || d.kind == "worker_question" {
                 card.addArrangedSubview(freeField("직접 답하기 (엔터)", #selector(decisionFree(_:)), "\(i)"))
             }
