@@ -3,7 +3,6 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { escapeHtml } from '../../src/web/index.ts'
 // @ts-expect-error — plain browser JS module without type declarations
 import * as lib from '../../src/web/assets/lib.js'
 import { createMockApi, XSS } from './mock-api.ts'
@@ -31,8 +30,9 @@ test('assets make no external requests and use no inline script/style', () => {
   assert.doesNotMatch(js, /setAttribute\(\s*['"]style['"]/, 'no style attributes (CSP style-src self)')
 })
 
-test('escapeHtml escapes all HTML-significant characters', () => {
-  assert.equal(escapeHtml(`<script>alert("x")</script>&'`), '&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;&amp;&#39;')
+test('the page shell carries no data or secrets (it is served without auth)', () => {
+  const html = assets.find((a) => a.name === 'index.html')!.text
+  assert.doesNotMatch(html, /\{\{|csrf|token|hq_session/i)
 })
 
 // Minimal DOM stand-in: records what renderMarkdown builds without any HTML parser.
@@ -80,11 +80,12 @@ test('diff parsing counts lines per file and flags binary/new files', () => {
   assert.equal(lib.parseDiff('').length, 0)
 })
 
-test('labels, formatting and approval kinds', () => {
-  assert.deepEqual(lib.approvalKind({ id: 'merge:req-1:hq' }), { kind: 'merge', requestId: 'req-1', project: 'hq' })
-  assert.deepEqual(lib.approvalKind({ id: 'accept:req-1' }), { kind: 'accept', requestId: 'req-1' })
-  assert.deepEqual(lib.approvalKind({ id: 'plan:req-1' }), { kind: 'plan', requestId: 'req-1' })
-  assert.equal(lib.approvalKind({ id: 'blog:x' }).kind, 'other')
+test('labels and formatting', () => {
+  assert.deepEqual(lib.BLOCKED_LABEL, { retry: '한 번 더 (최상위 모델)', skip: '이 작업 건너뛰기', stop: '요청 중단' })
+  assert.equal(lib.windowLabel('five_hour'), '5시간')
+  assert.equal(lib.windowLabel('some_new_window'), 'some_new_window')
+  for (const m of ['normal', 'save', 'hold', 'unobserved']) assert.ok(lib.QUOTA_MODE[m], m)
+  for (const k of ['plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge']) assert.ok(lib.DECISION_KIND[k], k)
   assert.equal(lib.shortSha(null), '미확인')
   assert.equal(lib.shortSha('0123456789abcdef'), '0123456')
   assert.equal(lib.formatDuration(125_000), '2분 5초')
@@ -93,22 +94,28 @@ test('labels, formatting and approval kinds', () => {
   assert.equal(lib.percent(null), null)
   assert.deepEqual(lib.statusInfo(lib.TASK_STATUS, 'weird'), ['weird', 'neutral'])
   assert.deepEqual(lib.statusInfo(lib.TASK_STATUS, null), ['미확인', 'neutral'])
-  const all = ['pending', 'running', 'verifying', 'reviewing', 'passed', 'rework', 'question', 'held', 'blocked', 'cancelled']
+  const all = ['pending', 'running', 'verifying', 'reviewing', 'passed', 'rework', 'revising', 'question', 'held', 'blocked', 'cancelled']
   for (const s of all) assert.ok(lib.TASK_GROUPS.some((g: { statuses: string[] }) => g.statuses.includes(s)), `${s} has a board column`)
-  assert.deepEqual(lib.normalizeActivity([{ at: 't', kind: 'tool', text: 'x' }, 'plain']), [{ at: 't', kind: 'tool', text: 'x' }, { at: null, kind: 'message', text: 'plain' }])
-  assert.deepEqual(lib.normalizeActivity({ lines: [{ text: 'y' }] }), [{ at: null, kind: 'message', text: 'y' }])
 })
 
-test('mock fixtures cover every task status and decision kind, with hostile strings', async () => {
+test('mock fixtures follow v2 shapes: every task status, every decision kind in order, hostile strings', async () => {
   const mock = createMockApi()
   const snapRes = await callMock(mock, '/api/state')
   const snap = JSON.parse(snapRes)
   const statuses = new Set(snap.requests.flatMap((r: { tasks: { status: string }[] }) => r.tasks.map((t) => t.status)))
-  for (const s of ['pending', 'running', 'verifying', 'reviewing', 'passed', 'rework', 'question', 'held', 'blocked', 'cancelled']) assert.ok(statuses.has(s), s)
-  const kinds = new Set(snap.approvals.map((a: { id: string }) => lib.approvalKind(a).kind))
-  for (const k of ['plan', 'accept', 'merge', 'other']) assert.ok(kinds.has(k), k)
-  assert.ok(snap.requests.some((r: { status: string }) => r.status === 'asking'))
+  for (const s of ['pending', 'running', 'verifying', 'reviewing', 'passed', 'rework', 'revising', 'question', 'held', 'blocked', 'cancelled']) assert.ok(statuses.has(s), s)
+  const order = ['plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge']
+  const kinds = snap.decisions.map((d: { kind: string }) => d.kind)
+  for (const k of order) assert.ok(kinds.includes(k), k)
+  assert.deepEqual(kinds, [...kinds].sort((a: string, b: string) => order.indexOf(a) - order.indexOf(b)), 'daemon order')
+  assert.equal(snap.headline.needsYou, snap.decisions.length)
+  assert.deepEqual(snap.decisions.find((d: { kind: string }) => d.kind === 'blocked').options, ['retry', 'skip', 'stop'])
+  assert.ok(snap.quota.windows.length >= 2)
   assert.ok(snapRes.includes('<script>'))
+  const act = JSON.parse(await callMock(mock, '/api/attempts/req-7f3a9c21.runner~a2/activity?after=0'))
+  assert.ok(Array.isArray(act.lines) && act.next === act.lines.length)
+  const diff = JSON.parse(await callMock(mock, '/api/requests/req-7f3a9c21/diff?task=runner'))
+  assert.ok(Array.isArray(diff.files) && typeof diff.diff === 'string' && typeof diff.truncated === 'boolean')
   mock.close()
 })
 

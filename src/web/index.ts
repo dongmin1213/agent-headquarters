@@ -87,7 +87,7 @@ export function createWebUi(opts: { port: number; token: string; routeApi: ApiRo
     async handle(req, res) {
       enforceHeaders(res)
       // DNS rebinding: only the exact loopback host:port this daemon listens on.
-      if (req.headers.host !== host) return json(res, 403, { error: '허용되지 않은 Host예요' })
+      if (req.headers.host !== host) { req.resume(); return json(res, 403, { error: '허용되지 않은 Host예요' }) }
       const url = new URL(req.url ?? '/', origin)
       const path = url.pathname
 
@@ -122,12 +122,13 @@ export function createWebUi(opts: { port: number; token: string; routeApi: ApiRo
       if (path.startsWith('/ui-api/')) {
         const rest = path.slice('/ui-api/'.length)
         const segments = rest.split('/')
-        if (!isAllowed(req.method ?? '', segments)) return json(res, 404, { error: '찾을 수 없어요' })
+        // Rejected requests have their body drained first so the keep-alive socket stays usable.
+        if (!isAllowed(req.method ?? '', segments)) { req.resume(); return json(res, 404, { error: '찾을 수 없어요' }) }
         const isEvents = req.method === 'GET' && rest === 'events'
         const bearer = /^Bearer (.+)$/.exec(String(req.headers.authorization ?? ''))?.[1] ?? ''
         // EventSource cannot send headers, so the events stream (and only it) takes ?t=<token>.
         const token = bearer || (isEvents ? url.searchParams.get('t') ?? '' : '')
-        if (!session(token)) return json(res, 401, { error: "세션이 없어요. 펫에서 '자세히 보기'로 열어 주세요." })
+        if (!session(token)) { req.resume(); return json(res, 401, { error: "세션이 없어요. 펫에서 '자세히 보기'로 열어 주세요." }) }
         if (isEvents) url.searchParams.delete('t')
         req.url = '/api/' + rest + url.search
         req.headers.authorization = `Bearer ${opts.token}`

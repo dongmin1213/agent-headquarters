@@ -29,7 +29,8 @@ after(() => { mock.close(); server.closeAllConnections(); server.close() })
 interface Res { status: number; headers: Record<string, string | string[] | undefined>; body: string }
 function raw(method: string, path: string, headers: Record<string, string> = {}, body?: string): Promise<Res> {
   return new Promise((resolve, reject) => {
-    const req = request({ host: '127.0.0.1', port, method, path, headers: { host: `127.0.0.1:${port}`, ...headers } }, (res) => {
+    const len = body === undefined ? {} : { 'content-length': String(Buffer.byteLength(body)) }
+    const req = request({ host: '127.0.0.1', port, method, path, headers: { host: `127.0.0.1:${port}`, ...len, ...headers } }, (res) => {
       let data = ''
       res.setEncoding('utf8')
       res.on('data', (c) => { data += c })
@@ -172,7 +173,7 @@ test('only allowlisted /ui-api routes are proxied; everything else is 404', asyn
   ]
   for (const [m, p] of allowed) {
     const n = mock.calls.length
-    await raw(m, `/ui-api/${p}`, bearer(token), m === 'POST' ? '{}' : undefined)
+    await raw(m, `/ui-api/${p}`, bearer(token), m === 'POST' ? '{}' : undefined).catch((e) => assert.fail(`${m} ${p}: ${e}`))
     assert.equal(mock.calls.length, n + 1, `${m} ${p} reaches routeApi`)
   }
   const denied: [string, string][] = [
@@ -182,7 +183,7 @@ test('only allowlisted /ui-api routes are proxied; everything else is 404', asyn
   ]
   for (const [m, p] of denied) {
     const n = mock.calls.length
-    const r = await raw(m, `/ui-api/${p}`, bearer(token), m === 'GET' ? undefined : '{}')
+    const r = await raw(m, `/ui-api/${p}`, bearer(token), m === 'GET' ? undefined : '{}').catch((e) => assert.fail(`${m} ${p}: ${e}`))
     assert.equal(r.status, 404, `${m} ${p}`)
     assert.equal(mock.calls.length, n, `${m} ${p} never reaches routeApi`)
   }
@@ -224,7 +225,7 @@ test('sessions expire after 12 h idle; activity keeps them alive up to 7 days', 
     clock += 2000
     assert.equal((await raw('GET', '/ui-api/state', bearer(a))).status, 401, 'a idle > 12h')
     assert.equal((await raw('GET', '/ui-api/state', bearer(b))).status, 200, 'b was used')
-    while (clock - start < SESSION_MAX_MS - 60 * 60_000) {
+    while (clock - start + 10 * 60 * 60_000 < SESSION_MAX_MS) {
       clock += 10 * 60 * 60_000
       assert.equal((await raw('GET', '/ui-api/state', bearer(b))).status, 200, 'still under the 7 day cap')
     }
