@@ -189,6 +189,12 @@ Snapshot: `workers`, `headline`, `quota`, `decisions: DecisionItem[]`, `RequestV
 `DecisionItem.options`는 **서버에 그대로 보낼 값**이다: 승인형 카드는 카드 옵션 문자열(`승인`·`반려`, `수락`·`반려`, `병합`·`보류`, `다시 통합`·`요청 중단`), 질문은 선택지 문자열, blocked는 `retry`·`skip`·`stop`. blocked 표시 이름은 클라이언트가 고정 매핑한다: retry → `한 번 더 (최상위 모델)`, skip → `이 작업 건너뛰기`, stop → `요청 중단`.
 DecisionItem 순서: plan → ceo_question → worker_question → revise → blocked → integration → accept → merge (각 종류 안에서는 오래된 순). 알림은 `decision id + revision`으로 중복 방지.
 
+### 결정 카드 설명 (필수)
+모든 DecisionItem은 `situation`(무슨 일인지 쉬운 말 1~2문장), `cause`(+`causeConfirmed`), `recommendation`(선택지 하나와 이유), `optionHelp`(선택지마다 고르면 무엇이 일어나는지: 비용·되돌릴 수 있는지)를 채운다.
+- `blocked`·`integration`: CEO **진단 턴**(읽기 전용, 도구 Read/Glob/Grep, 스키마 `{situation, cause, causeConfirmed, recommendation:{option, reason}}`, 입력: 작업 spec·시도별 판정 사유·checks 실패 항목·verdict blocking·report 요약)이 쓴다. 확인한 근거(검사 로그·판정)가 있는 원인만 `causeConfirmed: true`. 진단 턴 전·실패 시에는 hq의 사실 문장으로 채우고 추천은 null.
+- 그 밖의 종류는 hq가 사실로 만든다. 예) accept: "작업 2개가 검사·검토를 통과했어요 · 결과를 확인하고 수락해 주세요", 추천은 두지 않는다(회장 판단). merge: 대상 브랜치·SHA·변경 파일 수.
+- `optionHelp` 고정 문구: retry "같은 작업을 최상위 모델로 한 번 더 해요 · 사용량이 들어요", skip "이 작업과 여기에 의존하는 작업을 빼고 계속해요 · 나중에 새 요청으로 다시 할 수 있어요", stop "요청 전체를 멈춰요 · 만든 브랜치는 남겨 둬요", 수락 "통합본을 병합 대기로 넘겨요 · 병합은 따로 승인해요", 반려 "사유를 붙여 다시 작업시켜요", 병합 "대상 브랜치에 fast-forward로 반영해요", 보류 "지금은 병합하지 않고 둬요 · 나중에 다시 제시할 수 있어요".
+
 ## 18. 상황 문장 (headline)
 우선순위: 결정 → 장애(blocked·unverifiable·통합 실패) → 실행 중 → 한도 보류·대기 → 유휴.
 - `회장님 결정 N건: <첫 항목>`
@@ -205,7 +211,8 @@ DecisionItem 순서: plan → ceo_question → worker_question → revise → bl
 - CEO(피카츄) 항상, 말풍선 = headline(결정 있으면 `확인해 주세요 (N)`), 배지 = needsYou, 결정 있을 때만 튐.
 - `workers`마다 캐릭터(모델별). `held`는 잠자는 표시 + `한도 보류 · HH:mm까지`. `blocked` 작업도 캐릭터로 남기고 말풍선 `멈춤 · 사장에게 보고`(결정 카드가 CEO에게 있음).
 - 종료된 작업의 결과·실패 사유는 CEO 창의 "최근 결과"에 남는다.
-- CEO 창: 결정 카드 전부(§17 순서) + 최근 결과 + 새 요청 + 자세히 보기(웹).
+- CEO 창: 탭 `내 차례 N` / `새 요청` / `사용량`. 내 차례: 결정 카드(§17 순서) — 제목(프로젝트 · 작업), 상황, 원인(확인됨/추정), **추천 문단(강조)**, 선택지 버튼과 각 선택지 설명, `원문 보기`(웹). 새 요청: 입력·프로젝트 선택·최근 결과. 사용량: 창별 사용률·리셋·모드. 아래 `사무실 열기`(웹)·`닫기`.
+- 작업자 창: 제목·모델·상태(`! 확인 필요` 등). blocked면 "사장에게 보고했어요 · 결정은 사장 카드에서 해요" + `사장 카드 열기` 버튼. 최근 활동 5줄. `사무실 열기`·`닫기`.
 
 ## 20. 검토 판정 기록 (v1 → v2)
 Codex(X-B01~B15, A01~A07)와 Claude(C-B1~B13, A1~A15)의 지적에 대한 오케스트레이터 판정.
