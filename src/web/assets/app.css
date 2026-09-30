@@ -370,7 +370,9 @@ ul.compact li + li { margin-top: 2px; }
   .topbar-inner { padding: var(--s2) var(--s3); gap: var(--s2) var(--s3); }
   .brand-mark { width: 28px; height: 28px; }
   .quota { gap: var(--s3); }
-  .meter { grid-template-columns: auto 40px auto; }
+  .meter { grid-template-columns: auto 32px auto; column-gap: 6px; }
+  .topbar-meta { flex: 1 1 0; min-width: 0; order: 2; justify-content: space-between; gap: var(--s2); }
+  .quota { flex-wrap: wrap; gap: 4px var(--s3); min-width: 0; }
   .meter-reset, .quota-mode { display: none; }
   .headline-text { white-space: normal; font-size: 14px; }
   .decisions { padding: var(--s3); margin: 0 calc(-1 * var(--s1)); }

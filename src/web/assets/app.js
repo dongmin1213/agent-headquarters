@@ -223,6 +223,8 @@ function writeHash(replace) {
   else history.pushState(null, '', hash || location.pathname)
 }
 function applyHash() {
+  // A new login link opened in an existing tab only changes the fragment: start over so the code is exchanged.
+  if (/^#code=/.test(location.hash)) { location.reload(); return }
   const r = parseHash()
   if (r.req && r.req !== state.selected) { state.selected = r.req; loadDetail() }
   if (r.task) openDrawer(r.task, r.tab ?? 'activity', { fromHash: true })
