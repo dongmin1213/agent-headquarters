@@ -12,12 +12,13 @@ export interface TaskRow {
   review_model: string; spec: string; revision: number; status: string; attempts: number; limited_streak: number
   review_invalid: number; revise_turns: number; branch: string | null; worktree: string | null; base_sha: string | null
   head_sha: string | null; checks_state: string | null; resume_session: string | null; report_sha: string | null
-  diagnosis: string | null; note: string | null; updated_at: string
+  diagnosis: string | null; generation: number; block_count: number; note: string | null; updated_at: string
 }
 export interface AttemptRow {
   id: string; task_id: string; kind: string; n: number; model: string; status: string; session_id: string; pid: number | null
   lstart: string | null; attempt_token: string; dir: string; started_at: string | null; ended_at: string | null; cost_usd: number | null
   input_tokens: number | null; output_tokens: number | null; outcome: string | null; reason: string | null
+  generation: number; bash_runs: string | null
 }
 export interface QuotaRow { window: string; utilization: number | null; resets_at: string | null; status: string | null; observed_at: string }
 export interface MergeRow {
@@ -27,17 +28,17 @@ export interface MergeRow {
 export interface TaskQuestionRow { id: string; task_id: string; attempt_id: string | null; revision: number; question: string; options: string[]; default: string; answer: string | null; created_at: string }
 export interface ApprovalRow extends Approval { revision: number; kind: string; subjectId: string | null; state: string }
 
-const SCHEMA_VERSION = 3
+const SCHEMA_VERSION = 4
 /** Cards fixed to a subject hash never expire (execution.md §12). */
 export const NO_EXPIRY = '9999-12-31T00:00:00.000Z'
 
 const TASK_COLS = new Set(['title', 'role', 'grade', 'model', 'review_model', 'spec', 'revision', 'status', 'attempts', 'limited_streak', 'review_invalid',
-  'revise_turns', 'branch', 'worktree', 'base_sha', 'head_sha', 'checks_state', 'resume_session', 'report_sha', 'diagnosis', 'note'])
-const ATTEMPT_COLS = new Set(['model', 'status', 'session_id', 'pid', 'lstart', 'started_at', 'ended_at', 'cost_usd', 'input_tokens', 'output_tokens', 'outcome', 'reason'])
+  'revise_turns', 'branch', 'worktree', 'base_sha', 'head_sha', 'checks_state', 'resume_session', 'report_sha', 'diagnosis', 'generation', 'block_count', 'note'])
+const ATTEMPT_COLS = new Set(['model', 'status', 'session_id', 'pid', 'lstart', 'started_at', 'ended_at', 'cost_usd', 'input_tokens', 'output_tokens', 'outcome', 'reason', 'bash_runs'])
 const MERGE_COLS = new Set(['target', 'target_sha', 'integration_sha', 'state', 'result_sha', 'note', 'diagnosis'])
 type Val = string | number | null
 
-const kindOf = (id: string) => (/^(plan|accept|merge|revise|integration|team):/.exec(id)?.[1] ?? 'team')
+const kindOf = (id: string) => (/^(plan|accept|merge|revise|integration|team|system):/.exec(id)?.[1] ?? 'team')
 
 export class Store {
   private db: DatabaseSync
@@ -109,13 +110,34 @@ export class Store {
             case when decision is null then 'open' else 'decided' end, decision, decided_at from approvals_v1;
           drop table approvals_v1;`)
       }
-      // v2 → v3: diagnosis columns (execution.md §17 decision explanations).
-      for (const tbl of ['tasks', 'merges']) {
+      const addColumn = (tbl: string, col: string, decl: string) => {
         const have = (this.db.prepare(`select name from pragma_table_info('${tbl}')`).all() as { name: string }[]).map((c) => c.name)
-        if (!have.includes('diagnosis')) this.db.exec(`alter table ${tbl} add column diagnosis text`)
+        if (!have.includes(col)) this.db.exec(`alter table ${tbl} add column ${col} ${decl}`)
       }
+      // schema 3: diagnosis columns (execution.md §17 decision explanations).
+      addColumn('tasks', 'diagnosis', 'text'); addColumn('merges', 'diagnosis', 'text')
+      // schema 4 (contract v3): generations, per-block decision revision, reviewer Bash evidence.
+      addColumn('tasks', 'generation', 'integer not null default 0'); addColumn('tasks', 'block_count', 'integer not null default 0')
+      addColumn('attempts', 'generation', 'integer not null default 0'); addColumn('attempts', 'bash_runs', 'text')
+      if (v === 2 || v === 3) this.convertV2Execution()
       this.db.exec(`pragma user_version = ${SCHEMA_VERSION}`)
     })
+  }
+
+  /**
+   * Execution rows written by the v2 engine used shared-.git worktrees that v3 no longer trusts (§6.1).
+   * Unfinished work is parked as blocked with a retry hint; results that passed keep their SHAs (the mirror fetches them).
+   */
+  private convertV2Execution(): void {
+    const live = "('executing', 'blocked', 'awaiting_acceptance', 'accepted', 'merging')"
+    const note = 'v3 전환: 다시 시작하려면 한 번 더'
+    this.db.prepare(`update attempts set status = 'failed', reason = 'v3 전환', ended_at = ? where status in ('starting', 'running')`).run(new Date().toISOString())
+    this.db.prepare(`update tasks set status = 'blocked', note = ?, block_count = block_count + 1, worktree = null, resume_session = null
+      where status not in ('passed', 'cancelled') and request_id in (select id from requests where status in ${live})`).run(note)
+    this.db.exec(`update tasks set worktree = null where request_id in (select id from requests where status in ${live})`)
+    this.db.exec(`delete from merges where request_id in (select id from requests where status in ${live}) and state != 'merged'`)
+    this.db.exec(`update approvals set state = 'superseded' where state = 'open' and kind in ('accept', 'merge', 'integration', 'revise')`)
+    this.db.prepare(`update requests set status = 'blocked', note = ? where status in ${live}`).run(note)
   }
 
   /** Runs fn in one IMMEDIATE transaction (nested calls join the outer one). fn must be synchronous. */
@@ -287,6 +309,16 @@ export class Store {
       .run(...keys.map((k) => (f as Record<string, Val>)[k]), new Date().toISOString(), id)
   }
 
+  /** Generation-guarded transition (§7.7): applies only while the task is still in `generation`. Returns whether it applied. */
+  updateTaskIf(id: string, generation: number, f: Partial<Omit<TaskRow, 'id' | 'request_id' | 'key' | 'project' | 'updated_at'>>): boolean {
+    const keys = Object.keys(f)
+    for (const k of keys) if (!TASK_COLS.has(k)) throw new Error(`bad task column ${k}`)
+    if (!keys.length) return (this.task(id)?.generation ?? -1) === generation
+    const r = this.db.prepare(`update tasks set ${keys.map((k) => `${k} = ?`).join(', ')}, updated_at = ? where id = ? and generation = ?`)
+      .run(...keys.map((k) => (f as Record<string, Val>)[k]), new Date().toISOString(), id, generation)
+    return Number(r.changes) === 1
+  }
+
   task(id: string): TaskRow | null { return (this.db.prepare('select * from tasks where id = ?').get(id) as TaskRow | undefined) ?? null }
 
   /** Plan order (insertion order). */
@@ -299,9 +331,14 @@ export class Store {
   }
 
   // ----- attempts -----
-  insertAttempt(a: Pick<AttemptRow, 'id' | 'task_id' | 'kind' | 'n' | 'model' | 'status' | 'attempt_token' | 'dir' | 'session_id'>): void {
-    this.db.prepare('insert into attempts (id, task_id, kind, n, model, status, attempt_token, dir, session_id) values (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(a.id, a.task_id, a.kind, a.n, a.model, a.status, a.attempt_token, a.dir, a.session_id)
+  insertAttempt(a: Pick<AttemptRow, 'id' | 'task_id' | 'kind' | 'n' | 'model' | 'status' | 'attempt_token' | 'dir' | 'session_id'> & { generation?: number }): void {
+    this.db.prepare('insert into attempts (id, task_id, kind, n, model, status, attempt_token, dir, session_id, generation) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(a.id, a.task_id, a.kind, a.n, a.model, a.status, a.attempt_token, a.dir, a.session_id, a.generation ?? 0)
+  }
+
+  /** Attempt numbers only ever grow per kind (§7.1), independent of the rework counter. */
+  nextAttemptN(taskId: string, kind: string): number {
+    return Number((this.db.prepare('select coalesce(max(n), 0) + 1 n from attempts where task_id = ? and kind = ?').get(taskId, kind) as { n: number }).n)
   }
 
   updateAttempt(id: string, f: Partial<Omit<AttemptRow, 'id' | 'task_id' | 'kind' | 'n' | 'attempt_token' | 'dir'>>): void {

@@ -14,7 +14,6 @@ export interface QuotaState {
   pct: number | null
 }
 
-const HOLD_FALLBACK_MS = 60 * 60_000
 const iso = (sec: unknown) => (typeof sec === 'number' && Number.isFinite(sec) ? new Date(sec * 1000).toISOString() : null)
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 
@@ -45,19 +44,40 @@ export function recordRateLimit(store: Store, line: Record<string, unknown>, now
 /** Windows whose reset time has passed say nothing about the present. */
 const liveRows = (rows: QuotaRow[], now: number) => rows.filter((r) => !(r.resets_at && Date.parse(r.resets_at) <= now))
 
-export function quotaState(rows: QuotaRow[], limits: HqConfig['quota'], now: number): QuotaState {
+/** Extra hold sources besides window rows: the resetsAt-less limit back-off timer and a missing Claude login (§13). */
+export interface HoldTimers { backoffUntil?: string | null; loginRequired?: boolean }
+
+/**
+ * Mode from the window rows. `rejected` comes from the top-level rate_limit_info.status of the named window
+ * (overageStatus is never a signal). A rejection without resetsAt holds nothing here: the back-off timer covers it.
+ */
+export function quotaState(rows: QuotaRow[], limits: HqConfig['quota'], now: number, timers: HoldTimers = {}): QuotaState {
+  if (timers.loginRequired) return { mode: 'hold', until: null, window: 'login', pct: null }
   const live = liveRows(rows, now)
-  if (!live.length) return { mode: 'unobserved', until: null, window: null, pct: null }
-  const blocking = live.map((r) => ({ r, until: r.resets_at ?? new Date(Date.parse(r.observed_at) + HOLD_FALLBACK_MS).toISOString() }))
-    .filter(({ r, until }) => (r.status === 'rejected' || (r.utilization ?? 0) >= limits.holdAt) && Date.parse(until) > now)
-  if (blocking.length) {
-    const last = blocking.sort((a, b) => Date.parse(b.until) - Date.parse(a.until))[0]
-    return { mode: 'hold', until: last.until, window: last.r.window, pct: last.r.utilization }
+  const blocking = live.filter((r) => r.resets_at && Date.parse(r.resets_at) > now && (r.status === 'rejected' || (r.utilization ?? 0) >= limits.holdAt))
+  const holds = blocking.map((r) => ({ until: r.resets_at!, window: r.window, pct: r.utilization }))
+  if (timers.backoffUntil && Date.parse(timers.backoffUntil) > now) holds.push({ until: timers.backoffUntil, window: 'limit', pct: null })
+  if (holds.length) {
+    const last = holds.sort((a, b) => Date.parse(b.until) - Date.parse(a.until))[0]
+    return { mode: 'hold', until: last.until, window: last.window, pct: last.pct }
   }
+  if (!live.length) return { mode: 'unobserved', until: null, window: null, pct: null }
   const top = [...live].sort((a, b) => (b.utilization ?? 0) - (a.utilization ?? 0))[0]
-  const mode: QuotaMode = (top.utilization ?? 0) >= limits.saveAt ? 'save' : 'normal'
-  return { mode, until: null, window: top.window, pct: top.utilization }
+  return { mode: (top.utilization ?? 0) >= limits.saveAt ? 'save' : 'normal', until: null, window: top.window, pct: top.utilization }
 }
+
+/** True for a rejection that names no reset time anywhere (the caller starts the 15/30/60-minute back-off). */
+export function rejectedWithoutReset(line: Record<string, unknown>): boolean {
+  if (line.type !== 'rate_limit_event') return false
+  const info = line.rate_limit_info as Record<string, unknown> | undefined
+  if (!info || info.status !== 'rejected') return false
+  if (typeof info.resetsAt === 'number') return false
+  const w = (info.unifiedWindows ?? {}) as Record<string, Record<string, unknown> | undefined>
+  const named = typeof info.rateLimitType === 'string' ? w[info.rateLimitType] : undefined
+  return typeof named?.resetsAt !== 'number'
+}
+
+export const isAllowedEvent = (line: Record<string, unknown>) => line.type === 'rate_limit_event' && (line.rate_limit_info as Record<string, unknown> | undefined)?.status === 'allowed'
 
 export function quotaView(rows: QuotaRow[], s: QuotaState, now: number): QuotaView | null {
   if (!rows.length) return null

@@ -1,28 +1,28 @@
-// Execution scheduler and state machine (execution.md §5-§13, exec-engine-spec.md §C §D).
-// The runner is the only writer of task/attempt state. Every transition is one DB transaction and
-// intent is recorded before side effects (spawn, git writes, kill). Long work runs in background jobs;
-// the 2-second tick only observes and advances state.
+// Execution scheduler and state machine (execution.md v3 §5-§13, exec-engine-spec.md §C §D + v3 change orders).
+// The runner is the only writer of task/attempt state. Every transition is one DB transaction, guarded by the task
+// generation (§7.7), and intent is recorded before side effects (spawn, git writes, kill). Long work runs in
+// background jobs; the 2-second tick only observes and advances state.
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import type { Bus } from '../bus.ts'
-import { reviewModelOf, validateTasks, type CeoPlan, type PlanTask, type Project } from '../ceo.ts'
+import { reviewModelOf, validateTasks, type Acceptance, type CeoPlan, type PlanTask, type Project } from '../ceo.ts'
 import type { HqConfig } from '../config.ts'
 import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../store.ts'
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
-import { baseline, checksProfile, runChecks, runSandboxed, type CheckSpec, type ChecksFile } from './checks.ts'
-import { collectGitFacts, DONE_MAX, isLimited, judgeWork, readOut, REPORT_MAX, type WorkOutcome } from './contract.ts'
+import { baseline, checksProfile, runChecks, runSandboxed, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
+import { DONE_MAX, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
 import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, outDirOf, workerViews } from './decisions.ts'
 import { runDiagnoseTurn } from './diagnose.ts'
 import { atomicJson, atomicWrite, readJson, readText, sha256 } from './fsx.ts'
-import { addDetachedWorktree, branchExists, changedFiles, currentBranch, ensureWorktree, git, gitCommonDir, gitOk, isRepo, mergeHeads,
-  removeWorktree, resetClean, revParse, withRepo, worktreeDirtySnapshot } from './git.ts'
+import { currentBranch, isRepo, revParse, withRepo } from './git.ts'
 import { integrate, integrationRef } from './integration.ts'
 import { applyMerge } from './merge.ts'
 import { resumePrompt, reviewPrompt, reworkEvidence, workPrompt, type Upstream } from './prompt.ts'
-import { quotaState, quotaView, recordRateLimit, type QuotaState } from './quota.ts'
+import { isAllowedEvent, quotaState, quotaView, recordRateLimit, rejectedWithoutReset, type QuotaState } from './quota.ts'
+import { ensureMirror, fetchWork, hqGit, hqGitOk, mirrorChanged, mirrorPath, mirrorRev, newWorkClone, removeMirrorWorktree, verifyWorktree, wtGit, wtMerge, wtStatus } from './repos.ts'
 import { canAutoApply, reviseDiff, runReviseTurn } from './revise.ts'
 import { checkVerdict, ladderUp, VERDICT_SCHEMA } from './review.ts'
 import { real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
@@ -32,7 +32,7 @@ import { reconcile as reconcileInvariants, recover as recoverState, type Violati
 
 export type Notify = (title: string, body: string) => void
 
-/** Serializes CEO turns (plan turns in the engine, revise turns here). */
+/** Serializes CEO turns (plan turns in the engine, revise and diagnosis turns here). */
 export class TurnLock {
   private held = false
   tryAcquire(): boolean { if (this.held) return false; this.held = true; return true }
@@ -42,7 +42,7 @@ export class TurnLock {
 
 export interface RunnerDeps {
   store: Store; bus: Bus; cfg: HqConfig; projects: Project[]; hqRoot: string; hqPort: number; notify: Notify; now: () => number
-  /** Folder of the daemon token, denied inside the sandbox (default ~/.config/hq). */
+  /** Folder of the daemon token, denied inside the sandbox (dirname of HQ_TOKEN_FILE; default ~/.config/hq). */
   tokenDir?: string
   /** Shared with the engine so CEO turns never overlap. */
   ceoLock?: TurnLock
@@ -60,18 +60,27 @@ export interface Live {
   killed9: boolean
 }
 
+/** Result of a chairman decision; replays of the same decision return the stored one (§D). */
+export interface DecideResult { status: number; body: Record<string, unknown> }
+
 const KILL_GRACE_MS = 10_000
-const MAX_START_FAILURES = 3
 const MAX_QUESTION_ROUNDS = 3
 const MAX_REVISE_TURNS = 2
 const MAX_LIMITED_STREAK = 3
 const RECONCILE_MS = 60_000
 const LOG_RETENTION_MS = 30 * 24 * 60 * 60_000
+const BACKOFF_MIN = [15, 30, 60]
 export const TERMINAL_REQUEST = new Set(['merged', 'rejected', 'failed', 'cancelled', 'expired'])
 const UNCOUNTED_PREV = new Set(['limited', 'transient', 'start_failed', 'brief_blocked'])
+export const INTEGRATION_OPTIONS = ['다시 통합', '해당 작업 재작업', '요청 중단']
+export const LOGIN_CARD = 'system:login'
 
 export const specOf = (t: TaskRow) => JSON.parse(t.spec) as PlanTask
 export const nonManual = (t: PlanTask) => t.acceptance.filter((a) => a.check.trim() && a.check.trim() !== 'manual')
+const kindOf = (a: Acceptance) => (a.kind === 'new' ? 'new' : 'regression')
+
+class Setup extends Error {}
+class DecisionRefused extends Error {}
 
 export class Runner {
   readonly store: Store
@@ -88,14 +97,16 @@ export class Runner {
   readonly live = new Map<string, Live>()
   readonly launching = new Set<string>()
   readonly checking = new Set<string>()
-  private integrating = new Set<string>()
+  readonly integrating = new Set<string>()
   private revising = new Set<string>()
   private diagnosing = new Set<string>()
-  private gitDirs = new Map<string, string | null>()
   private ticking = false
   private again = false
   private timer: NodeJS.Timeout | null = null
   private lastReconcile = 0
+  private stopped = false
+  private jobs = new Set<Promise<unknown>>()
+  private current: Promise<void> | null = null
   lastViolations: Violation[] = []
 
   constructor(d: RunnerDeps) {
@@ -116,14 +127,13 @@ export class Runner {
   /** Stops ticking only; worker processes keep running and are re-adopted on the next start (§F). */
   stop(): void { if (this.timer) clearInterval(this.timer); this.timer = null; this.stopped = true }
 
-  private stopped = false
-  private jobs = new Set<Promise<unknown>>()
   /** Runs a background job and remembers it so shutdown (and tests) can wait for it. */
   private bg(p: Promise<unknown>): void {
     const j = p.catch((e) => console.error('[hq runner] job', e)).finally(() => { this.jobs.delete(j); this.kick() })
     this.jobs.add(j)
   }
-  /** Resolves when no background job (launch, checks, integration, CEO turn) is running. */
+
+  /** Resolves when no background job and no tick is running. */
   async drain(): Promise<void> {
     while (this.jobs.size || this.current) await Promise.allSettled([...this.jobs, ...(this.current ? [this.current] : [])])
   }
@@ -131,33 +141,78 @@ export class Runner {
   recover(): Promise<void> { return recoverState(this) }
 
   // ----- paths & helpers -----
-  worktreeDir(requestId: string, key: string): string { return join(this.home, 'worktrees', requestId, key) }
-  integrationDir(requestId: string, project: string): string { return join(this.home, 'worktrees', requestId, `_integration-${project}`) }
+  workDir(requestId: string, key: string): string { return join(this.home, 'work', requestId, key) }
+  worktreeDir(requestId: string, name: string): string { return join(this.home, 'worktrees', requestId, name) }
+  integrationDir(requestId: string, project: string): string { return this.worktreeDir(requestId, `_integration-${project}`) }
   runDir(requestId: string, key: string, attemptId: string): string { return join(this.home, 'runs', requestId, key, attemptId) }
+  mirror(projectId: string): string { return mirrorPath(this.home, projectId) }
   project(id: string): Project | undefined { return this.projects.find((p) => p.id === id) }
   iso(): string { return new Date(this.now()).toISOString() }
+  /** Mirror ref of a fetched work result. Git ref names cannot contain `~`, so the attempt id's suffix (a<n>) is used. */
+  resultRef(t: TaskRow, attemptId: string): string { return `refs/hq/${t.request_id}/${t.key}/${attemptId.split('~').pop()}` }
 
-  async sandboxFor(worktree: string, out: string | null, repo: string | null): Promise<SandboxOpts> {
-    let gitDir: string | null = null
-    if (repo) {
-      if (!this.gitDirs.has(repo)) this.gitDirs.set(repo, await gitCommonDir(repo))
-      gitDir = this.gitDirs.get(repo) ?? null
-    }
-    return { worktree, out, repoGitDir: gitDir, hqHome: this.home, tokenDir: this.tokenDir, hqPort: this.hqPort, extraWritable: this.cfg.sandbox.extraWritable, claudeDir: join(homedir(), '.claude') }
+  sandboxFor(worktree: string, out: string | null): SandboxOpts {
+    return { worktree, out, hqHome: this.home, tokenDir: this.tokenDir, hqPort: this.hqPort, extraWritable: this.cfg.sandbox.extraWritable, projects: this.projects.map((p) => p.path) }
   }
 
-  quota(): QuotaState { return quotaState(this.store.quotaRows(), this.cfg.quota, this.now()) }
+  /** Check/integration processes are recorded so a restart can kill leftover groups (§9). */
+  procTracker(what: string): { onSpawn: OnSpawn; done: () => void } {
+    const pids: number[] = []
+    return {
+      onSpawn: (pid) => { pids.push(pid); this.store.set(`proc:${pid}`, JSON.stringify({ pid, what, startedAt: new Date().toISOString() })) },
+      done: () => { for (const p of pids) this.store.set(`proc:${p}`, null) },
+    }
+  }
+
+  // ----- quota (§13) -----
+  quota(): QuotaState {
+    return quotaState(this.store.quotaRows(), this.cfg.quota, this.now(), { backoffUntil: this.store.get('limit.backoffUntil'), loginRequired: !!this.store.get('login.required') })
+  }
   quotaView(): QuotaView | null { return quotaView(this.store.quotaRows(), this.quota(), this.now()) }
-  /** CEO turns and teams may start unless the quota is on hold (§13). */
-  canStartCeo(): boolean { return this.quota().mode !== 'hold' }
   holdUntil(): string | null { const q = this.quota(); return q.mode === 'hold' ? q.until : null }
+
+  /** CEO turns (plan, revise, diagnosis): never on hold; in save/unobserved mode only when nothing else runs (§13). */
+  canStartCeo(): boolean {
+    const m = this.quota().mode
+    return m !== 'hold' && (m === 'normal' || this.store.liveAttempts().length === 0)
+  }
+
+  /** Something the CEO should do before any worker in save/unobserved mode (§13 "CEO 턴이 우선"). */
+  ceoWaiting(): boolean {
+    if (this.store.nextQueued()) return true
+    if (this.store.tasksByStatus(['revising']).some((t) => this.store.approval(`revise:${t.id}`)?.state !== 'open')) return true
+    return this.store.tasksByStatus(['blocked']).some((t) => t.diagnosis === null)
+  }
 
   observe(line: Record<string, unknown>): void {
     const before = this.quota().mode
-    if (recordRateLimit(this.store, line, this.now())) {
-      const after = this.quota().mode
-      if (after !== before) this.bus.emit({ kind: 'quota', text: `사용 한도 모드: ${after}`, data: { mode: after } })
-    }
+    if (!recordRateLimit(this.store, line, this.now())) return
+    if (rejectedWithoutReset(line)) this.limitBackoff()
+    else if (isAllowedEvent(line)) this.store.set('limit.backoffLevel', null)
+    const after = this.quota().mode
+    if (after !== before) this.bus.emit({ kind: 'quota', text: `사용 한도 모드: ${after}`, data: { mode: after } })
+  }
+
+  /** A limit without a reset time: wait 15, then 30, then 60 minutes (timer, §13). */
+  limitBackoff(): void {
+    const cur = this.store.get('limit.backoffUntil')
+    if (cur && Date.parse(cur) > this.now()) return
+    const level = Number(this.store.get('limit.backoffLevel') ?? 0)
+    const until = new Date(this.now() + BACKOFF_MIN[Math.min(level, BACKOFF_MIN.length - 1)] * 60_000).toISOString()
+    this.store.set('limit.backoffUntil', until)
+    this.store.set('limit.backoffLevel', String(level + 1))
+    this.bus.emit({ kind: 'limit', text: `사용 한도 — ${until}까지 새 시작을 멈춰요` })
+  }
+
+  /** "Not logged in": one global hold and one system card instead of per-task failures (§13). */
+  requireLogin(reason: string): void {
+    if (this.store.get('login.required')) return
+    this.store.tx(() => {
+      this.store.set('login.required', this.iso())
+      this.store.putApproval({ id: LOGIN_CARD, teamId: 'hq', subjectId: '', kind: 'system', title: 'Claude 로그인 필요', body: reason.slice(0, 500),
+        options: ['다시 확인'], subjectHash: sha256(`login:${this.iso()}`) })
+    })
+    this.bus.emit({ kind: 'limit', text: 'Claude CLI 로그인이 필요해요 — 모든 시작을 멈췄어요' })
   }
 
   emitTask(t: { id: string; request_id: string }, text: string): void {
@@ -168,36 +223,6 @@ export class Runner {
     this.bus.emit({ kind: 'request', text, data: { id, state: this.store.request(id)?.status } })
   }
 
-  // ----- plan approval (§D createTasks) -----
-  /** Creates task rows for an approved plan and moves the request to executing. Returns a Korean reason on refusal. */
-  async createTasks(requestId: string): Promise<string | null> {
-    const r = this.store.request(requestId)
-    if (!r || !r.plan) return '계획이 없는 요청입니다'
-    if (this.store.tasks(requestId).length) return null
-    const plan = JSON.parse(r.plan) as CeoPlan
-    const problem = validateTasks(plan.tasks, this.projects)
-    if (problem) return this.failRequest(requestId, `계획 검증 실패: ${problem}`)
-    const heads = new Map<string, string>()
-    for (const pid of new Set(plan.tasks.map((t) => t.project))) {
-      const p = this.project(pid)!
-      if (!(await isRepo(p.path))) return this.failRequest(requestId, `프로젝트 ${p.name}(${p.path})가 커밋이 있는 git 저장소가 아니라서 실행할 수 없어요`)
-      heads.set(pid, (await revParse(p.path))!)
-    }
-    const ok = this.store.tx(() => {
-      const cur = this.store.request(requestId)
-      if (!cur || !['planned', 'approved'].includes(cur.status)) return false
-      for (const t of plan.tasks) this.store.insertTask({ id: `${requestId}.${t.id}`, request_id: requestId, key: t.id, project: t.project, title: t.title,
-        role: t.role, grade: t.grade, model: t.model, review_model: reviewModelOf(t), spec: JSON.stringify(t), status: 'pending',
-        branch: t.role === 'implement' ? `hq/${requestId}/${t.id}` : null, base_sha: heads.get(t.project)! })
-      this.store.updateRequest(requestId, { status: 'executing', note: null })
-      return true
-    })
-    if (!ok) return '요청이 계획 승인 상태가 아닙니다'
-    this.emitRequest(requestId, `실행 시작: 작업 ${plan.tasks.length}개`)
-    this.kick()
-    return null
-  }
-
   failRequest(requestId: string, why: string): string {
     this.store.updateRequest(requestId, { status: 'failed', note: why })
     this.emitRequest(requestId, why)
@@ -205,10 +230,147 @@ export class Runner {
     return why
   }
 
+  // ----- chairman decisions (§D: card consumption and transition in one transaction) -----
+  /**
+   * Decides a card and applies its transition atomically. Replaying the same decision returns the same response.
+   * Async work that cannot sit inside the transaction (git preparation, the merge itself) happens before or after it.
+   */
+  async decide(id: string, decision: string, subjectHash: string): Promise<DecideResult> {
+    const a = this.store.approval(id)
+    if (!a) return { status: 404, body: { error: '카드가 없습니다' } }
+    const replayKey = `decided:${a.id}:${a.revision}`
+    if (a.state === 'decided') {
+      const prev = this.store.get(replayKey)
+      if (a.decision === decision && a.subjectHash === subjectHash && prev) return JSON.parse(prev) as DecideResult
+      return { status: 409, body: { error: '이미 결정된 카드입니다' } }
+    }
+    if (a.state !== 'open' || !a.options.includes(decision) || a.subjectHash !== subjectHash || Date.parse(a.expiresAt) <= this.now())
+      return { status: 409, body: { error: '카드가 만료·교체됐거나, 내용이 바뀌었거나, 없는 선택지입니다' } }
+    if (a.kind === 'accept' && decision === '반려') return { status: 409, body: { error: '사유와 함께 반려 버튼을 써 주세요' } }
+    const requestId = a.subjectId ?? ''
+    // Preparation outside the transaction: nothing here changes state.
+    let prep: { heads: Map<string, string> } | { error: string } | null = null
+    if (a.kind === 'plan' && decision === '승인') prep = await this.preparePlan(requestId)
+    let first = false
+    let res: DecideResult
+    try {
+      res = this.store.tx((): DecideResult => {
+      const d = this.store.decide(id, decision, subjectHash, this.now())
+      if (!d) {
+        // A concurrent identical decision won the race: answer with its recorded response.
+        const cur = this.store.approval(id)
+        const prev = cur ? this.store.get(`decided:${cur.id}:${cur.revision}`) : null
+        if (cur?.state === 'decided' && cur.decision === decision && cur.subjectHash === subjectHash && prev) return JSON.parse(prev) as DecideResult
+        return { status: 409, body: { error: '카드를 방금 다른 곳에서 결정했거나 내용이 바뀌었습니다' } }
+      }
+      const err = this.applyDecision(d, decision, prep)
+      if (err) throw new DecisionRefused(err) // roll back the card consumption as well
+      const ok: DecideResult = { status: 200, body: { ...d, note: null } }
+      this.store.set(replayKey, JSON.stringify(ok))
+      first = true
+      return ok
+      })
+    } catch (e) {
+      if (e instanceof DecisionRefused) return { status: 409, body: { error: e.message } }
+      throw e
+    }
+    if (first && a.kind === 'merge' && decision === '병합') {
+      const [, req, project] = a.id.split(':')
+      res.body.note = await this.runMerge(req, project)
+      this.store.set(replayKey, JSON.stringify(res))
+    }
+    if (first) {
+      this.bus.emit({ kind: 'approval', teamId: a.teamId, text: `결정: ${a.title} → ${decision}`, data: { id } })
+      this.kick()
+    }
+    return res
+  }
+
+  /** Transition for a just-consumed card. Call inside the decide transaction. Returns a Korean reason on refusal. */
+  private applyDecision(a: ApprovalRow, decision: string, prep: { heads: Map<string, string> } | { error: string } | null): string | null {
+    const requestId = a.subjectId ?? ''
+    switch (a.kind) {
+      case 'system':
+        this.store.set('login.required', null)
+        return null
+      case 'plan':
+        if (decision !== '승인') { this.store.updateRequest(requestId, { status: 'rejected', note: '계획 반려' }); return null }
+        if (!prep || 'error' in prep) { this.store.updateRequest(requestId, { status: 'failed', note: prep && 'error' in prep ? prep.error : '계획 준비 실패' }); return null }
+        return this.createTasksTx(requestId, prep.heads)
+      case 'accept':
+        return this.acceptTx(requestId)
+      case 'merge': {
+        const [, req, project] = a.id.split(':')
+        const m = this.store.mergeRow(req, project)
+        if (!m || m.state !== 'offered') return '병합할 수 있는 상태가 아닙니다'
+        if (decision === '보류') { this.store.putMerge(req, project, { state: 'held' }); return null }
+        if (this.store.request(req)?.status !== 'accepted') return '수락된 요청이 아닙니다'
+        this.store.updateRequest(req, { status: 'merging' })
+        this.store.putMerge(req, project, { state: 'merging' }) // intent: expected result = integration_sha (recovery checks HEAD)
+        return null
+      }
+      case 'integration': {
+        const [, req, project] = a.id.split(':')
+        return this.integrationDecidedTx(req, project, decision)
+      }
+      case 'revise': {
+        const taskId = a.id.slice('revise:'.length)
+        const raw = this.store.get(`revise:${taskId}`)
+        if (decision === '승인' && raw) return this.applyRevision(taskId, JSON.parse(raw) as PlanTask)
+        const t = this.store.task(taskId)
+        if (t?.status === 'revising') this.block(t, '회장이 지시서 수정안을 반려했어요')
+        return null
+      }
+      default:
+        return null
+    }
+  }
+
+  // ----- plan approval (§D createTasks) -----
+  /** Git-side preparation of a plan approval: every project must be a git repo; mirrors are fetched; base = project HEAD. */
+  async preparePlan(requestId: string): Promise<{ heads: Map<string, string> } | { error: string }> {
+    const r = this.store.request(requestId)
+    if (!r?.plan) return { error: '계획이 없는 요청입니다' }
+    const plan = JSON.parse(r.plan) as CeoPlan
+    const problem = validateTasks(plan.tasks, this.projects)
+    if (problem) return { error: `계획 검증 실패: ${problem}` }
+    const heads = new Map<string, string>()
+    for (const pid of new Set(plan.tasks.map((t) => t.project))) {
+      const p = this.project(pid)!
+      if (!(await isRepo(p.path))) return { error: `프로젝트 ${p.name}(${p.path})가 커밋이 있는 git 저장소가 아니라서 실행할 수 없어요` }
+      const head = (await revParse(p.path))!
+      try { await ensureMirror(p, this.mirror(pid)) } catch (e) { return { error: `프로젝트 ${p.name}의 hq 미러를 만들지 못했어요: ${String(e).slice(0, 200)}` } }
+      if (!(await mirrorRev(this.mirror(pid), head))) return { error: `프로젝트 ${p.name}의 HEAD를 미러에서 찾을 수 없어요` }
+      heads.set(pid, head)
+    }
+    return { heads }
+  }
+
+  /** Creates task rows and moves the request to executing. Call inside a transaction. */
+  private createTasksTx(requestId: string, heads: Map<string, string>): string | null {
+    const cur = this.store.request(requestId)
+    if (!cur?.plan || !['planned', 'approved'].includes(cur.status)) return '요청이 계획 승인 상태가 아닙니다'
+    if (this.store.tasks(requestId).length) return null
+    const plan = JSON.parse(cur.plan) as CeoPlan
+    for (const t of plan.tasks) this.store.insertTask({ id: `${requestId}.${t.id}`, request_id: requestId, key: t.id, project: t.project, title: t.title,
+      role: t.role, grade: t.grade, model: t.model, review_model: reviewModelOf(t), spec: JSON.stringify(t), status: 'pending', branch: null, base_sha: heads.get(t.project)! })
+    for (const [pid, sha] of heads) this.store.set(`base:${requestId}:${pid}`, sha)
+    this.store.updateRequest(requestId, { status: 'executing', note: null })
+    this.emitRequest(requestId, `실행 시작: 작업 ${plan.tasks.length}개`)
+    return null
+  }
+
+  /** Programmatic plan approval (tests, CLI): same path as the card. */
+  async createTasks(requestId: string): Promise<string | null> {
+    const prep = await this.preparePlan(requestId)
+    if ('error' in prep) return this.failRequest(requestId, prep.error)
+    const err = this.store.tx(() => this.createTasksTx(requestId, prep.heads))
+    this.kick()
+    return err
+  }
+
   // ----- tick (§C order) -----
   kick(): void { void this.tick() }
-
-  private current: Promise<void> | null = null
 
   tick(): Promise<void> {
     if (this.stopped) return Promise.resolve()
@@ -231,6 +393,7 @@ export class Runner {
         await this.step('revise', () => this.reviseOne())
         await this.step('diagnose', () => this.diagnoseOne())
         await this.step('notify', () => this.notifyDecisions())
+        // The reconciler runs inside the same tick lock (§5).
         if (this.now() - this.lastReconcile >= RECONCILE_MS) { this.lastReconcile = this.now(); await this.step('reconcile', () => this.reconcile()) }
       } while (this.again)
     } finally { this.ticking = false }
@@ -254,6 +417,16 @@ export class Runner {
     return l
   }
 
+  private wallMs(t: TaskRow | null): number {
+    return (this.cfg.attemptWallMinutes[(t?.grade ?? 'L1') as keyof HqConfig['attemptWallMinutes']] ?? 45) * 60_000
+  }
+
+  /** Time already spent by earlier work attempts of this generation (resume included), for the 3× cap (§13). */
+  private spentMs(t: TaskRow, exclude: string): number {
+    return this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.id !== exclude && a.generation === t.generation && a.started_at && a.ended_at)
+      .reduce((s, a) => s + Math.max(0, Date.parse(a.ended_at!) - Date.parse(a.started_at!)), 0)
+  }
+
   private async pollLive(): Promise<void> {
     for (const att of this.store.liveAttempts()) {
       if (this.launching.has(att.id)) continue
@@ -267,10 +440,12 @@ export class Runner {
       const alive = l.child ? !l.exited : await sameProcessAlive(l.pid, l.lstart, l.startedAt)
       if (alive) {
         const now = this.now()
-        const wall = (this.cfg.attemptWallMinutes[(task?.grade ?? 'L1') as keyof HqConfig['attemptWallMinutes']] ?? 45) * 60_000
+        const wall = this.wallMs(task)
         const elapsed = now - Date.parse(att.started_at ?? new Date(now).toISOString())
-        if (!att.outcome && (elapsed > wall || l.tail.sameErrorCount >= 3)) {
-          const why = elapsed > wall ? `시간 초과 (${Math.round(elapsed / 60_000)}분 > ${wall / 60_000}분)` : `같은 도구 오류 3회 연속: ${l.tail.lastActivity ?? ''}`
+        const total = att.kind === 'work' && task ? this.spentMs(task, att.id) + elapsed : elapsed
+        if (!att.outcome && (elapsed > wall || total > 3 * wall || l.tail.sameErrorCount >= 3)) {
+          const why = elapsed > wall ? `시간 초과 (${Math.round(elapsed / 60_000)}분 > ${wall / 60_000}분)`
+            : total > 3 * wall ? `작업 누적 시간 초과 (${Math.round(total / 60_000)}분 > ${3 * wall / 60_000}분)` : `같은 도구 오류 3회 연속: ${l.tail.lastActivity ?? ''}`
           this.store.updateAttempt(att.id, { outcome: 'runaway', reason: why })
           att.outcome = 'runaway'
           this.bus.emit({ kind: 'attempt', text: `폭주 감시: ${why}`, data: { id: att.id } })
@@ -293,7 +468,7 @@ export class Runner {
         this.store.tx(() => {
           this.store.updateAttempt(att.id, { status: 'unverifiable', ended_at: this.iso(), reason: `판정 중 오류: ${String(e).slice(0, 300)}` })
           const t = this.store.task(att.task_id)
-          if (t && ['running', 'reviewing'].includes(t.status)) this.block(t, `판정 중 오류: ${String(e).slice(0, 300)}`)
+          if (t && t.generation === fresh.generation && ['running', 'reviewing'].includes(t.status)) this.block(t, `판정 중 오류: ${String(e).slice(0, 300)}`)
         })
       }
     }
@@ -308,70 +483,98 @@ export class Runner {
     }
   }
 
-  private requestStopped(t: TaskRow): boolean {
+  /** The attempt's result may change the task only while the task is still in the attempt's generation (§7.7). */
+  private stale(att: AttemptRow, t: TaskRow): boolean {
     const r = this.store.request(t.request_id)
-    return !r || r.status === 'cancelled' || t.status === 'cancelled'
+    return t.generation !== att.generation || !r || r.status === 'cancelled' || t.status === 'cancelled' || ['cancelled', 'superseded'].includes(att.outcome ?? '')
   }
+
+  /** Generation-guarded task update (the SQL carries `where generation = ?`). */
+  private tset(t: TaskRow, f: Parameters<Store['updateTask']>[1]): boolean { return this.store.updateTaskIf(t.id, t.generation, f) }
 
   // ----- work attempt judgement (§8, §C table) -----
   async finalizeWork(att: AttemptRow, l: Live): Promise<void> {
     const task = this.store.task(att.task_id)!
     const result = l.tail.finalResult()
     const endedAt = this.iso()
-    if (['cancelled', 'superseded'].includes(att.outcome ?? '') || this.requestStopped(task)) {
-      this.store.updateAttempt(att.id, { status: 'failed', ended_at: endedAt, reason: att.outcome === 'superseded' ? '선행 작업 변경으로 폐기' : '요청 중단', ...this.usage(result) })
+    const role = task.role === 'collect' ? 'collect' : 'implement'
+    const collectWt = role === 'collect' ? this.worktreeDir(task.request_id, `${task.key}.c${att.n}`) : null
+    if (this.stale(att, task)) {
+      this.store.updateAttempt(att.id, { status: 'failed', ended_at: endedAt, reason: att.outcome === 'cancelled' ? '요청 중단' : '세대가 바뀌어 결과를 반영하지 않음', ...this.usage(result) })
+      if (collectWt) await removeMirrorWorktree(this.mirror(task.project), collectWt).catch(() => {})
       return
     }
     const spec = specOf(task)
-    const role = task.role === 'collect' ? 'collect' : 'implement'
     const out = outDirOf(att), hq = hqDirOf(att)
+    const mirror = this.mirror(task.project)
     const report = readOut(out, 'report.md', REPORT_MAX)
+    let git: GitFacts | null = null
+    let fetched: string | null = null
+    if (role === 'implement' && task.worktree && task.base_sha) {
+      fetched = await fetchWork(mirror, task.worktree, this.resultRef(task, att.id))
+      git = await mirrorFacts(mirror, task.base_sha, fetched)
+    } else if (collectWt && task.base_sha && existsSync(collectWt)) {
+      const wt = { path: collectWt, gitDir: join(mirror, 'worktrees', `${task.key}.c${att.n}`), mirror }
+      const head = (await wtGit(wt, ['rev-parse', 'HEAD'])).stdout.trim() || null
+      git = { head, changed: [], status: head ? await wtStatus(wt).catch(() => '?') : '', baseIsAncestor: true, hasMerges: false }
+      await removeMirrorWorktree(mirror, collectWt).catch(() => {})
+    }
+    const stderr = (readText(join(hq, 'stderr.log'), 200_000) ?? '').slice(-20_000)
     const j = judgeWork({
       role, token: att.attempt_token, owns: spec.owns, protectedPaths: this.cfg.protectedPaths, base: task.base_sha ?? '',
-      runaway: att.outcome === 'runaway', result, stderr: (readText(join(hq, 'stderr.log'), 200_000) ?? '').slice(-20_000), rejectedSeen: l.tail.rejectedSeen,
-      doneRaw: readOut(out, 'done.json', DONE_MAX), report,
-      git: task.worktree && task.base_sha ? await collectGitFacts(task.worktree, task.base_sha) : null,
+      runaway: att.outcome === 'runaway', result, stderr, rejectedSeen: l.tail.rejectedSeen,
+      doneRaw: readOut(out, 'done.json', DONE_MAX), report, git,
     })
     const reason = j.reasons.join('\n') || null
-    atomicJson(join(hq, 'result.json'), { outcome: j.outcome, reasons: j.reasons, summary: j.done?.summary ?? null, protectedChanges: j.protectedChanges, at: endedAt })
+    atomicJson(join(hq, 'result.json'), { outcome: j.outcome, reasons: j.reasons, summary: j.done?.summary ?? null, fetched, protectedChanges: j.protectedChanges, at: endedAt })
     if (j.outcome === 'succeeded' && role === 'collect' && report !== null) atomicWrite(join(hq, 'report.sealed.md'), report)
+    if (j.login) this.requireLogin(String(result?.result ?? stderr).slice(0, 300))
+    else if (j.outcome === 'limited' && this.quota().mode !== 'hold') this.limitBackoff()
     const status: WorkOutcome = j.outcome
     this.store.tx(() => {
       this.store.updateAttempt(att.id, { status, ended_at: endedAt, reason: att.outcome === 'runaway' ? att.reason : reason, ...this.usage(result),
         ...(att.outcome ? {} : { outcome: j.done?.outcome ?? j.outcome }) })
       const t = this.store.task(att.task_id)!
-      if (t.status !== 'running') return
+      if (t.status !== 'running' || t.generation !== att.generation) return
       switch (j.outcome) {
-        case 'succeeded':
-          if (role === 'collect') this.store.updateTask(t.id, { status: 'passed', head_sha: t.base_sha, report_sha: report === null ? null : sha256(report), limited_streak: 0, note: null })
-          else this.store.updateTask(t.id, { status: 'verifying', head_sha: j.done!.head_sha, report_sha: report === null ? null : sha256(report), limited_streak: 0, review_invalid: 0, checks_state: null, note: null })
+        case 'succeeded': {
+          const reviewModel = t.review_model === 'none' && j.protectedChanges.length ? 'sonnet' : t.review_model
+          const sha = report === null ? null : sha256(report)
+          if (role === 'collect') this.tset(t, { status: reviewModel === 'none' ? 'passed' : 'reviewing', head_sha: t.base_sha, report_sha: sha, limited_streak: 0, review_invalid: 0, note: null })
+          else this.tset(t, { status: 'verifying', head_sha: j.done!.head_sha, report_sha: sha, review_model: reviewModel, limited_streak: 0, review_invalid: 0, checks_state: null, note: null })
           break
+        }
         case 'brief_blocked':
           if (t.revise_turns >= MAX_REVISE_TURNS) this.block(t, `지시서를 ${t.revise_turns}번 고쳤는데도 작업자가 멈췄어요: ${reason}`)
-          else this.store.updateTask(t.id, { status: 'revising', note: reason })
+          else this.tset(t, { status: 'revising', note: reason })
           break
         case 'question': {
-          const rounds = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'question').length
+          const rounds = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'question' && a.generation === t.generation).length
           if (rounds > MAX_QUESTION_ROUNDS) { this.block(t, `작업자 질문이 ${MAX_QUESTION_ROUNDS}라운드를 넘었어요`); break }
           this.store.addTaskQuestions(t.id, att.id, t.revision, j.done!.questions.map((q) => ({ id: 'tq-' + randomUUID().slice(0, 8), ...q })))
-          this.store.updateTask(t.id, { status: 'question', resume_session: att.session_id, note: j.done!.summary || null })
+          this.tset(t, { status: 'question', resume_session: att.session_id, note: j.done!.summary || null })
           break
         }
         case 'limited': {
+          if (j.login) { this.tset(t, { status: 'held', resume_session: att.session_id, note: 'Claude 로그인 필요' }); break }
           const streak = t.limited_streak + 1
-          if (streak >= MAX_LIMITED_STREAK) { this.store.updateTask(t.id, { limited_streak: streak }); this.block(t, `사용 한도로 ${streak}번 연속 중단됐어요`) }
-          else this.store.updateTask(t.id, { status: 'held', limited_streak: streak, resume_session: att.session_id, note: '사용 한도로 보류' })
+          if (streak >= MAX_LIMITED_STREAK) { this.tset(t, { limited_streak: streak }); this.block(this.store.task(t.id)!, `사용 한도로 ${streak}번 연속 중단됐어요`) }
+          else this.tset(t, { status: 'held', limited_streak: streak, resume_session: att.session_id, note: '사용 한도로 보류' })
           break
         }
         case 'transient': {
           const prev = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.id !== att.id).at(-1)
           if (prev?.status === 'transient') this.rework(t, `일시 오류가 2번 연속: ${reason}`)
-          else this.store.updateTask(t.id, { status: 'pending', note: reason })
+          else this.tset(t, { status: 'pending', note: reason })
           break
         }
-        case 'unverifiable':
-          this.block(t, `완료를 확인할 수 없어요: ${reason}`)
+        case 'unverifiable': {
+          // §8.4: one automatic retry for a format mistake by a worker that ran to the end.
+          const prev = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.id !== att.id && a.generation === t.generation).at(-1)
+          if (result && prev?.status !== 'unverifiable') this.rework(t, `형식 실수, 자동 재시도 1회: ${reason}`, true)
+          else this.block(t, `완료를 확인할 수 없어요: ${reason}`)
           break
+        }
         default: // failed, runaway
           this.rework(t, j.outcome === 'runaway' ? `폭주로 중단: ${att.reason ?? ''}` : reason ?? '실패')
       }
@@ -379,62 +582,59 @@ export class Runner {
     })
   }
 
-  /** §C rework(): back for another attempt, or blocked after maxAttempts. Invalidates dependents if it had passed. Call inside a tx. */
-  rework(t: TaskRow, reason: string): void {
+  /** §C rework(): another attempt, or blocked after maxAttempts. A task that had passed invalidates its dependents. Call inside a tx. */
+  rework(t: TaskRow, reason: string, sameModel = false): void {
     const cur = this.store.task(t.id)!
     const wasPassed = cur.status === 'passed'
     if (cur.attempts >= this.cfg.maxAttempts) this.block(cur, `${cur.attempts}번 실패했어요: ${reason}`)
-    else this.store.updateTask(cur.id, { status: 'rework', note: reason.slice(0, 2000), model: cur.attempts + 1 >= 3 ? ladderUp(this.cfg.ladder, cur.model) : cur.model })
+    else this.tset(cur, { status: 'rework', note: reason.slice(0, 2000), model: !sameModel && cur.attempts + 1 >= 3 ? ladderUp(this.cfg.ladder, cur.model) : cur.model })
     if (wasPassed) this.invalidateDependents(cur)
   }
 
-  /** Circuit break: the chairman decides (§9). Call inside a tx. */
+  /** Circuit break: the chairman decides (§9). The decision revision is the per-task block count. Call inside a tx. */
   block(t: TaskRow, reason: string): void {
-    this.store.updateTask(t.id, { status: 'blocked', note: reason.slice(0, 2000), diagnosis: null })
+    const cur = this.store.task(t.id)!
+    this.store.updateTask(t.id, { status: 'blocked', note: reason.slice(0, 2000), diagnosis: null, block_count: cur.block_count + 1 })
     const r = this.store.request(t.request_id)
     if (r && r.status === 'executing') this.store.updateRequest(r.id, { status: 'blocked', note: `작업 ${t.title} 판단 필요` })
     this.emitTask(t, `작업 차단: ${t.title}`)
   }
 
-  /** §11: every transitive dependent starts over from a fresh worktree; old branches are archived as -v<n>. Call inside a tx. */
-  invalidateDependents(t: TaskRow): void {
+  /** Transitive dependents of a task within its request. */
+  private dependents(t: TaskRow): TaskRow[] {
     const all = this.store.tasks(t.request_id)
     const gone = new Set<string>([t.key])
     for (let changed = true; changed;) {
       changed = false
       for (const x of all) if (!gone.has(x.key) && specOf(x).depends_on.some((d) => gone.has(d))) { gone.add(x.key); changed = true }
     }
-    const kill: number[] = []
-    for (const d of all) {
-      if (d.id === t.id || !gone.has(d.key) || d.status === 'cancelled') continue
-      for (const a of this.store.liveAttempts()) if (a.task_id === d.id) { this.store.updateAttempt(a.id, { outcome: 'superseded' }); if (a.pid) kill.push(a.pid) }
-      const sameProjectDep = specOf(d).depends_on.some((k) => all.find((x) => x.key === k)?.project === d.project)
-      this.store.updateTask(d.id, { status: 'pending', attempts: 0, head_sha: null, worktree: null, base_sha: sameProjectDep ? null : d.base_sha, limited_streak: 0,
-        review_invalid: 0, resume_session: null, checks_state: null, report_sha: null, note: `선행 작업 ${t.key}이(가) 바뀌어 처음부터 다시 해요` })
-      if (d.worktree || d.branch) { const snap = { ...d }; queueMicrotask(() => this.bg(this.archiveTask(snap, d.worktree))) }
-    }
-    this.store.supersede(`accept:${t.request_id}`)
-    for (const pid of kill) queueMicrotask(() => killGroup(pid, 'SIGTERM'))
+    return all.filter((x) => x.id !== t.id && gone.has(x.key))
   }
 
-  /** Removes a stale worktree and renames its branch to `<branch>-v<n>` (kept, never deleted). Idempotent. */
-  async archiveTask(t: TaskRow, oldWorktree: string | null = null): Promise<void> {
-    const p = this.project(t.project)
-    if (!p) return
-    await withRepo(p.path, async () => {
-      const wt = oldWorktree ?? this.worktreeDir(t.request_id, t.key)
-      if (existsSync(wt)) await removeWorktree(p.path, wt)
-      if (t.branch && await branchExists(p.path, t.branch)) {
-        let n = 1
-        while (await branchExists(p.path, `${t.branch}-v${n}`)) n++
-        await gitOk(p.path, ['branch', '-m', t.branch, `${t.branch}-v${n}`])
-      }
-    })
+  /**
+   * Starts a task over (§11): generation+1, live attempts ended, pending, attempts 0, clone discarded (mirror refs are kept),
+   * questions/session/base/verification/review dropped. Call inside a tx.
+   */
+  resetTask(d: TaskRow, note: string, base: string | null = null): void {
+    const all = this.store.tasks(d.request_id)
+    for (const a of this.store.liveAttempts()) if (a.task_id === d.id) {
+      this.store.updateAttempt(a.id, { outcome: 'superseded' })
+      if (a.pid) { const pid = a.pid; queueMicrotask(() => killGroup(pid, 'SIGTERM')) }
+    }
+    const sameProjectDep = specOf(d).depends_on.some((k) => { const x = all.find((y) => y.key === k); return x?.project === d.project && x.role === 'implement' })
+    const requestBase = this.store.get(`base:${d.request_id}:${d.project}`) ?? d.base_sha
+    this.store.updateTask(d.id, { generation: d.generation + 1, status: 'pending', attempts: 0, head_sha: null, worktree: null,
+      base_sha: base ?? (sameProjectDep ? null : requestBase), limited_streak: 0, review_invalid: 0, resume_session: null, checks_state: null, report_sha: null, note })
+    if (d.worktree) { const path = d.worktree; queueMicrotask(() => rmSync(path, { recursive: true, force: true })) }
+  }
+
+  /** §11: every transitive dependent of a changed result (code head or collect report) starts over. Call inside a tx. */
+  invalidateDependents(t: TaskRow): void {
+    for (const d of this.dependents(t)) if (d.status !== 'cancelled') this.resetTask(d, `선행 작업 ${t.key}의 결과가 바뀌어 처음부터 다시 해요`)
+    this.store.supersede(`accept:${t.request_id}`)
   }
 
   // ----- dispatch (§C 배정, §13) -----
-  private liveCount(): number { return this.store.liveAttempts().length }
-
   depsPassed(t: TaskRow, all: TaskRow[]): boolean {
     return specOf(t).depends_on.every((d) => all.find((x) => x.key === d)?.status === 'passed')
   }
@@ -452,8 +652,10 @@ export class Runner {
   private async dispatch(): Promise<void> {
     const q = this.quota()
     if (q.mode === 'hold') return
-    const cap = q.mode === 'save' || q.mode === 'unobserved' ? 1 : this.cfg.maxWorkers
-    let free = cap - this.liveCount()
+    const single = q.mode === 'save' || q.mode === 'unobserved'
+    // save / unobserved: one process in total, and the CEO goes first (§13).
+    if (single && (this.ceoLock.busy || this.ceoWaiting())) return
+    let free = (single ? 1 : this.cfg.maxWorkers) - this.store.liveAttempts().length
     for (const t of this.store.tasksByStatus(['reviewing'])) {
       if (free <= 0) return
       const r = this.store.request(t.request_id)
@@ -469,18 +671,18 @@ export class Runner {
 
   // ----- work attempts (§7 start protocol) -----
   private claimWork(t: TaskRow): boolean {
+    // The previous attempt decides counting even across a revision (a brief_blocked restart is never counted).
     const prev = this.store.attempts(t.id).filter((a) => a.kind === 'work').at(-1)
     const resume = t.resume_session
     const counted = !resume && !(prev && UNCOUNTED_PREV.has(prev.status))
-    const n = this.store.attempts(t.id).filter((a) => a.kind === 'work').length + 1
+    const n = this.store.nextAttemptN(t.id, 'work')
     const id = `${t.id}~a${n}`
-    const sessionId = resume ?? randomUUID()
     const claimed = this.store.tx(() => {
       const cur = this.store.task(t.id)!
-      if (!['pending', 'rework', 'held'].includes(cur.status)) return false
+      if (!['pending', 'rework', 'held'].includes(cur.status) || cur.generation !== t.generation) return false
       this.store.insertAttempt({ id, task_id: t.id, kind: 'work', n, model: cur.model, status: 'starting', attempt_token: randomBytes(16).toString('hex'),
-        dir: this.runDir(t.request_id, t.key, id), session_id: sessionId })
-      this.store.updateTask(t.id, { status: 'running', attempts: cur.attempts + (counted ? 1 : 0) })
+        dir: this.runDir(t.request_id, t.key, id), session_id: resume ?? randomUUID(), generation: cur.generation })
+      this.tset(cur, { status: 'running', attempts: cur.attempts + (counted ? 1 : 0) })
       return true
     })
     if (!claimed) return false
@@ -490,7 +692,6 @@ export class Runner {
     return true
   }
 
-  /** Base commit (§11): request base, a single same-project dependency's head, or hq's merge of several. */
   private depHeads(t: TaskRow): TaskRow[] {
     const all = this.store.tasks(t.request_id)
     return specOf(t).depends_on.map((k) => all.find((x) => x.key === k)!).filter((d) => d && d.project === t.project && d.role === 'implement' && d.head_sha)
@@ -500,9 +701,36 @@ export class Runner {
     const all = this.store.tasks(t.request_id)
     return specOf(t).depends_on.map((k) => all.find((x) => x.key === k)!).filter((d) => d && d.status === 'passed').map((d) => {
       const work = this.store.attempts(d.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
-      const sealed = work ? readText(join(hqDirOf(work), d.role === 'collect' ? 'report.sealed.md' : '__none__'), 200_000) : null
+      const sealed = work && d.role === 'collect' ? readText(join(hqDirOf(work), 'report.sealed.md'), 200_000) : null
       return { key: d.key, title: d.title, project: d.project, headSha: d.role === 'implement' ? d.head_sha : null, reportSha: d.report_sha, report: sealed }
     })
+  }
+
+  /** Base of a task (§11): request base, one same-project dependency head, or hq's --no-ff merge of several (in a mirror worktree). */
+  private async resolveBase(t: TaskRow): Promise<string> {
+    const deps = this.depHeads(t)
+    if (!deps.length) return t.base_sha ?? this.store.get(`base:${t.request_id}:${t.project}`)!
+    if (deps.length === 1) return deps[0].head_sha!
+    const mirror = this.mirror(t.project)
+    const wt = await verifyWorktree(mirror, this.worktreeDir(t.request_id, `${t.key}.base`), deps[0].head_sha!)
+    try {
+      const m = await withRepo(mirror, () => wtMerge(wt, deps.slice(1).map((d) => d.head_sha!), `hq: ${t.key}의 선행 작업 합치기 (${deps.map((d) => d.key).join(', ')})`))
+      if (!m.ok) throw new Setup(`선행 작업(${deps.map((d) => d.key).join(', ')})의 결과를 합치다 충돌: ${m.files.join(', ')}`)
+      await withRepo(mirror, () => hqGitOk(mirror, null, ['update-ref', `refs/hq/${t.request_id}/${t.key}/base-g${t.generation}`, m.sha]))
+      return m.sha
+    } finally { await removeMirrorWorktree(mirror, wt.path).catch(() => {}) }
+  }
+
+  private async runSetup(project: Project, wt: string, hq: string, name: string): Promise<void> {
+    if (!project.setup) return
+    const prof = join(hq, `${name}.sb`)
+    atomicWrite(prof, sandboxProfile(this.sandboxFor(wt, null)))
+    const p = this.procTracker(name)
+    try {
+      const s = await runSandboxed(project.setup, wt, this.cfg.checkTimeoutMinutes * 60_000, prof, 'setup', p.onSpawn)
+      atomicJson(join(hq, `${name}.json`), s)
+      if (!s.pass) throw new Setup(`setup 명령 실패 (종료 코드 ${s.exitCode ?? '시간 초과'}): ${s.outputTail.split('\n').slice(-5).join(' ').slice(0, 300)}`)
+    } finally { p.done() }
   }
 
   private async prepareAndLaunch(attemptId: string, resume: boolean, prev: AttemptRow | null): Promise<void> {
@@ -513,43 +741,25 @@ export class Runner {
     try {
       if (!project) throw new Setup(`등록되지 않은 프로젝트: ${t.project}`)
       mkdirSync(hq, { recursive: true }); mkdirSync(out, { recursive: true })
-      const repo = project.path
-      const wt = this.worktreeDir(t.request_id, t.key)
-      if (!t.worktree) {
-        await this.archiveTask(t)
-        const deps = this.depHeads(t)
-        let base = deps.length ? deps[0].head_sha! : t.base_sha!
-        if (t.role === 'collect') await withRepo(repo, () => addDetachedWorktree(repo, wt, base))
-        else {
-          await withRepo(repo, () => ensureWorktree(repo, wt, t.branch!, base))
-          if (deps.length > 1) {
-            const m = await withRepo(repo, () => mergeHeads(wt, deps.slice(1).map((d) => d.head_sha!), `hq: ${t.key}의 선행 작업 합치기 (${deps.map((d) => d.key).join(', ')})`))
-            if (!m.ok) throw new Setup(`선행 작업(${deps.map((d) => d.key).join(', ')})의 결과를 합치다 충돌: ${m.files.join(', ')}`)
-            base = m.sha
-          }
+      const mirror = this.mirror(t.project)
+      if (!existsSync(join(mirror, 'HEAD'))) await ensureMirror(project, mirror)
+      let cwd: string
+      if (t.role === 'collect') {
+        const base = t.base_sha ?? await this.resolveBase(t)
+        cwd = (await verifyWorktree(mirror, this.worktreeDir(t.request_id, `${t.key}.c${att.n}`), base)).path
+        if (!t.base_sha) this.tset(t, { base_sha: base })
+        await this.runSetup(project, cwd, hq, 'setup')
+      } else {
+        cwd = this.workDir(t.request_id, t.key)
+        if (!t.worktree) {
+          const base = await this.resolveBase(t)
+          await newWorkClone(mirror, cwd, base)
+          await this.runSetup(project, cwd, hq, 'setup')
+          if (!this.tset(t, { worktree: cwd, base_sha: base })) throw new Setup('작업이 다른 세대로 바뀌어 시작을 멈췄어요')
+          t = this.store.task(t.id)!
         }
-        if (project.setup) {
-          const sb = await this.sandboxFor(wt, null, repo)
-          const prof = join(hq, 'setup.sb')
-          atomicWrite(prof, sandboxProfile(sb))
-          const s = await runSandboxed(project.setup, wt, this.cfg.checkTimeoutMinutes * 60_000, prof, 'setup')
-          atomicJson(join(hq, 'setup.json'), s)
-          if (!s.pass) throw new Setup(`setup 명령 실패 (종료 코드 ${s.exitCode ?? '시간 초과'}): ${s.outputTail.split('\n').slice(-5).join(' ').slice(0, 300)}`)
-        }
-        this.store.updateTask(t.id, { worktree: wt, base_sha: base })
-        t = this.store.task(t.id)!
+        await this.ensureBaseline(t, hq)
       }
-      if (t.role === 'implement') await this.ensureBaseline(t, hq)
-      let dirtyNotice: string | null = null
-      if (t.role === 'implement' && existsSync(wt)) {
-        const snap = await worktreeDirtySnapshot(wt)
-        if (snap) {
-          atomicWrite(join(hq, 'dirty.patch'), snap)
-          await resetClean(wt)
-          dirtyNotice = '이전 시도가 남긴 커밋되지 않은 변경을 hq가 저장(hq/dirty.patch)한 뒤 지웠다. 마지막 커밋에서 이어서 한다.'
-        }
-      }
-      const spec = specOf(t)
       const role = t.role === 'collect' ? 'collect' : 'implement'
       let prompt: string
       if (resume) {
@@ -557,67 +767,70 @@ export class Runner {
         prompt = resumePrompt({ answers, out, token: att.attempt_token, role, base: t.base_sha! })
       } else {
         const request = this.store.request(t.request_id)!
-        prompt = workPrompt({ task: spec, requestText: request.text, projectName: project.name, cwd: wt, branch: role === 'implement' ? t.branch : null, base: t.base_sha!,
-          out, token: att.attempt_token, rework: t.status === 'running' && t.note ? this.reworkText(t, prev) : null, dirtyNotice, upstream: this.upstream(t) })
+        prompt = workPrompt({ task: specOf(t), requestText: request.text, projectName: project.name, cwd, branch: role === 'implement' ? 'hq-work' : null, base: t.base_sha!,
+          out, token: att.attempt_token, rework: t.note && prev ? this.reworkText(t, prev) : null, dirtyNotice: null, upstream: this.upstream(t) })
       }
       const argv = claudeArgs(this.cfg, { role, model: att.model, sessionId: att.session_id, resume, out })
-      const { info, child } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd: wt, hqDir: hq, outDir: out, prompt, sessionId: att.session_id,
-        sandbox: await this.sandboxFor(wt, out, repo),
-        spec: { attemptId, kind: 'work', role, model: att.model, base: t.base_sha, branch: t.branch, attempt_token: att.attempt_token, resume, startedAt: this.iso() } })
+      const { info, child } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd, hqDir: hq, outDir: out, prompt, sessionId: att.session_id,
+        sandbox: this.sandboxFor(cwd, out),
+        spec: { attemptId, kind: 'work', role, model: att.model, base: t.base_sha, generation: att.generation, attempt_token: att.attempt_token, resume, startedAt: this.iso() } })
       const startedAt = this.iso()
       this.store.tx(() => {
         this.store.updateAttempt(attemptId, { status: 'running', pid: info.pid, lstart: info.lstart, started_at: startedAt })
-        this.store.updateTask(t.id, { resume_session: null })
+        this.tset(t, { resume_session: null })
       })
       this.track({ ...att, status: 'running' }, info.pid, info.lstart, info.startedAt, child)
     } catch (e) {
-      this.startFailed(att, e instanceof Setup ? e.message : `시작 실패: ${String(e)}`, e instanceof Setup)
+      this.startFailed(att, e instanceof Setup ? e.message : `시작 실패: ${String(e)}`)
     }
   }
 
-  private reworkText(t: TaskRow, prev: AttemptRow | null): string {
-    const works = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'succeeded')
-    const lastOk = works.at(-1)
+  private reworkText(t: TaskRow, prev: AttemptRow): string {
+    const lastOk = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
     const checks = lastOk ? readJson<ChecksFile>(join(hqDirOf(lastOk), 'checks.json')) : null
     const lastReview = this.store.attempts(t.id).filter((a) => a.kind === 'review' && a.outcome === 'blocking').at(-1)
     const verdict = lastReview ? readJson<Verdict>(join(hqDirOf(lastReview), 'verdict.json')) : null
     // Only evidence that belongs to the failure being reworked: checks/verdict of the last succeeded attempt.
-    const fresh = !prev || prev.status === 'succeeded'
+    const fresh = prev.status === 'succeeded'
     return reworkEvidence({ reasons: t.note ? [t.note] : [], checks: fresh ? checks : null, verdict: fresh ? verdict : null })
   }
 
-  /** §9 baseline: run each check once on this base (cached per repo/base/command). */
+  private baselineKey(t: TaskRow, a: Acceptance): string {
+    return `baseline:${this.mirror(t.project)}:${t.base_sha}:${sha256(`${this.project(t.project)?.setup ?? ''}\n${a.check}`)}`
+  }
+
+  /** §9 baseline: each check once on the base, recorded (never an exemption). */
   private async ensureBaseline(t: TaskRow, hq: string): Promise<void> {
     const project = this.project(t.project)!
-    const specs = nonManual(specOf(t))
-    const key = (cmd: string) => `baseline:${project.path}:${t.base_sha}:${sha256(cmd)}`
-    const missing = specs.filter((a) => this.store.get(key(a.check)) === null)
+    const missing = nonManual(specOf(t)).filter((a) => this.store.get(this.baselineKey(t, a)) === null)
     if (!missing.length) return
-    const res = await baseline({ repo: project.path, base: t.base_sha!, path: `${this.worktreeDir(t.request_id, t.key)}.baseline`,
-      checks: missing.map((a) => ({ id: a.id, command: a.check })), setup: project.setup ?? null, timeoutMs: this.cfg.checkTimeoutMinutes * 60_000,
-      sandbox: (wt) => ({ worktree: wt, out: null, repoGitDir: this.gitDirs.get(project.path) ?? null, hqHome: this.home, tokenDir: this.tokenDir, hqPort: this.hqPort, extraWritable: this.cfg.sandbox.extraWritable, claudeDir: join(homedir(), '.claude') }),
-      profilePath: join(hq, 'baseline.sb') })
-    for (const a of missing) this.store.set(key(a.check), res[a.id] ? 'pass' : 'fail')
+    const p = this.procTracker('baseline')
+    try {
+      const res = await baseline({ mirror: this.mirror(t.project), base: t.base_sha!, path: this.worktreeDir(t.request_id, `${t.key}.baseline`),
+        checks: missing.map((a) => ({ id: a.id, command: a.check })), setup: project.setup ?? null, timeoutMs: this.cfg.checkTimeoutMinutes * 60_000,
+        sandbox: (wt) => this.sandboxFor(wt, null), profilePath: join(hq, 'baseline.sb'), onSpawn: p.onSpawn })
+      for (const a of missing) this.store.set(this.baselineKey(t, a), res[a.id] ? 'pass' : 'fail')
+    } finally { p.done() }
   }
 
-  baselineFailed(t: TaskRow, prefix = ''): Set<string> {
-    const project = this.project(t.project)
-    const out = new Set<string>()
-    if (!project) return out
-    for (const a of nonManual(specOf(t))) if (this.store.get(`baseline:${project.path}:${t.base_sha}:${sha256(a.check)}`) === 'fail') out.add(prefix + a.id)
-    return out
+  /** Checks hq runs itself, and regression checks handed to the reviewer because they already failed on the base (§9). */
+  effectiveChecks(t: TaskRow, prefix = ''): { checks: CheckSpec[]; manual: string[]; basePassed: Record<string, boolean> } {
+    const checks: CheckSpec[] = [], manual: string[] = [], basePassed: Record<string, boolean> = {}
+    for (const a of nonManual(specOf(t))) {
+      const b = this.store.get(this.baselineKey(t, a))
+      if (b !== null) basePassed[prefix + a.id] = b === 'pass'
+      if (kindOf(a) === 'regression' && b === 'fail') manual.push(prefix + a.id)
+      else checks.push({ id: prefix + a.id, command: a.check, kind: kindOf(a) })
+    }
+    return { checks, manual, basePassed }
   }
 
-  private startFailed(att: AttemptRow, why: string, setupProblem: boolean): void {
+  /** start_failed never restarts automatically (v3): the task stops for the chairman. */
+  private startFailed(att: AttemptRow, why: string): void {
     this.store.tx(() => {
       this.store.updateAttempt(att.id, { status: 'start_failed', ended_at: this.iso(), reason: why.slice(0, 2000) })
       const t = this.store.task(att.task_id)!
-      if (att.kind === 'work' && t.status === 'running') this.store.updateTask(t.id, { status: 'pending' })
-      const recent = this.store.attempts(t.id).filter((a) => a.kind === att.kind).slice(-MAX_START_FAILURES)
-      const cur = this.store.task(t.id)!
-      if (!['pending', 'reviewing'].includes(cur.status)) return
-      if (setupProblem) this.block(cur, why)
-      else if (recent.length >= MAX_START_FAILURES && recent.every((a) => a.status === 'start_failed')) this.block(cur, `${att.kind === 'work' ? '작업자' : '검토자'}를 ${MAX_START_FAILURES}번 연속 시작하지 못했어요: ${why.slice(0, 300)}`)
+      if (t.generation === att.generation && ['running', 'reviewing'].includes(t.status)) this.block(t, why)
     })
     this.bus.emit({ kind: 'attempt', text: why.slice(0, 200), data: { id: att.id } })
   }
@@ -633,40 +846,50 @@ export class Runner {
 
   private async verify(t: TaskRow): Promise<void> {
     const att = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
-    this.store.updateTask(t.id, { checks_state: 'running' })
+    this.tset(t, { checks_state: 'running' })
+    const mirror = this.mirror(t.project)
+    const path = this.worktreeDir(t.request_id, `${t.key}.v${att?.n ?? 0}`)
+    const p = this.procTracker('checks')
     try {
-      if (!att || !t.worktree || !t.base_sha || !t.head_sha) throw new Error('성공한 시도·worktree·커밋 정보가 없음')
+      if (!att || !t.base_sha || !t.head_sha) throw new Error('성공한 시도·커밋 정보가 없음')
       const project = this.project(t.project)!
       const hq = hqDirOf(att)
-      const file = await runChecks({ cwd: t.worktree, base: t.base_sha, head: t.head_sha, checks: nonManual(specOf(t)).map((a) => ({ id: a.id, command: a.check })),
-        timeoutMs: this.cfg.checkTimeoutMinutes * 60_000, sandbox: await this.sandboxFor(t.worktree, null, project.path), profilePath: checksProfile(hq), baselineFailed: this.baselineFailed(t) })
+      const wt = await verifyWorktree(mirror, path, t.head_sha)
+      await this.runSetup(project, wt.path, hq, 'verify-setup')
+      const eff = this.effectiveChecks(t)
+      const file = await runChecks({ wt, base: t.base_sha, head: t.head_sha, checks: eff.checks, basePassed: eff.basePassed,
+        timeoutMs: this.cfg.checkTimeoutMinutes * 60_000, sandbox: this.sandboxFor(wt.path, null), profilePath: checksProfile(hq), onSpawn: p.onSpawn })
+      file.manual = eff.manual
       atomicJson(join(hq, 'checks.json'), file)
-      const failed = file.checks.filter((c) => !c.pass && !c.baselineFailed).map((c) => `[${c.id}] ${c.command} → ${c.exitCode ?? '시간 초과'}`)
+      const failed = file.checks.filter((c) => !c.pass).map((c) => `[${c.id}] ${c.command} → ${c.exitCode ?? '시간 초과'}`)
       if (file.error) failed.unshift(file.error)
       if (file.secrets.length) failed.push(`비밀값 패턴·금지 파일: ${file.secrets.map((s) => `${s.file}:${s.line}(${s.pattern})`).join(', ')}`)
       this.store.tx(() => {
         const cur = this.store.task(t.id)
-        if (!cur || cur.status !== 'verifying' || cur.head_sha !== t.head_sha) return
-        if (file.pass) this.store.updateTask(cur.id, { status: cur.review_model === 'none' ? 'passed' : 'reviewing', checks_state: 'passed' })
-        else { this.store.updateTask(cur.id, { checks_state: 'failed' }); this.rework(cur, `기계 검증 실패: ${failed.join('; ')}`) }
+        if (!cur || cur.status !== 'verifying' || cur.generation !== t.generation || cur.head_sha !== t.head_sha) return
+        if (file.pass) this.tset(cur, { status: cur.review_model === 'none' ? 'passed' : 'reviewing', checks_state: 'passed' })
+        else { this.tset(cur, { checks_state: 'failed' }); this.rework(this.store.task(cur.id)!, `기계 검증 실패: ${failed.join('; ')}`) }
         this.emitTask(cur, `${cur.title}: 검증 ${file.pass ? '통과' : '실패'}`)
       })
     } catch (e) {
       this.store.tx(() => {
         const cur = this.store.task(t.id)
-        if (cur?.status === 'verifying') { this.store.updateTask(cur.id, { checks_state: 'error' }); this.block(cur, `검증을 실행할 수 없어요: ${String(e).slice(0, 300)}`) }
+        if (cur?.status === 'verifying' && cur.generation === t.generation) { this.tset(cur, { checks_state: 'error' }); this.block(cur, e instanceof Setup ? e.message : `검증을 실행할 수 없어요: ${String(e).slice(0, 300)}`) }
       })
+    } finally {
+      p.done()
+      await removeMirrorWorktree(mirror, path).catch(() => {})
     }
   }
 
   // ----- cross review (§10) -----
-  private reviewWorktree(t: TaskRow, n: number): string { return `${this.worktreeDir(t.request_id, t.key)}.r${n}` }
+  private reviewWorktree(t: TaskRow, n: number): string { return this.worktreeDir(t.request_id, `${t.key}.r${n}`) }
 
   private claimReview(t: TaskRow): boolean {
-    const n = this.store.attempts(t.id).filter((a) => a.kind === 'review').length + 1
+    const n = this.store.nextAttemptN(t.id, 'review')
     const id = `${t.id}~r${n}`
     this.store.insertAttempt({ id, task_id: t.id, kind: 'review', n, model: t.review_model, status: 'starting', attempt_token: randomBytes(16).toString('hex'),
-      dir: this.runDir(t.request_id, t.key, id), session_id: randomUUID() })
+      dir: this.runDir(t.request_id, t.key, id), session_id: randomUUID(), generation: t.generation })
     this.launching.add(id)
     this.bg(this.launchReview(id).finally(() => this.launching.delete(id)))
     this.emitTask(t, `${t.review_model}가 ${t.title} 검토 시작`)
@@ -677,54 +900,65 @@ export class Runner {
     const att = this.store.attempt(attemptId)!
     const t = this.store.task(att.task_id)!
     const project = this.project(t.project)!
-    const wt = this.reviewWorktree(t, att.n)
+    const mirror = this.mirror(t.project)
+    const path = this.reviewWorktree(t, att.n)
     const hq = hqDirOf(att)
     try {
       mkdirSync(hq, { recursive: true })
-      await withRepo(project.path, () => addDetachedWorktree(project.path, wt, t.head_sha!))
-      if (project.setup) {
-        atomicWrite(join(hq, 'setup.sb'), sandboxProfile(await this.sandboxFor(wt, null, project.path)))
-        const s = await runSandboxed(project.setup, wt, this.cfg.checkTimeoutMinutes * 60_000, join(hq, 'setup.sb'), 'setup')
-        if (!s.pass) throw new Setup(`검토 worktree setup 실패 (종료 코드 ${s.exitCode ?? '시간 초과'})`)
-      }
-      const stat = await git(wt, ['diff', '--stat', t.base_sha!, t.head_sha!])
+      const wt = await verifyWorktree(mirror, path, t.head_sha!)
+      await this.runSetup(project, wt.path, hq, 'setup')
+      const stat = await hqGit(mirror, null, ['diff', '--stat', '--no-ext-diff', '--no-textconv', t.base_sha!, t.head_sha!])
       const work = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
       const result = work ? readJson<{ protectedChanges?: string[] }>(join(hqDirOf(work), 'result.json')) : null
+      const checks = work ? readJson<ChecksFile>(join(hqDirOf(work), 'checks.json')) : null
+      const report = t.role === 'collect' && work ? readText(join(hqDirOf(work), 'report.sealed.md'), 200_000) : null
       const prompt = reviewPrompt({ task: specOf(t), requestText: this.store.request(t.request_id)!.text, base: t.base_sha!, head: t.head_sha!, diffStat: stat.stdout,
-        checks: work ? readJson<ChecksFile>(join(hqDirOf(work), 'checks.json')) : null, protectedChanges: result?.protectedChanges ?? [] })
+        checks, protectedChanges: result?.protectedChanges ?? [], manualIds: checks?.manual ?? [], report })
       const argv = claudeArgs(this.cfg, { role: 'review', model: att.model, sessionId: att.session_id, resume: false, out: null, schema: VERDICT_SCHEMA })
-      const { info, child } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd: wt, hqDir: hq, outDir: null, prompt, sessionId: att.session_id,
-        sandbox: await this.sandboxFor(wt, null, project.path),
-        spec: { attemptId, kind: 'review', model: att.model, head_sha: t.head_sha, base_sha: t.base_sha, worktree: wt, startedAt: this.iso() } })
+      const { info, child } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd: wt.path, hqDir: hq, outDir: null, prompt, sessionId: att.session_id,
+        sandbox: this.sandboxFor(wt.path, null),
+        spec: { attemptId, kind: 'review', model: att.model, head_sha: t.head_sha, base_sha: t.base_sha, worktree: wt.path, generation: att.generation, startedAt: this.iso() } })
       const startedAt = this.iso()
       this.store.updateAttempt(attemptId, { status: 'running', pid: info.pid, lstart: info.lstart, started_at: startedAt })
       this.track({ ...att, status: 'running' }, info.pid, info.lstart, info.startedAt, child)
     } catch (e) {
-      await withRepo(project.path, () => removeWorktree(project.path, wt)).catch(() => {})
-      this.startFailed(att, e instanceof Setup ? e.message : `검토 시작 실패: ${String(e)}`, e instanceof Setup)
+      await removeMirrorWorktree(mirror, path).catch(() => {})
+      this.startFailed(att, e instanceof Setup ? e.message : `검토 시작 실패: ${String(e)}`)
     }
   }
 
   async finalizeReview(att: AttemptRow, l: Live): Promise<void> {
     const task = this.store.task(att.task_id)!
-    const project = this.project(task.project)
     const result = l.tail.finalResult()
     const endedAt = this.iso()
-    if (project) await withRepo(project.path, () => removeWorktree(project.path, this.reviewWorktree(task, att.n))).catch(() => {})
-    if (['cancelled', 'superseded'].includes(att.outcome ?? '') || this.requestStopped(task)) {
-      this.store.updateAttempt(att.id, { status: 'failed', ended_at: endedAt, reason: '요청 중단', ...this.usage(result) })
+    await removeMirrorWorktree(this.mirror(task.project), this.reviewWorktree(task, att.n)).catch(() => {})
+    if (this.stale(att, task)) {
+      this.store.updateAttempt(att.id, { status: 'failed', ended_at: endedAt, reason: '요청 중단 또는 세대 변경', ...this.usage(result) })
       return
     }
     const hq = hqDirOf(att)
-    if (att.outcome !== 'runaway' && isLimited(result, (readText(join(hq, 'stderr.log'), 200_000) ?? '').slice(-20_000), l.tail.rejectedSeen)) {
-      this.store.updateAttempt(att.id, { status: 'limited', ended_at: endedAt, reason: '사용 한도', ...this.usage(result) })
-      return // task stays reviewing; dispatch restarts the review when the hold ends
+    const stderr = (readText(join(hq, 'stderr.log'), 200_000) ?? '').slice(-20_000)
+    if (att.outcome !== 'runaway' && (isNotLoggedIn(result, stderr) || isLimited(result, stderr, l.tail.rejectedSeen))) {
+      const login = isNotLoggedIn(result, stderr)
+      if (login) this.requireLogin(String(result?.result ?? stderr).slice(0, 300))
+      else if (this.quota().mode !== 'hold') this.limitBackoff()
+      this.store.tx(() => {
+        this.store.updateAttempt(att.id, { status: 'limited', ended_at: endedAt, reason: login ? '로그인 필요' : '사용 한도', ...this.usage(result) })
+        const reviews = this.store.attempts(task.id).filter((a) => a.kind === 'review' && a.generation === att.generation)
+        const streak = reviews.slice(-MAX_LIMITED_STREAK)
+        const t = this.store.task(task.id)!
+        if (!login && streak.length >= MAX_LIMITED_STREAK && streak.every((a) => a.status === 'limited') && t.status === 'reviewing') this.block(t, `검토가 사용 한도로 ${MAX_LIMITED_STREAK}번 연속 중단됐어요`)
+      })
+      return // otherwise the task stays reviewing; dispatch restarts the review when the hold ends
     }
-    const codeChanged = task.base_sha && task.head_sha && project ? (await changedFiles(project.path, task.base_sha, task.head_sha).catch(() => ['?'])).length > 0 : true
+    const codeChanged = task.role === 'implement' && task.base_sha && task.head_sha ? (await mirrorChanged(this.mirror(task.project), task.base_sha, task.head_sha).catch(() => ['?'])).length > 0 : false
     const spec = specOf(task)
+    // Evidence first: the reviewer's real Bash runs go to the DB before the verdict is judged.
+    const bashRuns = extractBashRuns(join(hq, 'stream.jsonl'))
+    this.store.updateAttempt(att.id, { bash_runs: JSON.stringify(bashRuns) })
     const check = att.outcome === 'runaway' ? { kind: 'invalid' as const, reason: `검토 폭주: ${att.reason ?? ''}`, verdict: null }
       : result?.is_error || !result ? { kind: 'invalid' as const, reason: `검토 실행 오류: ${String(result?.result ?? result?.subtype ?? '결과 없음').slice(0, 300)}`, verdict: null }
-      : checkVerdict(result.structured_output, { acceptanceIds: spec.acceptance.map((a) => a.id), codeChanged, bashRuns: extractBashRuns(join(hq, 'stream.jsonl')) })
+      : checkVerdict(result.structured_output, { acceptanceIds: spec.acceptance.map((a) => a.id), codeChanged, bashRuns })
     const work = this.store.attempts(task.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
     const prot = work ? readJson<{ protectedChanges?: string[] }>(join(hqDirOf(work), 'result.json'))?.protectedChanges ?? [] : []
     const binding = { task: task.id, head_sha: task.head_sha ?? undefined, base_sha: task.base_sha ?? undefined, reviewer_model: att.model, implementer_model: task.model, sameFamily: true, protectedChanges: prot }
@@ -735,12 +969,12 @@ export class Runner {
       this.store.updateAttempt(att.id, { status, ended_at: endedAt, outcome: check.kind, ...this.usage(result),
         reason: check.kind === 'invalid' ? check.reason : check.kind === 'blocking' ? check.verdict.blocking.map((b) => b.summary).join('; ').slice(0, 2000) : null })
       const t = this.store.task(att.task_id)!
-      if (t.status !== 'reviewing' || t.head_sha !== task.head_sha) return
-      if (check.kind === 'pass') this.store.updateTask(t.id, { status: 'passed', note: null })
+      if (t.status !== 'reviewing' || t.generation !== att.generation || t.head_sha !== task.head_sha) return
+      if (check.kind === 'pass') this.tset(t, { status: 'passed', note: null })
       else if (check.kind === 'blocking') this.rework(t, `검토 blocking: ${check.verdict.blocking.map((b) => `[${b.id}] ${b.summary}`).join('; ')}`)
       else {
         const cnt = t.review_invalid + 1
-        this.store.updateTask(t.id, { review_invalid: cnt, note: `검토 무효: ${check.reason}` })
+        this.tset(t, { review_invalid: cnt, note: `검토 무효: ${check.reason}` })
         if (cnt >= 2) this.block(this.store.task(t.id)!, `검토가 ${cnt}번 무효였어요: ${check.reason}`)
       }
       this.emitTask(t, `${t.title}: 검토 ${check.kind}`)
@@ -771,66 +1005,90 @@ export class Runner {
     const tasks = this.store.tasks(requestId).filter((t) => t.project === projectId && t.role === 'implement' && t.status === 'passed')
     const hq = join(this.home, 'runs', requestId, `_integration-${projectId}`, 'hq')
     mkdirSync(hq, { recursive: true })
-    const target = await currentBranch(project.path)
-    const fail = (state: string, note: string, body: string) => this.store.tx(() => {
+    const fail = (state: string, note: string, body: string, taskIds: string[]) => this.store.tx(() => {
       this.store.putMerge(requestId, projectId, { state, note, diagnosis: null })
+      this.store.set(`integration.tasks:${requestId}:${projectId}`, JSON.stringify(taskIds))
       const r = this.store.request(requestId)!
       if (!TERMINAL_REQUEST.has(r.status)) this.store.updateRequest(requestId, { status: 'blocked', note })
       this.store.putApproval({ id: `integration:${requestId}:${projectId}`, teamId: 'hq', subjectId: requestId, title: `통합 실패: ${project.name}`,
-        body, options: ['다시 통합', '요청 중단'], subjectHash: sha256(`${requestId}:${projectId}:${note}:${this.now()}`) })
+        body, options: INTEGRATION_OPTIONS, subjectHash: sha256(`${requestId}:${projectId}:${note}:${this.now()}`) })
     })
-    if (!target) { fail('failed', `프로젝트 ${project.name} checkout이 브랜치가 아니라서(detached HEAD) 통합할 대상이 없어요`, '프로젝트 checkout을 브랜치로 되돌린 뒤 다시 통합하세요.'); return }
-    const checks: CheckSpec[] = tasks.flatMap((t) => nonManual(specOf(t)).map((a) => ({ id: `${t.key}.${a.id}`, command: a.check })))
-    const bf = new Set<string>(tasks.flatMap((t) => [...this.baselineFailed(t, `${t.key}.`)]))
+    const target = await currentBranch(project.path)
+    if (!target) { fail('failed', `프로젝트 ${project.name} checkout이 브랜치가 아니라서(detached HEAD) 통합할 대상이 없어요`, '프로젝트 checkout을 브랜치로 되돌린 뒤 다시 통합하세요.', []); return }
+    const mirror = this.mirror(projectId)
+    try { await ensureMirror(project, mirror) } catch (e) { fail('failed', `미러 갱신 실패: ${String(e).slice(0, 200)}`, String(e).slice(0, 500), []); return }
+    const eff = tasks.map((t) => ({ t, e: this.effectiveChecks(t, `${t.key}.`) }))
     const path = this.integrationDir(requestId, projectId)
-    const res = await integrate({ repo: project.path, requestId, project: projectId, path, target, heads: tasks.map((t) => ({ taskId: t.id, title: t.title, sha: t.head_sha! })),
-      setup: project.setup ?? null, checks, baselineFailed: bf, timeoutMs: this.cfg.checkTimeoutMinutes * 60_000,
-      sandbox: await this.sandboxFor(path, null, project.path), profilePath: join(hq, 'checks.sb') })
+    const p = this.procTracker('integration')
+    let res
+    try {
+      res = await integrate({ mirror, requestId, project: projectId, path, target, heads: tasks.map((t) => ({ taskId: t.id, title: t.title, sha: t.head_sha! })),
+        setup: project.setup ?? null, checks: eff.flatMap((x) => x.e.checks), timeoutMs: this.cfg.checkTimeoutMinutes * 60_000,
+        sandbox: this.sandboxFor(path, null), profilePath: join(hq, 'checks.sb'), onSpawn: p.onSpawn })
+    } finally { p.done() }
     if (res.kind !== 'conflict' && res.checks) atomicJson(join(hq, 'checks.json'), res.checks)
     if (res.kind === 'conflict') {
       const who = tasks.find((t) => t.id === res.taskId)
-      fail('conflict', `통합 충돌 (${who?.key ?? res.taskId}): ${res.files.join(', ')}`, `작업 ${who?.title ?? res.taskId}을(를) ${target}(${res.targetSha.slice(0, 10)}) 위에 합치다 충돌했어요.\n충돌 파일:\n${res.files.map((f) => `- ${f}`).join('\n')}`)
+      fail('conflict', `통합 충돌 (${who?.key ?? res.taskId}): ${res.files.join(', ')}`, `작업 ${who?.title ?? res.taskId}을(를) ${target}(${res.targetSha.slice(0, 10)}) 위에 합치다 충돌했어요.\n충돌 파일:\n${res.files.map((f) => `- ${f}`).join('\n')}`, [res.taskId])
       this.notify('통합 충돌', `${project.name}: ${res.files.slice(0, 3).join(', ')}`)
       return
     }
-    if (res.kind === 'failed') { fail('failed', res.reason, res.reason); return }
+    if (res.kind === 'failed') {
+      const failedIds = new Set((res.checks?.checks ?? []).filter((c) => !c.pass).map((c) => c.id.split('.')[0]))
+      fail('failed', res.reason, res.reason, tasks.filter((t) => failedIds.has(t.key)).map((t) => t.id))
+      return
+    }
     this.store.tx(() => {
       this.store.putMerge(requestId, projectId, { state: 'integrated', target, target_sha: res.targetSha, integration_sha: res.sha, note: prevNote })
       if (this.store.request(requestId)?.status === 'accepted') this.offerMerge(requestId, projectId)
     })
   }
 
-  /** Called after the chairman decides an integration card. */
-  integrationDecided(requestId: string, projectId: string, decision: string): string | null {
-    if (decision === '요청 중단') return this.cancelRequest(requestId)
-    return this.store.tx(() => {
-      const m = this.store.mergeRow(requestId, projectId)
-      if (!m || !['conflict', 'failed'].includes(m.state)) return '다시 통합할 수 있는 상태가 아닙니다'
-      this.store.putMerge(requestId, projectId, { state: 'pending', note: null })
-      const accepted = this.store.approval(`accept:${requestId}`)?.decision === '수락'
-      const r = this.store.request(requestId)!
-      if (r.status === 'blocked' && !this.store.tasks(requestId).some((t) => t.status === 'blocked')) this.store.updateRequest(requestId, { status: accepted ? 'accepted' : 'executing', note: null })
-      this.kick()
+  /** Integration card decision. Call inside a tx. */
+  private integrationDecidedTx(requestId: string, projectId: string, decision: string): string | null {
+    const m = this.store.mergeRow(requestId, projectId)
+    if (decision === '요청 중단') return this.cancelRequestTx(requestId)
+    if (!m || !['conflict', 'failed'].includes(m.state)) return '다시 통합할 수 있는 상태가 아닙니다'
+    const accepted = this.store.approval(`accept:${requestId}`)?.decision === '수락'
+    if (decision === '해당 작업 재작업') {
+      // The named tasks start over on top of the current target (invalidation rules, §12); integration restarts later.
+      const ids = JSON.parse(this.store.get(`integration.tasks:${requestId}:${projectId}`) ?? '[]') as string[]
+      const targets = (ids.length ? ids : this.store.tasks(requestId).filter((t) => t.project === projectId && t.role === 'implement').map((t) => t.id))
+      for (const id of targets) {
+        const t = this.store.task(id)
+        if (!t) continue
+        this.resetTask(t, '통합 실패로 새 대상 위에서 다시 해요', m.target_sha)
+        for (const d of this.dependents(t)) if (d.status !== 'cancelled') this.resetTask(d, `선행 작업 ${t.key}을(를) 다시 해서 처음부터 다시 해요`)
+      }
+      this.store.raw().prepare('delete from merges where request_id = ?').run(requestId)
+      this.store.supersede(`accept:${requestId}`)
+      for (const x of this.store.mergeRows(requestId)) this.store.supersede(`merge:${requestId}:${x.project}`)
+      this.store.updateRequest(requestId, { status: 'executing', note: null })
       return null
-    })
+    }
+    this.store.putMerge(requestId, projectId, { state: 'pending', note: null })
+    const r = this.store.request(requestId)!
+    if (r.status === 'blocked' && !this.store.tasks(requestId).some((t) => t.status === 'blocked')) this.store.updateRequest(requestId, { status: accepted ? 'accepted' : 'executing', note: null })
+    return null
   }
 
   // ----- request completion (§C step 5, §12) -----
-  private acceptSubject(requestId: string): string {
+  /** Accept subject (v3): the task results only — the merge card binds the integration SHA. */
+  acceptSubject(requestId: string): string {
     const lines = this.store.tasks(requestId).filter((t) => t.status === 'passed').map((t) => {
       const work = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
+      const review = this.store.attempts(t.id).filter((a) => a.kind === 'review' && a.outcome === 'pass').at(-1)
       const checks = work ? readText(join(hqDirOf(work), 'checks.json')) ?? '' : ''
-      return `${t.id}|${t.head_sha}|${t.report_sha ?? ''}|${sha256(checks)}`
+      const verdict = review ? readText(join(hqDirOf(review), 'verdict.json')) ?? '' : ''
+      return `${t.id}|${t.generation}|${t.head_sha}|${t.report_sha ?? ''}|${sha256(checks)}|${sha256(verdict)}`
     }).sort()
-    const ints = this.store.mergeRows(requestId).map((m) => `${m.project}|${m.integration_sha}`).sort()
-    return sha256([...lines, ...ints].join('\n'))
+    return sha256(lines.join('\n'))
   }
 
   private putAcceptCard(requestId: string): void {
     const r = this.store.request(requestId)!
-    const tasks = this.store.tasks(requestId)
     const body: string[] = []
-    for (const t of tasks) {
+    for (const t of this.store.tasks(requestId)) {
       if (t.status === 'cancelled') { body.push(`${t.key} ${t.title} — 취소됨`); continue }
       const work = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
       const done = work ? readJson<{ summary?: string; files_modified?: string[] }>(join(outDirOf(work), 'done.json')) : null
@@ -840,13 +1098,12 @@ export class Runner {
       const verdict = review ? readJson<Verdict>(join(hqDirOf(review), 'verdict.json')) : null
       const parts = [`변경 파일 ${done?.files_modified?.length ?? 0}개`,
         checks ? `검사 ${checks.checks.filter((c) => c.pass).length}/${checks.checks.length} 통과` : '검사 없음',
-        t.role === 'collect' ? '조사(검토 없음)' : t.review_model === 'none' ? '검토 없음(기계 검증만)' : verdict ? `검토 통과(${review!.model}${verdict.advisory.length ? `, 참고 ${verdict.advisory.length}건` : ''})` : '검토 기록 없음']
-      const bf = checks?.checks.filter((c) => c.baselineFailed).map((c) => c.id) ?? []
-      if (bf.length) parts.push(`기존 실패: ${bf.join(', ')}`)
+        t.review_model === 'none' ? '검토 없음(기계 검증만)' : verdict ? `검토 통과(${review!.model}${verdict.advisory.length ? `, 참고 ${verdict.advisory.length}건` : ''})` : '검토 기록 없음']
+      if (checks?.manual?.length) parts.push(`기존 실패(검토자 판단): ${checks.manual.join(', ')}`)
+      if (checks?.warnings?.length) parts.push(`경고: ${checks.warnings.join(' / ')}`)
       if (result?.protectedChanges?.length) parts.push(`보호 경로 변경: ${result.protectedChanges.join(', ')}`)
       body.push(`${t.key} [${t.model}] ${t.title} — ${done?.summary ?? ''}\n  ${parts.join(' · ')}`)
     }
-    for (const m of this.store.mergeRows(requestId)) body.push(`통합 ${m.project}: ${m.target} ${m.target_sha?.slice(0, 10)} → ${m.integration_sha?.slice(0, 10)}`)
     this.store.putApproval({ id: `accept:${requestId}`, teamId: 'hq', subjectId: requestId, title: `결과 수락: ${r.text.replace(/\s+/g, ' ').slice(0, 60)}`,
       body: body.join('\n'), options: ['수락', '반려'], subjectHash: this.acceptSubject(requestId) })
   }
@@ -856,7 +1113,9 @@ export class Runner {
     const m = this.store.mergeRow(requestId, projectId)!
     const project = this.project(projectId)!
     const tasks = this.store.tasks(requestId).filter((t) => t.project === projectId && t.role === 'implement' && t.status === 'passed')
-    const body = [...(m.note ? [m.note, ''] : []), `대상: ${project.name} ${m.target} (${m.target_sha?.slice(0, 10)})`, `병합할 통합 커밋: ${m.integration_sha?.slice(0, 10)} (fast-forward)`,
+    const newCommits = this.store.get(`targetAhead:${requestId}:${projectId}`)
+    const body = [...(m.note ? [m.note, ''] : []), `대상: ${project.name} ${m.target} (${m.target_sha?.slice(0, 10)})`,
+      `병합할 통합 커밋: ${m.integration_sha?.slice(0, 10)} (fast-forward)`, ...(newCommits ? [`대상 브랜치에 새로 생긴 커밋 ${newCommits}개`] : []),
       ...tasks.map((t) => `- ${t.key} ${t.title}`)].join('\n')
     this.store.putApproval({ id: `merge:${requestId}:${projectId}`, teamId: 'hq', subjectId: requestId, title: `병합 승인: ${project.name} ${m.target}`, body,
       options: ['병합', '보류'], subjectHash: sha256(`${m.target}|${m.target_sha}|${m.integration_sha}`) })
@@ -874,70 +1133,48 @@ export class Runner {
         const all = this.store.tasks(r.id)
         if (!all.length) return
         const live = all.filter((t) => t.status !== 'cancelled')
-        if (!live.length) { this.store.updateRequest(r.id, { status: 'cancelled', note: '모든 작업이 취소됨' }); this.emitRequest(r.id, '모든 작업이 취소됨'); return }
+        if (!live.length) { this.store.updateRequest(r.id, { status: 'cancelled', note: '남은 작업 없음' }); this.emitRequest(r.id, '남은 작업 없음'); return }
         if (!live.every((t) => t.status === 'passed')) return
-        const projects = this.projectsToIntegrate(r.id)
-        for (const p of projects) if (!this.store.mergeRow(r.id, p)) this.store.putMerge(r.id, p, { state: 'pending' })
-        const rows = this.store.mergeRows(r.id)
-        if (rows.some((m) => m.state !== 'integrated')) return
+        for (const p of this.projectsToIntegrate(r.id)) if (!this.store.mergeRow(r.id, p)) this.store.putMerge(r.id, p, { state: 'pending' })
+        if (this.store.mergeRows(r.id).some((m) => m.state !== 'integrated')) return
         this.store.updateRequest(r.id, { status: 'awaiting_acceptance', note: null })
         this.putAcceptCard(r.id)
         this.emitRequest(r.id, '모든 작업 통과 — 결과 수락을 기다려요')
       })
     }
     for (const r of this.store.requestsByStatus(['accepted'])) {
-      this.store.tx(() => {
-        for (const m of this.store.mergeRows(r.id)) if (m.state === 'integrated') this.offerMerge(r.id, m.project)
-      })
+      for (const m of this.store.mergeRows(r.id)) if (m.state === 'integrated') {
+        await this.countTargetAhead(r.id, m.project, m.target_sha)
+        this.store.tx(() => { if (this.store.mergeRow(r.id, m.project)?.state === 'integrated') this.offerMerge(r.id, m.project) })
+      }
     }
     for (const r of this.store.requestsByStatus(['cancelled'])) await this.cleanupCancelled(r.id)
   }
 
+  /** Commits the target gained since the request base, for the merge card (§12). */
+  private async countTargetAhead(requestId: string, projectId: string, targetSha: string | null): Promise<void> {
+    const base = this.store.get(`base:${requestId}:${projectId}`)
+    if (!base || !targetSha) return
+    const r = await hqGit(this.mirror(projectId), null, ['rev-list', '--count', `${base}..${targetSha}`])
+    this.store.set(`targetAhead:${requestId}:${projectId}`, r.code === 0 && r.stdout.trim() !== '0' ? r.stdout.trim() : null)
+  }
+
   // ----- chairman actions (§D) -----
-  /** Routes a decided approval card (server calls this after store.decide succeeded). */
-  async onApproval(a: ApprovalRow): Promise<string | null> {
-    const d = a.decision!
-    if (a.kind === 'accept') return d === '수락' ? this.accept(a.id.slice(7)) : this.rejectResult(a.id.slice(7), '(사유 없음)', undefined, true)
-    if (a.kind === 'merge') {
-      const [, req, project] = a.id.split(':')
-      if (d === '병합') return this.merge(req, project)
-      this.store.putMerge(req, project, { state: 'held' })
-      return null
-    }
-    if (a.kind === 'integration') { const [, req, project] = a.id.split(':'); return this.integrationDecided(req, project, d) }
-    if (a.kind === 'revise') {
-      const taskId = a.id.slice('revise:'.length)
-      const raw = this.store.get(`revise:${taskId}`)
-      if (d === '승인' && raw) return this.applyRevision(taskId, JSON.parse(raw) as PlanTask)
-      return this.store.tx(() => { const t = this.store.task(taskId); if (t?.status === 'revising') this.block(t, '회장이 지시서 수정안을 반려했어요'); return null })
-    }
+  /** Call inside a tx. */
+  private acceptTx(requestId: string): string | null {
+    const r = this.store.request(requestId)
+    if (r?.status !== 'awaiting_acceptance') return '결과 수락을 기다리는 요청이 아닙니다'
+    this.store.updateRequest(requestId, { status: 'accepted', note: null })
+    this.emitRequest(requestId, this.store.mergeRows(requestId).length ? '결과 수락 — 병합 승인을 기다려요' : '결과 수락 — 완료')
     return null
   }
 
-  accept(requestId: string): string | null {
-    const err = this.store.tx(() => {
-      const r = this.store.request(requestId)
-      if (r?.status !== 'awaiting_acceptance') return '결과 수락을 기다리는 요청이 아닙니다'
-      this.store.updateRequest(requestId, { status: 'accepted', note: null })
-      for (const m of this.store.mergeRows(requestId)) if (m.state === 'integrated') this.offerMerge(requestId, m.project)
-      return null
-    })
-    if (!err) { this.emitRequest(requestId, this.store.mergeRows(requestId).length ? '결과 수락 — 병합 승인을 기다려요' : '결과 수락 — 완료'); this.kick() }
-    return err
-  }
-
-  async merge(requestId: string, projectId: string): Promise<string | null> {
-    const project = this.project(projectId)
-    const m = this.store.mergeRow(requestId, projectId)
-    if (!project || !m || m.state !== 'offered' || !m.target || !m.target_sha || !m.integration_sha) return '병합할 수 있는 상태가 아닙니다'
-    const ok = this.store.tx(() => {
-      if (this.store.request(requestId)?.status !== 'accepted') return false
-      this.store.updateRequest(requestId, { status: 'merging' })
-      this.store.putMerge(requestId, projectId, { state: 'merging' })
-      return true
-    })
-    if (!ok) return '수락된 요청이 아닙니다'
-    const res = await applyMerge({ repo: project.path, target: m.target, targetSha: m.target_sha, integrationSha: m.integration_sha })
+  /** The merge itself, after the decide transaction recorded the intent (request merging, row merging). */
+  private async runMerge(requestId: string, projectId: string): Promise<string | null> {
+    const project = this.project(projectId)!
+    const m = this.store.mergeRow(requestId, projectId)!
+    await ensureMirror(project, this.mirror(projectId)).catch(() => {})
+    const res = await applyMerge({ repo: project.path, mirror: this.mirror(projectId), requestId, project: projectId, target: m.target!, targetSha: m.target_sha!, integrationSha: m.integration_sha! })
     if (res.kind === 'merged') {
       const all = this.store.tx(() => {
         this.store.putMerge(requestId, projectId, { state: 'merged', result_sha: res.sha })
@@ -957,8 +1194,7 @@ export class Runner {
     })
     if (res.kind === 'detached') this.notify('병합 대기', `${project.name} checkout이 detached HEAD예요. 브랜치로 돌린 뒤 병합을 다시 요청하세요.`)
     this.emitRequest(requestId, res.kind === 'stale' ? `병합 전 확인 실패, 다시 통합: ${res.why}` : '병합 대기: detached HEAD')
-    this.kick()
-    return null
+    return res.kind === 'stale' ? res.why : 'detached HEAD'
   }
 
   /** POST /api/requests/:id/merge — re-offer held or detached merges after re-checking the integration. */
@@ -974,27 +1210,25 @@ export class Runner {
   }
 
   private async cleanupMerged(requestId: string): Promise<void> {
-    for (const t of this.store.tasks(requestId)) {
-      const p = this.project(t.project)
-      if (!p) continue
-      await withRepo(p.path, async () => {
-        if (t.worktree) await removeWorktree(p.path, t.worktree)
-        if (t.branch && await branchExists(p.path, t.branch)) await git(p.path, ['branch', '-d', t.branch])
-      }).catch(() => {})
-    }
-    for (const m of this.store.mergeRows(requestId)) { const p = this.project(m.project); if (p) await git(p.path, ['update-ref', '-d', integrationRef(requestId, m.project)]) }
+    for (const t of this.store.tasks(requestId)) if (t.worktree) rmSync(t.worktree, { recursive: true, force: true })
+    for (const m of this.store.mergeRows(requestId)) await withRepo(this.mirror(m.project), () => hqGit(this.mirror(m.project), null, ['update-ref', '-d', integrationRef(requestId, m.project)]))
   }
 
-  /** §D rejectResult: rework the named (or all passed) tasks; dependents are invalidated by rework(). */
-  rejectResult(requestId: string, reason: string, keys?: string[], cardDecided = false): string | null {
+  /** §D rejectResult (v3): only via the API with a reason and the accept card's subject hash. */
+  rejectResult(requestId: string, reason: string, subjectHash: string, keys?: string[]): string | null {
     const err = this.store.tx(() => {
       const r = this.store.request(requestId)
       if (r?.status !== 'awaiting_acceptance') return '결과 수락을 기다리는 요청이 아닙니다'
+      const card = this.store.approval(`accept:${requestId}`)
+      if (!card || card.state !== 'open' || card.subjectHash !== subjectHash) return '수락 카드 내용이 바뀌었습니다. 새로 보고 다시 반려해 주세요'
       const all = this.store.tasks(requestId)
       if (keys) for (const k of keys) if (!all.some((t) => t.key === k && t.status === 'passed')) return `통과한 작업이 아닙니다: ${k}`
-      if (!cardDecided) this.store.supersede(`accept:${requestId}`)
+      this.store.supersede(`accept:${requestId}`)
       this.store.updateRequest(requestId, { status: 'executing', note: `결과 반려: ${reason}` })
-      for (const t of all) if (t.status === 'passed' && (!keys || keys.includes(t.key))) this.rework(t, `결과 반려: ${reason}`)
+      for (const t of all) if (t.status === 'passed' && (!keys || keys.includes(t.key))) {
+        const cur = this.store.task(t.id)!
+        if (cur.status === 'passed') this.rework(cur, `결과 반려: ${reason}`)
+      }
       this.store.raw().prepare('delete from merges where request_id = ?').run(requestId)
       if (this.store.tasks(requestId).some((t) => t.status === 'blocked')) this.store.updateRequest(requestId, { status: 'blocked' })
       return null
@@ -1003,60 +1237,55 @@ export class Runner {
     return err
   }
 
-  cancelRequest(requestId: string): string | null {
-    const kill: number[] = []
-    const err = this.store.tx(() => {
-      const r = this.store.request(requestId)
-      if (!r) return '요청이 없습니다'
-      if (TERMINAL_REQUEST.has(r.status) || r.status === 'merging') return '이미 끝났거나 병합 중인 요청입니다'
-      if (r.status === 'accepted' && !this.store.mergeRows(requestId).length) return '이미 끝난 요청입니다'
-      this.store.updateRequest(requestId, { status: 'cancelled', note: '회장이 중단' })
-      const tasks = this.store.tasks(requestId)
-      for (const t of tasks) if (t.status !== 'passed' && t.status !== 'cancelled') this.store.updateTask(t.id, { status: 'cancelled' })
-      for (const a of this.store.liveAttempts()) if (tasks.some((t) => t.id === a.task_id)) { this.store.updateAttempt(a.id, { outcome: 'cancelled', reason: '요청 중단' }); if (a.pid) kill.push(a.pid) }
-      for (const a of this.store.openApprovals(0)) {
-        if (a.id === `plan:${requestId}` || a.id === `accept:${requestId}` || a.id.startsWith(`merge:${requestId}:`) || a.id.startsWith(`integration:${requestId}:`)
-          || (a.kind === 'revise' && tasks.some((t) => a.id === `revise:${t.id}`))) this.store.supersede(a.id)
-      }
-      return null
-    })
-    if (err) return err
-    for (const pid of kill) { killGroup(pid, 'SIGTERM'); setTimeout(() => killGroup(pid, 'SIGKILL'), KILL_GRACE_MS).unref() }
+  /** Call inside a tx. Live attempt groups are killed after the transaction commits. */
+  private cancelRequestTx(requestId: string): string | null {
+    const r = this.store.request(requestId)
+    if (!r) return '요청이 없습니다'
+    if (TERMINAL_REQUEST.has(r.status) || r.status === 'merging') return '이미 끝났거나 병합 중인 요청입니다'
+    if (r.status === 'accepted' && !this.store.mergeRows(requestId).length) return '이미 끝난 요청입니다'
+    this.store.updateRequest(requestId, { status: 'cancelled', note: '회장이 중단' })
+    const tasks = this.store.tasks(requestId)
+    for (const t of tasks) if (t.status !== 'passed' && t.status !== 'cancelled') this.store.updateTask(t.id, { status: 'cancelled', generation: t.generation + 1 })
+    for (const a of this.store.liveAttempts()) if (tasks.some((t) => t.id === a.task_id)) {
+      this.store.updateAttempt(a.id, { outcome: 'cancelled', reason: '요청 중단' })
+      if (a.pid) { const pid = a.pid; queueMicrotask(() => { killGroup(pid, 'SIGTERM'); setTimeout(() => killGroup(pid, 'SIGKILL'), KILL_GRACE_MS).unref() }) }
+    }
+    for (const a of this.store.openApprovals(0)) {
+      if (a.id === `plan:${requestId}` || a.id === `accept:${requestId}` || a.id.startsWith(`merge:${requestId}:`) || a.id.startsWith(`integration:${requestId}:`)
+        || (a.kind === 'revise' && tasks.some((t) => a.id === `revise:${t.id}`))) this.store.supersede(a.id)
+    }
     this.emitRequest(requestId, '요청 중단')
-    this.kick()
     return null
+  }
+
+  cancelRequest(requestId: string): string | null {
+    const err = this.store.tx(() => this.cancelRequestTx(requestId))
+    if (!err) this.kick()
+    return err
   }
 
   private async cleanupCancelled(requestId: string): Promise<void> {
     if (this.store.get(`cleaned:${requestId}`)) return
     const tasks = this.store.tasks(requestId)
     if (this.store.liveAttempts().some((a) => tasks.some((t) => t.id === a.task_id))) return
-    for (const t of tasks) {
-      const p = this.project(t.project)
-      if (p && t.worktree) await withRepo(p.path, () => removeWorktree(p.path, t.worktree!)).catch(() => {})
-    }
+    for (const t of tasks) if (t.worktree) rmSync(t.worktree, { recursive: true, force: true })
     this.store.set(`cleaned:${requestId}`, this.iso())
   }
 
-  /** §D decideTask: retry once more on the top model, skip (with dependents), or stop the request. */
+  /** §D decideTask (v3): retry on the same model, skip (with dependents), or stop. Revision = the task's block count. */
   decideTask(taskId: string, decision: string, revision: number): string | null {
     const t = this.store.task(taskId)
     if (!t || t.status !== 'blocked') return '차단된 작업이 아닙니다'
-    if (t.revision !== revision) return `오래된 revision입니다 (현재 ${t.revision})`
+    if (t.block_count !== revision) return `오래된 revision입니다 (현재 ${t.block_count})`
     if (decision === 'stop') return this.cancelRequest(t.request_id)
     if (decision !== 'retry' && decision !== 'skip') return 'decision은 retry | skip | stop 중 하나여야 합니다'
     this.store.tx(() => {
       if (decision === 'retry') {
-        this.store.updateTask(t.id, { status: 'rework', attempts: this.cfg.maxAttempts - 1, model: this.cfg.ladder[this.cfg.ladder.length - 1], limited_streak: 0,
-          review_invalid: 0, resume_session: null, note: `회장: 한 번 더 (최상위 모델)\n이전 사유: ${t.note ?? ''}`.slice(0, 2000) })
+        this.store.updateTask(t.id, { status: 'rework', attempts: Math.max(0, this.cfg.maxAttempts - 1), limited_streak: 0,
+          review_invalid: 0, resume_session: null, note: `회장: 한 번 더 (같은 모델)\n이전 사유: ${t.note ?? ''}`.slice(0, 2000) })
       } else {
-        const all = this.store.tasks(t.request_id)
-        const gone = new Set([t.key])
-        for (let changed = true; changed;) {
-          changed = false
-          for (const x of all) if (!gone.has(x.key) && specOf(x).depends_on.some((d) => gone.has(d))) { gone.add(x.key); changed = true }
-        }
-        for (const x of all) if (gone.has(x.key) && x.status !== 'passed' && x.status !== 'cancelled') this.store.updateTask(x.id, { status: 'cancelled', note: x.id === t.id ? '회장: 이 작업 건너뛰기' : `선행 작업 ${t.key} 건너뜀` })
+        for (const x of [t, ...this.dependents(t)]) if (x.status !== 'passed' && x.status !== 'cancelled')
+          this.store.updateTask(x.id, { status: 'cancelled', generation: x.generation + 1, note: x.id === t.id ? '회장: 이 작업 건너뛰기' : `선행 작업 ${t.key} 건너뜀` })
       }
       this.unblockRequest(t.request_id)
     })
@@ -1080,12 +1309,10 @@ export class Runner {
       const t = this.store.task(taskId)
       if (!t || t.status !== 'question') return '질문을 기다리는 작업이 아닙니다'
       if (t.revision !== revision) return `오래된 revision입니다 (현재 ${t.revision})`
-      const qs = this.store.taskQuestions(taskId)
-      const q = qs.find((x) => x.id === questionId)
+      const q = this.store.taskQuestions(taskId).find((x) => x.id === questionId)
       if (!q || q.revision !== t.revision) return '이 작업의 현재 질문이 아닙니다'
       if (!this.store.answerTaskQuestion(questionId, answer)) return '이미 답한 질문입니다'
-      const open = this.store.taskQuestions(taskId, q.attempt_id).filter((x) => x.answer === null)
-      if (!open.length) this.store.updateTask(taskId, { status: 'pending' })
+      if (!this.store.taskQuestions(taskId, q.attempt_id).some((x) => x.answer === null)) this.tset(t, { status: 'pending' })
       return null
     })
     if (!err) { this.bus.emit({ kind: 'task', text: `작업자 질문 답변: ${answer.slice(0, 60)}`, data: { id: taskId } }); this.kick() }
@@ -1094,7 +1321,7 @@ export class Runner {
 
   // ----- brief revision (§10a) -----
   private async reviseOne(): Promise<void> {
-    if (this.quota().mode === 'hold') return
+    if (!this.canStartCeo()) return
     const t = this.store.tasksByStatus(['revising']).find((x) => !this.revising.has(x.id) && this.store.approval(`revise:${x.id}`)?.state !== 'open'
       && this.store.request(x.request_id)?.status === 'executing')
     if (!t || !this.ceoLock.tryAcquire()) return
@@ -1108,13 +1335,14 @@ export class Runner {
     const spec = specOf(t)
     const att = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'brief_blocked').at(-1)
     const report = att ? readOut(outDirOf(att), 'report.md', REPORT_MAX) : null
-    const stat = t.worktree && t.base_sha && existsSync(t.worktree) ? (await git(t.worktree, ['diff', '--stat', t.base_sha, 'HEAD'])).stdout : ''
+    const fetched = att ? readJson<{ fetched?: string | null }>(join(hqDirOf(att), 'result.json'))?.fetched ?? null : null
+    const stat = fetched && t.base_sha ? (await hqGit(this.mirror(t.project), null, ['diff', '--stat', '--no-ext-diff', '--no-textconv', t.base_sha, fetched])).stdout : ''
     this.store.updateTask(t.id, { revise_turns: t.revise_turns + 1 })
     const res = await runReviseTurn({ claudeBin: this.cfg.claudeBin, hqRoot: this.hqRoot, project, projects: this.projects, requestText: r.text, task: spec, report, diffStat: stat,
       onLine: (line) => { if (line.type === 'rate_limit_event') this.observe(line) } })
-    if (res.limited) { this.store.updateTask(t.id, { revise_turns: t.revise_turns }); return } // retried when the hold ends; not counted
+    if (res.limited) { this.store.updateTask(t.id, { revise_turns: t.revise_turns }); if (this.quota().mode !== 'hold') this.limitBackoff(); return } // not counted
     const cur = this.store.task(t.id)
-    if (!cur || cur.status !== 'revising') return
+    if (!cur || cur.status !== 'revising' || cur.generation !== t.generation) return
     if (!res.ok || !res.output) { this.store.tx(() => this.block(cur, `지시서 수정 턴 실패: ${res.error ?? ''}`)); return }
     if (!res.output.revised_task) {
       this.store.tx(() => this.block(cur, `사장이 지시서를 고치려면 회장님 답이 필요해요:\n${res.output!.questions.map((q) => `- ${q.question} (기본: ${q.default})`).join('\n')}`))
@@ -1124,7 +1352,7 @@ export class Runner {
     const plan = this.store.tasks(t.request_id).map((x) => (x.id === t.id ? rev : specOf(x)))
     const problem = rev.id !== spec.id ? '작업 id가 바뀜' : validateTasks(plan, this.projects)
     if (problem) { this.store.tx(() => this.block(cur, `지시서 수정안이 유효하지 않아요: ${problem}`)); return }
-    if (canAutoApply(spec, rev)) { this.applyRevision(t.id, rev); return }
+    if (canAutoApply(spec, rev)) { this.store.tx(() => this.applyRevision(t.id, rev)); return }
     this.store.tx(() => {
       this.store.set(`revise:${t.id}`, JSON.stringify(rev))
       this.store.putApproval({ id: `revise:${t.id}`, teamId: 'hq', subjectId: t.request_id, title: `지시서 수정 승인: ${t.title}`, body: reviseDiff(spec, rev),
@@ -1133,24 +1361,26 @@ export class Runner {
     this.emitTask(t, `지시서 수정안 승인 필요: ${t.title}`)
   }
 
-  /** §D applyRevision: new spec, revision+1, rework keeping attempts, no resume, dependents invalidated. */
+  /** §D applyRevision: full validate, new spec, revision+1, generation+1, rework keeping attempts, dependents invalidated. Call inside a tx. */
   applyRevision(taskId: string, rev: PlanTask): string | null {
-    return this.store.tx(() => {
-      const t = this.store.task(taskId)
-      if (!t || t.status !== 'revising') return '지시서 수정을 기다리는 작업이 아닙니다'
-      this.store.updateTask(taskId, { spec: JSON.stringify(rev), title: rev.title, grade: rev.grade, model: rev.model, review_model: reviewModelOf(rev),
-        revision: t.revision + 1, status: 'rework', resume_session: null, note: '지시서 수정 적용' })
-      this.store.set(`revise:${taskId}`, null)
-      this.invalidateDependents(this.store.task(taskId)!)
-      this.emitTask(t, `지시서 수정 적용: ${rev.title} (revision ${t.revision + 1})`)
-      this.kick()
-      return null
-    })
+    const t = this.store.task(taskId)
+    if (!t || t.status !== 'revising') return '지시서 수정을 기다리는 작업이 아닙니다'
+    const plan = this.store.tasks(t.request_id).map((x) => (x.id === t.id ? rev : specOf(x)))
+    const problem = validateTasks(plan, this.projects)
+    if (problem) { this.block(t, `지시서 수정안이 유효하지 않아요: ${problem}`); return null }
+    for (const a of this.store.liveAttempts()) if (a.task_id === t.id) { this.store.updateAttempt(a.id, { outcome: 'superseded' }); if (a.pid) { const pid = a.pid; queueMicrotask(() => killGroup(pid, 'SIGTERM')) } }
+    this.store.updateTask(taskId, { spec: JSON.stringify(rev), title: rev.title, grade: rev.grade, model: rev.model, review_model: reviewModelOf(rev),
+      revision: t.revision + 1, generation: t.generation + 1, status: 'rework', resume_session: null, note: '지시서 수정 적용' })
+    this.store.set(`revise:${taskId}`, null)
+    this.invalidateDependents(this.store.task(taskId)!)
+    this.emitTask(t, `지시서 수정 적용: ${rev.title} (revision ${t.revision + 1})`)
+    this.kick()
+    return null
   }
 
   // ----- CEO diagnosis of blocked / integration items (§17) -----
   private async diagnoseOne(): Promise<void> {
-    if (this.quota().mode === 'hold' || this.ceoLock.busy) return
+    if (!this.canStartCeo() || this.ceoLock.busy) return
     const t = this.store.tasksByStatus(['blocked']).find((x) => x.diagnosis === null && !this.diagnosing.has(x.id))
     const m = t ? null : this.store.requestsByStatus(['blocked', 'executing', 'accepted']).flatMap((r) => this.store.mergeRows(r.id))
       .find((x) => ['conflict', 'failed'].includes(x.state) && x.diagnosis === null && !this.diagnosing.has(`${x.request_id}:${x.project}`))
@@ -1163,8 +1393,7 @@ export class Runner {
 
   private checksEvidence(file: ChecksFile | null): string {
     if (!file) return '(검사 기록 없음)'
-    const failed = file.checks.filter((c) => !c.pass)
-    const lines = failed.map((c) => `- [${c.id}] \`${c.command}\` → 종료 코드 ${c.exitCode ?? '시간 초과'}${c.baselineFailed ? ' (base에서도 실패)' : ''}\n\`\`\`\n${c.outputTail.split('\n').slice(-30).join('\n')}\n\`\`\``)
+    const lines = file.checks.filter((c) => !c.pass).map((c) => `- [${c.id}] \`${c.command}\` → 종료 코드 ${c.exitCode ?? '시간 초과'}\n\`\`\`\n${c.outputTail.split('\n').slice(-30).join('\n')}\n\`\`\``)
     if (file.error) lines.unshift(`- 오류: ${file.error}`)
     if (file.secrets.length) lines.push(`- 비밀값 패턴·금지 파일: ${file.secrets.map((x) => `${x.file}:${x.line} (${x.pattern})`).join(', ')}`)
     return lines.join('\n') || '(실패한 검사 없음)'
@@ -1192,7 +1421,7 @@ export class Runner {
     if (res.limited) return // retried after the hold
     this.store.tx(() => {
       const cur = this.store.task(t.id)
-      if (cur?.status === 'blocked' && cur.diagnosis === null && cur.updated_at === t.updated_at) this.store.updateTask(t.id, { diagnosis: JSON.stringify(res.result) })
+      if (cur?.status === 'blocked' && cur.diagnosis === null && cur.block_count === t.block_count) this.store.updateTask(t.id, { diagnosis: JSON.stringify(res.result) })
     })
   }
 
@@ -1206,8 +1435,7 @@ export class Runner {
       { title: '합친 작업', body: tasks.map((t) => `- ${t.key} ${t.title} @ ${t.head_sha}\n  owns: ${specOf(t).owns.join(', ')}`).join('\n') },
       { title: '실패한 검사', body: m.state === 'failed' ? this.checksEvidence(checks) : '(충돌이라 검사 전)' },
     ]
-    const options = ['다시 통합', '요청 중단']
-    const res = await runDiagnoseTurn({ claudeBin: this.cfg.claudeBin, hqRoot: this.hqRoot, project, kind: 'integration', options, evidence,
+    const res = await runDiagnoseTurn({ claudeBin: this.cfg.claudeBin, hqRoot: this.hqRoot, project, kind: 'integration', options: INTEGRATION_OPTIONS, evidence,
       onLine: (line) => { if (line.type === 'rate_limit_event') this.observe(line) } })
     if (res.limited) return
     this.store.tx(() => {
@@ -1259,8 +1487,8 @@ export class Runner {
   findOrphan(sessionId: string): Promise<number | null> { return findOrphan(sessionId) }
 
   requestRow(id: string): RequestRow | null { return this.store.request(id) }
-}
 
-/** A preparation failure that blocks the task instead of counting as a start failure (setup, dependency merge). */
-class Setup extends Error {}
+  /** Offers the merge card again for a project whose integration is still valid (recovery when HEAD is still the target). */
+  reofferIntegrated(requestId: string, projectId: string): void { this.store.tx(() => { this.store.putMerge(requestId, projectId, { state: 'integrated' }) }) }
+}
 

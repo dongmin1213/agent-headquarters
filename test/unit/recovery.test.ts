@@ -20,7 +20,7 @@ function startingAttempt(h: Harness, taskId: string, sessionId: string): string 
   const t = tsk(h, taskId)
   const id = `${taskId}~a1`
   h.store.tx(() => {
-    h.store.insertAttempt({ id, task_id: taskId, kind: 'work', n: 1, model: 'sonnet', status: 'starting', attempt_token: 'tok', dir: h.runner.runDir(t.request_id, t.key, id), session_id: sessionId })
+    h.store.insertAttempt({ id, task_id: taskId, kind: 'work', n: 1, model: 'sonnet', status: 'starting', attempt_token: 'tok', dir: h.runner.runDir(t.request_id, t.key, id), session_id: sessionId, generation: t.generation })
     h.store.updateTask(taskId, { status: 'running', attempts: 1 })
   })
   return id
@@ -33,6 +33,7 @@ test('13. starting row without pid + a live process with that session id → ado
   orphan.stdin!.end('[[FAKE:sleep=20000]]')
   try {
     const id = h.plan([task('A')])
+    h.runner.stop()
     await h.approve(id)
     const aid = startingAttempt(h, `${id}.A`, sid)
     await new Promise((r) => setTimeout(r, 300))
@@ -47,15 +48,20 @@ test('13. starting row without pid + a live process with that session id → ado
   } finally { try { process.kill(-orphan.pid!, 'SIGKILL') } catch { /* gone */ } await h.close() }
 })
 
-test('13. starting row without pid and no orphan → start_failed, task back to pending', async () => {
+test('13 / v3-10. starting row without pid and no orphan → blocked ("시작 여부 불명확"), never restarted automatically', async () => {
   const h = harness()
   try {
     const id = h.plan([task('A')])
+    h.runner.stop()
     await h.approve(id)
     const aid = startingAttempt(h, `${id}.A`, randomUUID())
-    await restart(h).recover()
+    const r = restart(h)
+    await r.recover()
     assert.equal(h.store.attempt(aid)!.status, 'start_failed')
-    assert.equal(tsk(h, `${id}.A`).status, 'pending')
+    assert.equal(tsk(h, `${id}.A`).status, 'blocked')
+    assert.match(tsk(h, `${id}.A`).note!, /시작 여부 불명확/)
+    for (let i = 0; i < 3; i++) await r.tick()
+    assert.equal(h.store.attempts(`${id}.A`).length, 1, 'no automatic restart')
   } finally { await h.close() }
 })
 

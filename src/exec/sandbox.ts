@@ -1,28 +1,25 @@
-// macOS Seatbelt boundary for workers, reviewers, setup and check commands (execution.md §6).
-// SBPL: later rules take precedence, so the order below is deny-hq → allow-own → deny-writes-outside-allowlist.
+// macOS Seatbelt boundary for workers, reviewers, setup and check commands (execution.md §6.2).
+// SBPL: later rules take precedence. Order: deny secret contents → allow own paths → deny writes outside the
+// allow list → deny writes to user repos and ~/.claude control files → exec/appleevent/network denials.
+// Only content reads are denied; metadata (lstat of ancestors) stays allowed, or Node's resolver fails with EPERM.
 import { existsSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, basename, join } from 'node:path'
 
 export interface SandboxOpts {
-  /** Task/review/integration worktree (read-write). */
+  /** The one repository/worktree this process may write (work clone, verification/review/integration worktree). */
   worktree: string
   /** Attempt out/ folder (read-write), or null when the command submits nothing (checks, setup). */
   out: string | null
-  /** Shared git dir of the project (`git rev-parse --git-common-dir`), writable so worktree commits work. */
-  repoGitDir: string | null
   hqHome: string
-  /** Folder holding the daemon token (~/.config/hq). */
+  /** Folder holding the daemon token (dirname of HQ_TOKEN_FILE). */
   tokenDir: string
   hqPort: number
   extraWritable: string[]
-  /** ~/.claude (the CLI's own state). */
-  claudeDir: string
-  /**
-   * hq-owned files wired to the process as stdin/stdout/stderr. Node aborts at startup when it cannot fstat its stdio,
-   * so these get metadata-only access (no content read or write) — measured, see report.
-   */
-  stdioFiles?: string[]
+  /** Registered project checkouts: never writable, and their .env* files are unreadable. */
+  projects: string[]
+  /** Home directory for ~ paths (tests use a fake one). */
+  home?: string
 }
 
 /** Seatbelt matches resolved paths (/var → /private/var); resolve the deepest existing ancestor. */
@@ -39,19 +36,46 @@ export function real(p: string): string {
 
 const q = (s: string) => JSON.stringify(s) // SBPL string literal: same escaping as JSON for our paths
 const reEsc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const sub = (p: string) => `(subpath ${q(p)})`
+const lit = (p: string) => `(literal ${q(p)})`
+const rx = (r: string) => `(regex ${q(r)})`
+
+/**
+ * ~/.claude subfolders the CLI must write. Measured with the real CLI (2.1.285, haiku, -p): with all of ~/.claude
+ * write-denied a one-line answer, Bash, Write and Edit worked; only `--resume` failed ("No conversation found")
+ * until projects/ (session transcripts) was writable. ~/.claude.json* is always written (documented limit).
+ */
+export const CLAUDE_RUNTIME_DIRS = ['projects']
+const CLAUDE_PROTECTED_DIRS = ['skills', 'agents', 'commands', 'plugins', 'hooks']
 
 export function sandboxProfile(o: SandboxOpts): string {
-  const home = real(homedir())
+  const home = real(o.home ?? homedir())
+  const hq = real(o.hqHome)
   const own = [o.worktree, ...(o.out ? [o.out] : [])].map(real)
-  const writable = [...own, ...(o.repoGitDir ? [real(o.repoGitDir)] : []), real(o.claudeDir), '/private/tmp', '/private/var/folders', '/dev', ...o.extraWritable.map(real)]
+  const projects = o.projects.map(real)
+  const secretContents = [
+    sub(real(o.tokenDir)), rx(`^${reEsc(hq)}/hq\\.db`), sub(join(hq, 'runs')), sub(join(hq, 'logs')), sub(join(hq, 'work')),
+    sub(join(home, '.ssh')), sub(join(home, '.aws')), sub(join(home, '.config/gh')), lit(join(home, '.netrc')), lit(join(home, '.docker/config.json')),
+    // ~/Library/Keychains is NOT denied although §6.2 lists it: with it denied the real CLI answers "Not logged in"
+    // (its subscription token lives in the login keychain; measured on 2.1.285). Reported as BLOCKED for a ruling.
+    ...projects.map((p) => rx(`^${reEsc(p)}/(.*/)?\\.env[^/]*$`)),
+  ]
+  const writable = [...own, '/private/tmp', '/private/var/folders', '/dev', ...o.extraWritable.map(real), ...CLAUDE_RUNTIME_DIRS.map((d) => join(home, '.claude', d))]
+  const claudeControl = [rx(`^${reEsc(join(home, '.claude'))}/settings[^/]*\\.json$`), lit(join(home, '.claude/CLAUDE.md')), ...CLAUDE_PROTECTED_DIRS.map((d) => sub(join(home, '.claude', d)))]
   return [
     '(version 1)',
     '(allow default)',
-    `(deny file-read* file-write* (subpath ${q(real(o.tokenDir))}) (subpath ${q(real(o.hqHome))}))`,
-    `(allow file-read* file-write* ${own.map((p) => `(subpath ${q(p)})`).join(' ')})`,
-    `(deny file-write* (require-not (require-any ${writable.map((p) => `(subpath ${q(p)})`).join(' ')} (regex ${q(`^${reEsc(home)}/\\.claude\\.json`)}))))`,
+    `(deny file-read-data file-write* ${secretContents.join(' ')})`,
+    `(allow file-read-data file-write* ${own.map(sub).join(' ')})`,
+    `(deny file-write* (require-not (require-any ${writable.map(sub).join(' ')} ${rx(`^${reEsc(home)}/\\.claude\\.json`)})))`,
+    // $HQ_HOME (mirrors, other worktrees, the DB) and user checkouts are never writable, even when they sit under an
+    // allow-listed temp root; the process's own paths are re-allowed right after.
+    `(deny file-write* ${[sub(hq), ...projects.map(sub)].join(' ')})`,
+    `(allow file-write* ${own.map(sub).join(' ')})`,
+    `(deny file-write* ${claudeControl.join(' ')})`,
+    '(deny process-exec (literal "/usr/bin/open") (literal "/usr/bin/osascript") (literal "/bin/launchctl"))',
+    '(deny appleevent-send)',
     `(deny network-outbound (remote ip ${q(`localhost:${o.hqPort}`)}))`,
-    ...(o.stdioFiles?.length ? [`(allow file-read-metadata ${o.stdioFiles.map((f) => `(literal ${q(real(f))})`).join(' ')})`] : []),
     '',
   ].join('\n')
 }
@@ -62,7 +86,7 @@ export function wrap(argv: string[], profilePath: string): string[] {
 
 const PASS = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL']
 
-/** Allow-listed environment only: no HQ_TOKEN, API keys or SSH agent reach sandboxed processes. */
+/** Allow-listed environment only: no HQ_TOKEN, ANTHROPIC_ or OPENAI_ keys, or SSH agent reach sandboxed processes. */
 export function childEnv(extra: Record<string, string> = {}, from: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {}
   for (const k of PASS) if (from[k] !== undefined) env[k] = from[k]

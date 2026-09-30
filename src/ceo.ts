@@ -9,7 +9,7 @@ import { isLimited } from './exec/contract.ts'
 
 export interface Project { id: string; name: string; path: string; setup?: string }
 export interface CeoQuestion { question: string; options: string[]; default: string; reason: string }
-export interface Acceptance { id: string; text: string; check: string }
+export interface Acceptance { id: string; text: string; check: string; kind: 'new' | 'regression' }
 export interface TaskReview { brief: string; model: 'sonnet' | 'opus' | 'none' }
 export interface PlanTask {
   id: string; title: string; project: string; role: 'collect' | 'implement'
@@ -33,7 +33,7 @@ export const TASK_SCHEMA = { type: 'object', additionalProperties: false,
     role: { enum: ['collect', 'implement'] }, grade: { enum: ['L0', 'L1', 'L2', 'L3'] },
     model: { enum: ['haiku', 'sonnet', 'opus'] }, owns: strArr,
     acceptance: { type: 'array', minItems: 1, maxItems: 7, items: { type: 'object', additionalProperties: false,
-      required: ['id', 'text', 'check'], properties: { id: str, text: str, check: str } } },
+      required: ['id', 'text', 'check', 'kind'], properties: { id: str, text: str, check: str, kind: { enum: ['new', 'regression'] } } } },
     brief: str, depends_on: strArr,
     review: { type: 'object', additionalProperties: false, required: ['brief', 'model'], properties: { brief: str, model: { enum: ['sonnet', 'opus', 'none'] } } } } }
 export const CEO_SCHEMA = {
@@ -47,7 +47,15 @@ export const CEO_SCHEMA = {
 
 /** Default review model by grade (§3): L0 none, L1 sonnet, L2·L3 opus. */
 export const defaultReviewModel = (grade: string) => (grade === 'L0' ? 'none' : grade === 'L1' ? 'sonnet' : 'opus')
-export const reviewModelOf = (t: PlanTask) => (t.role === 'collect' ? 'none' : t.review?.model ?? defaultReviewModel(t.grade))
+/** Review model: implement by grade (or task.review); collect is reviewed only from L2 up (§10). */
+export const reviewModelOf = (t: PlanTask) => (t.role === 'collect' && (t.grade === 'L0' || t.grade === 'L1') ? 'none' : t.review?.model ?? defaultReviewModel(t.grade))
+
+/** A check is one command: chaining hides failures (§3). Returns the offending token, or null. */
+export function chainedCheck(check: string): string | null {
+  if (check.trim() === 'manual') return null
+  for (const tok of ['&&', '||', '|', ';', '`', '$(', '\n']) if (check.includes(tok)) return tok === '\n' ? '줄바꿈' : tok
+  return null
+}
 
 const norm = (p: string) => p.replace(/^\.\//, '').replace(/\/+$/, '')
 const isGlob = (p: string) => /[*?[{]/.test(p)
@@ -88,6 +96,11 @@ export function validateTasks(tasks: PlanTask[], projects: Project[]): string | 
     if (t.role === 'implement' && t.owns.length === 0) return `작업 ${t.id}에 owns가 없습니다`
     const accIds = t.acceptance.map((a) => a.id)
     if (new Set(accIds).size !== accIds.length) return `작업 ${t.id}의 수용 기준 id가 중복됩니다`
+    for (const a of t.acceptance) {
+      if (a.kind !== 'new' && a.kind !== 'regression') return `작업 ${t.id}의 수용 기준 ${a.id}에 kind(new | regression)가 없습니다`
+      const tok = chainedCheck(a.check)
+      if (tok) return `작업 ${t.id}의 수용 기준 ${a.id} check는 명령 하나여야 합니다 (${tok} 사용 금지): ${a.check.slice(0, 80)}`
+    }
   }
   // Cycle check (Kahn).
   const indeg = new Map(tasks.map((t) => [t.id, t.depends_on.length]))

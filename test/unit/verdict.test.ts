@@ -8,7 +8,7 @@ import { extractBashRuns } from '../../src/exec/stream.ts'
 import { tmp } from './helpers.ts'
 
 const ids = ['A1', 'A2']
-const runs = [{ command: 'npm test', exitCode: 0 }, { command: 'npm run lint', exitCode: 1 }]
+const runs: { command: string; exitCode: number | null }[] = [{ command: 'npm test', exitCode: 0 }, { command: 'npm run lint', exitCode: 1 }]
 const v = (o: Record<string, unknown> = {}) => ({ pass: true, blocking: [], advisory: [],
   criteria: [{ id: 'A1', result: 'pass', evidence: 'e' }, { id: 'A2', result: 'pass', evidence: 'e' }], tests_run: [{ command: 'npm test', exit_code: 0, summary: 'ok' }], ...o })
 const kind = (raw: unknown) => checkVerdict(raw, { acceptanceIds: ids, codeChanged: true, bashRuns: runs }).kind
@@ -40,5 +40,5 @@ test('4. Bash runs and exit codes come from the reviewer stream', () => {
   const got = extractBashRuns(join(dir, 'stream.jsonl'))
   assert.deepEqual(got, [{ command: 'npm test', exitCode: 0 }, { command: 'cd pkg && npm run lint', exitCode: 2 }])
   const r = checkVerdict(v({ tests_run: [{ command: 'npm run lint', exit_code: 2, summary: '' }] }), { acceptanceIds: ids, codeChanged: true, bashRuns: got })
-  assert.equal(r.kind, 'pass', 'command contained in a compound Bash run')
+  assert.equal(r.kind, 'invalid', 'v3: a command contained in a compound Bash run is not a match')
 })

@@ -1,5 +1,5 @@
 // hq daemon entry point. Start order (exec-engine-spec §F): recover → runner → engine → server.
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
@@ -20,15 +20,23 @@ const cfg = loadConfig(root)
 const port = Number(process.env.HQ_PORT ?? 7777)
 mkdirSync(cfg.home, { recursive: true })
 
-// Single instance: daemon.lock holds our pid as one integer line.
+// Single instance (§7.8): daemon.lock is created with O_CREAT|O_EXCL and holds our pid as one integer line.
+// An existing lock whose pid is alive and runs src/main.ts means another daemon; anything else is stale.
 const lockPath = resolve(cfg.home, 'daemon.lock')
-if (existsSync(lockPath)) {
-  const other = Number(readFileSync(lockPath, 'utf8').trim())
+const tryLock = () => {
+  try { const fd = openSync(lockPath, 'wx', 0o644); writeSync(fd, `${process.pid}\n`); closeSync(fd); return true } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false
+    throw e
+  }
+}
+if (!tryLock()) {
+  const other = Number((() => { try { return readFileSync(lockPath, 'utf8').trim() } catch { return '' } })())
   let cmd = ''
   if (other > 0 && other !== process.pid) try { cmd = execFileSync('ps', ['-o', 'command=', '-p', String(other)], { encoding: 'utf8' }) } catch { /* not running */ }
   if (cmd.includes('src/main.ts')) { console.error(`hq가 이미 실행 중이에요 (pid ${other})`); process.exit(1) }
+  rmSync(lockPath, { force: true })
+  if (!tryLock()) { console.error('daemon.lock을 만들지 못했어요 (다른 hq가 동시에 시작 중)'); process.exit(1) }
 }
-writeFileSync(lockPath, `${process.pid}\n`)
 const releaseLock = () => { try { if (readFileSync(lockPath, 'utf8').trim() === String(process.pid)) rmSync(lockPath) } catch { /* gone */ } }
 process.on('exit', releaseLock)
 
@@ -50,7 +58,8 @@ const projects = (JSON.parse(readFileSync(projectsFile, 'utf8')) as Project[]).m
 
 const runner = new Runner({ store, bus, cfg, projects, hqRoot: root, hqPort: port, notify: cfg.notify ? notify : () => {}, now: Date.now, tokenDir: dirname(tokenPath) })
 const scheduler = new Scheduler(teams, store, bus, `http://127.0.0.1:${port}`, token, {
-  holdUntil: () => runner.holdUntil(),
+  // A login hold has no end time; teams still wait (checked again every scheduler tick).
+  holdUntil: () => (runner.quota().mode === 'hold' ? runner.holdUntil() ?? new Date(Date.now() + 60_000).toISOString() : null),
   teamLimited: (until) => store.setQuotaWindow({ window: 'team', utilization: null, resets_at: until, status: 'rejected', observed_at: new Date().toISOString() }),
 })
 const engine = new RequestEngine(store, bus, projects, root, runner)
