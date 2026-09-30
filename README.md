@@ -46,6 +46,7 @@
 bin/hq projects add ~/code/my-app   # 관리할 프로젝트 등록
 bin/hq install                      # 진단 → 펫 빌드 → 자동 시작 등록
 bin/hq open                         # 웹 화면
+npm test                            # 테스트 (단위·웹·CLI·펫)
 ```
 자세한 설치·운영·문제 해결은 [SETUP](docs/SETUP.md), 실행 계약은 [설계 문서](docs/design/execution.md)에 있습니다.
 요구 사항: macOS 14+, Node 26+, Claude Code CLI(로그인된 구독), Xcode Command Line Tools.

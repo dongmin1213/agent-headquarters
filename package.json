@@ -5,7 +5,8 @@
   "description": "Personal AI company runtime: chairman -> CEO agent -> teams. Runs teams on schedules, supervises Claude Code processes, serves state to the desk pet.",
   "scripts": {
     "start": "node src/main.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --test 'test/unit/*.test.ts' 'test/web/*.test.ts' 'test/cli/*.test.ts' 'test/pet/*.test.ts'"
   },
   "engines": { "node": ">=26" },
   "devDependencies": { "typescript": "7.0.2", "@types/node": "latest" }
