@@ -1,42 +1,31 @@
-# 실행 단계 설계 (계약)
+# 실행 단계 설계 (계약) v2
 
-상태: 구현 기준 문서. 병렬 작업자는 이 문서의 계약(데이터 형태·상태·API·경로)을 바꾸지 않는다. 바꿔야 하면 BLOCKED로 돌려준다.
+상태: 구현 기준 문서. v1(d9e5089)에 대한 두 독립 검토(Codex·Claude, 둘 다 NO SIGN)의 지적을 판정해 반영했다. 판정 기록은 §20.
+병렬 작업자는 이 문서의 계약(데이터 형태·상태·API·경로)을 바꾸지 않는다. 바꿔야 하면 멈추고 보고한다.
 
-## 0. 목표
-승인된 계획을 사람 개입 없이 끝까지 실행한다: 작업자 실행 → 완료 계약 확인 → hq가 수용 기준 직접 재실행 → 새 worktree 교차 검토 → 실패 시 재작업 사다리 → 결과 수락 → 병합 승인 → 로컬 병합.
-사람은 **질문 답변, 계획 승인, 결과 수락, 병합 승인, 회로 차단 판단**에서만 개입한다.
+## 0. 목표와 역할
+승인된 계획을 사람 개입 없이 끝까지 실행한다. 사람은 **질문 답변, 계획 승인, 결과 수락, 병합 승인, 회로 차단·수정안 판단**에서만 개입한다.
+- **판단은 CEO, 구현은 작업자** (decisions/0001). CEO는 코드를 조사해 "어디를·무엇을·어떤 규칙으로·무엇으로 확인하는지"를 지시서에 확정하고 코드 본문은 쓰지 않는다. 작업자는 지시서대로 구현만 하고, 지시서가 현실과 다르면 설계하지 않고 `blocked`로 멈춘다.
+- **작업자·검토자·검사 명령은 신뢰하지 않는다.** 권한 규칙은 가드레일이고, 경계는 OS 샌드박스(§6)와 hq의 직접 재검증(§8·§9)이다.
 
 ## 1. 경로
-| 경로 | 내용 |
-| --- | --- |
-| `$HQ_HOME` (기본 `~/.hq`) | hq의 모든 실행 데이터. 코드 저장소와 분리 |
-| `$HQ_HOME/hq.db` | SQLite (WAL) |
-| `$HQ_HOME/worktrees/<requestId>/<taskId>` | 작업 worktree (재작업 시 재사용) |
-| `$HQ_HOME/worktrees/<requestId>/<taskId>.review-a<n>` | 검토용 detached worktree (매번 새로) |
-| `$HQ_HOME/runs/<requestId>/<taskId>/a<n>/` | 시도별 증거 폴더 (아래) |
-| `~/.config/hq/token` | 데몬 API 토큰 (0600) |
-| `<hq repo>/config/hq.json` | 설정 (없으면 기본값). `config/projects.json` 프로젝트 목록 |
-
-토큰은 기존대로 `~/.config/hq/token`. DB는 `.data/hq.db`에서 `$HQ_HOME/hq.db`로 옮긴다(최초 1회 복사 마이그레이션: `.data/hq.db`가 있고 새 파일이 없으면 복사).
-
-증거 폴더 파일:
-| 파일 | 쓰는 쪽 | 내용 |
+| 경로 | 내용 | 작업자 접근 |
 | --- | --- | --- |
-| `prompt.md` | hq | 작업자에게 준 전체 프롬프트 |
-| `spec.json` | hq | 실행 argv(비밀 없음), 모델, base/branch, 시작 시각, attempt_token |
-| `stream.jsonl` | claude stdout | stream-json 원문 |
-| `stderr.log` | claude stderr | |
-| `process.json` | hq | `{pid, startedAt, sessionId}` — spawn 직후 원자적 기록 |
-| `done.json` | 작업자 | 완료 계약 (아래) |
-| `report.md` | 작업자 | 보고서 (`## 요약` 절 필수) |
-| `activity.jsonl` | hq | 사람이 읽는 활동 로그 (아래) |
-| `checks.json` | hq | 기계 검증 결과 |
-| `verdict.json` | hq | 검토 결과(검토 시도에서만) |
-| `result.json` | hq | 시도 최종 판정 |
+| `$HQ_HOME` (기본 `~/.hq`) | hq 실행 데이터 | 기본 거부 |
+| `$HQ_HOME/hq.db` | SQLite(WAL) | 거부 |
+| `$HQ_HOME/worktrees/<requestId>/<key>` | 작업 worktree | 자기 것만 읽기·쓰기 |
+| `$HQ_HOME/worktrees/<requestId>/<key>.r<n>` | 검토 worktree (detached, 매번 새로) | 자기 것만 |
+| `$HQ_HOME/worktrees/<requestId>/_integration-<project>` | 통합 worktree (§12) | 작업자 없음 |
+| `$HQ_HOME/runs/<requestId>/<key>/<attemptId>/hq/` | hq 소유 증거: prompt.md, spec.json, stream.jsonl, stderr.log, process.json, tail.json, activity.jsonl, checks.json, verdict.json, result.json | 거부 |
+| `$HQ_HOME/runs/<requestId>/<key>/<attemptId>/out/` | 작업자 제출: `report.md`, `done.json` 만 | 이 폴더만 쓰기 |
+| `~/.config/hq/token` | 데몬 API 토큰 (0600) | 거부 |
+| `<hq repo>/config/hq.json`, `config/projects.json` | 설정 | — |
 
-파일 쓰기는 모두 같은 폴더의 임시 파일 → rename (원자적).
+- **ID 형식 (URL 안전)**: 요청 `req-xxxxxxxx`, 작업 `<requestId>.<key>`(key는 `[A-Za-z0-9_-]{1,32}`), 시도 `<taskId>~a<n>`(작업) / `<taskId>~r<n>`(검토). 클라이언트는 그래도 경로 세그먼트를 percent-encode하고, 서버는 한 번만 decode한다.
+- `out/` 파일은 hq가 `lstat`로 일반 파일인지 확인하고 `O_NOFOLLOW` + 크기 상한(report 1MB, done 64KB)으로만 읽는다. symlink·디렉터리·과대 파일은 없는 것으로 취급한다.
+- **로그는 append-only**(stream.jsonl, stderr.log, activity.jsonl; 마지막 불완전 줄은 다음 읽기에서 복구). **스냅샷 파일은 원자적 교체**(tmp→rename). 판정의 원본은 DB이며 파일은 사본이다.
 
-## 2. 설정 `config/hq.json` (모든 키 선택, 기본값)
+## 2. 설정 `config/hq.json` (모든 키 선택)
 ```json
 {
   "maxWorkers": 2,
@@ -46,143 +35,205 @@
   "models": { "haiku": "haiku", "sonnet": "sonnet", "opus": "opus" },
   "ladder": ["haiku", "sonnet", "opus"],
   "maxAttempts": 3,
-  "quota": { "saveAt": 0.85, "reviewOnlyAt": 0.90, "holdAt": 0.95 },
-  "workerDisallowedTools": ["Bash(git push:*)", "Bash(git remote:*)", "Read(**/.env*)", "Edit(**/.env*)", "Write(**/.env*)"],
+  "quota": { "saveAt": 0.85, "holdAt": 0.95 },
+  "protectedPaths": ["**/*.test.*", "**/*.spec.*", "test/**", "tests/**", "**/__tests__/**", "package.json", "*.lock", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", ".github/**", "tsconfig*.json", "**/*.config.*"],
+  "sandbox": { "extraWritable": ["~/.npm", "~/.cache", "~/Library/Caches"] },
   "notify": true
 }
 ```
-`src/config.ts`가 로드·검증·기본값 병합을 담당한다(이미 작성됨).
+`projects.json` 항목에 선택 필드 `setup`(문자열, 예: `"npm ci --prefer-offline"`) 추가: worktree 생성 직후 샌드박스 안에서 실행.
+`quota.reviewOnlyAt`은 v2에서 제거(검토 A14: 실익 작음). `workerDisallowedTools`는 가드레일로 유지(§6).
 
-## 3. 데이터 모델 (store 확장)
+## 3. 계획 형태 (CEO 스키마 v2)
+- 역할은 `collect | implement` 둘. **verify 역할 폐지**: 구현 작업마다 선택 필드 `review: { brief, model }`(model `sonnet|opus|none`). 없으면 등급 표 기본값(L0 none, L1 sonnet, L2·L3 opus). `none`은 LLM 검토 없이 기계 검증만.
+- `external: true` 작업과 `model: none` 작업은 이번 단계에서 **거부**(validate 오류). 외부 게시·삭제·결제는 지원하지 않는다고 CEO 규칙에 명시.
+- `validate()` 추가 검사: 자기 의존·순환(위상 정렬), 존재하지 않는 의존, owns 정규화(선행 `./` 제거, 뒤 `/` 제거) 후 **겹침 검사**(한쪽이 다른 쪽의 접두 경로이거나, glob과 경로가 `matchesGlob` 양방향 중 하나라도 맞거나, 두 glob의 고정 접두부가 겹치면 겹침으로 본다) — 병렬 구현 작업이 겹치면 오류, 같은 프로젝트 의존으로 순서가 있으면 허용.
+- 계획 승인 카드 본문: 작업별 `[key] 제목 · 역할·등급·모델 · 검토 모델`, 소유 경로, **수용 기준의 check 명령 원문**, 프로젝트 setup 명령. 사람이 본 명령만 실행된다.
+
+## 4. 데이터 모델
 ```sql
-create table tasks (
-  id text primary key,            -- "<requestId>/<taskKey>"
-  request_id text not null, task_key text not null, project text not null,
-  title text not null, role text not null, grade text not null, model text not null,
-  spec text not null,             -- PlanTask JSON (brief, owns, acceptance, depends_on, external)
-  review_brief text,              -- verify 역할 작업이 가리키는 검토 지시 (없으면 기본 검토)
-  status text not null,           -- TaskStatus
-  attempts integer not null default 0,
-  branch text, worktree text, base_sha text, head_sha text,
-  note text, updated_at text not null);
-create table attempts (
-  id text primary key,            -- "<taskId>#a<n>" 또는 "<taskId>#r<n>"(검토)
-  task_id text not null, kind text not null,   -- work | review
-  n integer not null, model text not null, status text not null,  -- AttemptStatus
-  session_id text, pid integer, attempt_token text not null, dir text not null,
-  started_at text, ended_at text, cost_usd real, input_tokens integer, output_tokens integer,
-  outcome text, reason text);
-create table quota (id integer primary key check (id = 1), five_hour real, seven_day real,
-  five_hour_resets_at text, seven_day_resets_at text, status text, observed_at text);
+tasks(id pk, request_id, key, project, title, role, grade, model, review_model,
+      spec text,            -- PlanTask JSON (revision마다 교체)
+      revision int default 0, status, attempts int default 0, limited_streak int default 0,
+      branch, worktree, base_sha, head_sha, checks_state, resume_session, note, updated_at)
+attempts(id pk, task_id, kind work|review, n, model, status, session_id not null,
+      pid, lstart, attempt_token, dir, started_at, ended_at, cost_usd, input_tokens, output_tokens, outcome, reason,
+      unique(task_id, kind, n))
+quota(window pk, utilization, resets_at, status, observed_at)      -- window: five_hour | seven_day | …
+merges(request_id, project, target, target_sha, integration_sha, state, result_sha, note, updated_at, pk(request_id, project))
+task_questions(id pk, task_id, attempt_id, revision, question, options, default_option, answer, created_at)
+approvals: 기존 + kind, subject_id, revision 컬럼, 상태 superseded 추가
+schema_version: pragma user_version
 ```
-요청 테이블의 status에 실행 단계 값이 추가된다(§4).
+- 모든 상태 전이는 한 트랜잭션. 외부 부작용(spawn, git 쓰기, kill) 전에 의도를 먼저 기록.
+- DB 이전(`.data/hq.db` → `$HQ_HOME/hq.db`): 원본을 열어 `VACUUM INTO '<tmp>'` → `pragma integrity_check` → rename. 표식 `kv: migrated_from`. 원본은 지우지 않는다.
 
-## 4. 상태
-**Request.status**: `queued → thinking → asking → planned → approved → executing → awaiting_acceptance → accepted → merging → merged`, 분기 `rejected | failed | blocked`(회로 차단 등 사람 판단 필요) `| cancelled`.
+## 5. 상태 (전이표는 exec-engine-spec.md §C가 권위)
+**Request**: `queued → thinking → asking → planned → executing → awaiting_acceptance → accepted → merging → merged`; 분기 `rejected | failed | blocked | cancelled | expired`.
+**Task**: `pending → running → verifying → reviewing → passed`; 분기 `rework · revising · question · held · blocked · cancelled`.
+**Attempt**: `starting → running →` 판정 `succeeded | failed | brief_blocked | question | limited | runaway | unverifiable | start_failed | transient`.
+**불변식**: 종결되지 않은 요청·작업은 항상 (a) 살아 있는 프로세스 (b) 열린 카드·미답 질문 (c) 시각 타이머(한도 해제 등) (d) 배정 대기(스케줄러가 다음 틱에 시작 가능) 중 하나를 가진다. 1분마다 조정기(reconciler)가 검사해 위반을 `blocked` + 카드로 드러낸다.
 
-**TaskStatus**: `pending`(의존 대기·배정 대기) → `running` → `verifying` → `reviewing` → `passed`. 분기: `rework`(다음 시도 대기) · `question`(작업자 질문 대기) · `held`(한도 보류) · `blocked`(3회 실패 또는 확인 불가 → 사람 판단) · `cancelled`.
-`collect` 역할: `running → verifying(보고서 존재·요약 확인만) → passed`. 검토 없음.
-`verify` 역할 작업은 독립 실행하지 않는다: 의존 대상 구현 작업의 `review_brief`로 합쳐진다.
+## 6. 작업자 실행 경계 (샌드박스)
+작업자·검토자·collect·setup·check 명령은 모두 macOS Seatbelt(`sandbox-exec -f <profile>`)로 감싼다. 프로필(실측 검증됨: 토큰 읽기·hq 포트 접속·허용 밖 쓰기 거부, claude 정상 동작):
+- 읽기·쓰기 거부: `~/.config/hq`, `$HQ_HOME` 전체 — 단 자기 worktree·자기 `out/`은 허용(뒤 규칙 우선).
+- 쓰기 허용 목록 외 전부 거부: 자기 worktree, 자기 `out/`, 프로젝트 repo의 `.git`(worktree 커밋에 필요), `~/.claude`, `~/.claude.json*`, `/private/tmp`, `/private/var/folders`, `/dev`, `sandbox.extraWritable`.
+- 네트워크: `localhost:<hq port>`·`127.0.0.1:<hq port>` 거부.
+- 환경변수 허용 목록만 전달: `PATH HOME USER LANG LC_ALL TERM TMPDIR SHELL`, `HQ_ATTEMPT_OUT`, git 보조(`GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_COUNT/KEY/VALUE`로 `remote.pushDefault`·`push.default=nothing`). `HQ_TOKEN`·API 키·`SSH_AUTH_SOCK` 제거.
+- **알려진 한계(문서화)**: 공유 `.git`에 쓸 수 있으므로 작업자가 다른 브랜치 ref를 바꿀 수 있다 → hq는 브랜치 이름이 아니라 **기록한 SHA**로만 검증·통합·병합한다(§12).
+- 권한 플래그(가드레일): 모든 역할에 `--tools <목록>`(사용 가능 도구 자체 제한) + `--setting-sources "" --strict-mcp-config --disable-slash-commands`.
+  - implement: `--tools Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch --permission-mode acceptEdits --add-dir <out>`
+  - collect: `--tools Read,Glob,Grep,WebFetch,WebSearch,Write --permission-mode dontAsk --allowedTools Read,Glob,Grep,WebFetch,WebSearch,Write(//<out 절대경로>/**)` (cwd = base의 detached worktree)
+  - review: `--tools Bash,Read,Glob,Grep --permission-mode dontAsk --allowedTools Bash,Read,Glob,Grep --json-schema <VERDICT>`
+- 실행: `--output-format stream-json --verbose --model <m> --session-id <uuid>|--resume <uuid> --max-turns <n>`. stdin = prompt 파일, stdout/stderr = `hq/` 로그 파일, `detached: true`(자기 프로세스 그룹).
 
-**AttemptStatus**: `starting → running → ended` 후 판정 `succeeded | failed | question | limited | runaway | unverifiable | start_failed`.
+## 7. 시작·종료 프로토콜 (중복 실행 방지)
+1. 트랜잭션: attempt 행 `starting` + `session_id` + `attempt_token` + 폴더 기록 → task `running`.
+2. spawn → 즉시 `pid`와 `ps -o lstart=`(LC_ALL=C)를 attempt 행과 `hq/process.json`에 기록.
+3. 복구 시 `starting` 행: pid 없으면 `pgrep -f -- "--session-id <uuid>"`(또는 `--resume <uuid>`)로 고아를 찾는다 → 찾으면 채택(pid 기록), 없으면 `start_failed`. pid가 있으면 `lstart` 일치로 동일 프로세스 확인.
+4. 시도가 끝나면(판정 직후, 정상 포함) 프로세스 그룹 전체 SIGTERM → 10초 후 SIGKILL(작업자가 띄운 백그라운드 프로세스 정리).
+5. 저장소 단위 뮤텍스: 같은 repo에 대한 git 쓰기(worktree add/remove, branch, merge, 통합)는 직렬.
+6. 다음 시도 전 worktree가 더러우면 `git diff`와 미추적 목록을 `hq/dirty.patch`로 저장 후 `reset --hard HEAD` + `clean -fd`, 프롬프트에 알림.
 
-## 5. 작업자 실행 계약
-- worktree: 프로젝트가 git repo가 아니면 계획 승인 시 요청을 `failed`(사유 명시). base = 승인 시점 프로젝트 `HEAD` 커밋(요청 단위 고정). 같은 프로젝트에서 의존하는 작업은 선행 작업의 `head_sha`에서 분기. 브랜치 `hq/<requestId>/<taskKey>`.
-- 실행: `claude -p --output-format stream-json --verbose --model <models[x]> --session-id <uuid> --permission-mode acceptEdits --allowedTools Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch --disallowedTools <workerDisallowedTools> --setting-sources "" --strict-mcp-config --disable-slash-commands --add-dir <증거폴더> --max-turns <maxTurns>`, cwd = worktree, stdin = `prompt.md` 파일, stdout/stderr = 증거 폴더 파일. `detached: true`로 띄워 데몬 재시작에도 살아남는다. 환경변수에서 `CLAUDECODE` 제거, `HQ_ATTEMPT_DIR` 설정.
-  - `collect`: `--allowedTools Read,Glob,Grep,WebFetch,WebSearch,Write(<증거폴더>/**)`, 커밋 없음.
-- 프롬프트(`src/exec/prompt.ts`): 지시서 + owns + 수용 기준 + 아래 규칙. 재작업이면 이전 실패 증거(checks.json 실패 항목·검토 blocking·반려 사유) 요약을 붙인다.
-  1. owns 밖 파일을 바꾸지 않는다. 필요하면 멈추고 `outcome: "blocked"`로 이유를 적는다.
-  2. 작업을 코드 커밋으로 남긴다(여러 개 가능). 마지막에 작업 트리가 깨끗해야 한다. push 금지.
-  3. `report.md`를 증거 폴더에 쓴다: 첫 절은 `## 요약`(200자 이상: 무엇을·왜·검증 결과), 그 뒤 수용 기준별 확인 결과(실행한 명령과 종료 코드).
-  4. 마지막에 `done.json`을 증거 폴더에 **임시 파일로 쓴 뒤 rename**한다. 이후 아무것도 바꾸지 않는다.
-  5. 사람에게 물어야만 진행 가능하면 `outcome: "question"`과 `questions`를 넣고 끝낸다.
-- `done.json`:
-```json
-{ "attempt_token": "<그대로 복사>", "outcome": "succeeded|failed|blocked|question",
-  "head_sha": "<git rev-parse HEAD>", "files_modified": ["..."], "summary": "한 줄",
-  "questions": [{ "question": "...", "options": ["..."], "default": "..." }] }
-```
+## 8. 완료 판정 (작업 시도)
+프로세스 종료 확인 후:
+1. **한도**: 구조화 신호만 — `rate_limit_info.status == "rejected"` 또는 result `is_error` && `api_error_status == 429`. result 줄이 없을 때만 stderr 정규식. → `limited`(시도 수 안 셈, task `held`, 같은 세션 `--resume`으로 이어감). 작업당 연속 3회 → `blocked`.
+2. **일시 오류**: result `is_error` && `api_error_status` 5xx·과부하 → `transient`(시도 수 안 셈, 1회 자동 재시작, 2회 연속이면 `failed`).
+3. 폭주로 죽였으면 → `runaway`. result `subtype == error_max_turns` → `failed`("턴 상한").
+4. 정상 종료인데 `out/done.json` 없음·파싱 실패·토큰 불일치 → `unverifiable` → task `blocked`(자동 재시도 없음).
+5. outcome `question` → `question` (라운드 최대 3, 초과 → `blocked`).
+6. outcome `blocked` → `brief_blocked` → task `revising` (§10a).
+7. outcome `failed` → `failed`.
+8. `succeeded` 검사 (implement): `head_sha` = worktree HEAD = 종료 시점 HEAD; `git diff --name-only --no-renames <task.base_sha> HEAD` = `files_modified`; 모두 owns 안(rename 양쪽 경로 포함); 작업 트리 깨끗함; `out/report.md` `## 요약` 200자 이상; base..HEAD 모든 커밋이 base의 자손(`rev-list`)이고 merge 커밋 없음. 하나라도 실패 → `failed`.
+   collect: done/토큰/outcome 공통 검사 + report 요약 + cwd 트리 무변경. 보고서는 hq가 `hq/report.sealed.md`로 복사하고 sha256을 task에 기록(후행 작업에는 봉인본 경로 전달).
+9. 보호 경로(`protectedPaths`)에 해당하는 변경은 통과시키되 목록을 기록 → 검토 프롬프트에 "보호 경로 변경: 테스트·설정 약화 여부 반드시 판정"으로, 수락 카드에 표시.
 
-## 6. 완료 판정 (`src/exec/contract.ts`, 순수 함수 + git 호출)
-프로세스 종료 후(또는 재시작 복구 시 종료가 확인된 뒤) 순서대로:
-1. 한도: stream의 result/stderr가 한도 패턴이거나 `rate_limit_event.status`가 `rejected` → `limited` (시도 수에 안 셈, 작업 `held`).
-2. 폭주로 죽였으면 → `runaway` (실패로 셈).
-3. `done.json` 없음·파싱 실패·토큰 불일치 → `unverifiable` (자동 재실행 안 함 → 작업 `blocked`, 사람 판단). 종료 코드 0이어도 같다.
-4. outcome `question` → `question`.
-5. outcome `failed|blocked` → `failed` (reason에 요약).
-6. `succeeded`면 검사: `head_sha` = worktree HEAD, base..HEAD 변경 파일 집합 = `files_modified`, 모두 owns glob 안, `git status --porcelain` 비어 있음, report.md 존재·`## 요약` 200자 이상, done.json 이후 HEAD 불변. 하나라도 실패 → `failed`(사유 목록).
+## 9. 기계 검증 (hq가 직접)
+- worktree HEAD가 `head_sha`인지 확인 후, 모든 non-manual check를 샌드박스 안 `/bin/sh -c <check>`(stdin /dev/null, 최소 env, 그룹 타임아웃)로 실행. 검사 전후 `git status --porcelain`·HEAD 불변 확인(검사가 소스를 바꾸면 실패).
+- **기준선**: 처음 그 base에서 작업을 시작할 때, 같은 check들을 base의 임시 detached worktree에서 한 번 실행해 캐시(`kv: baseline:<repo>:<sha>:<checkId>`). base에서 이미 실패한 check는 `baselineFailed`로 표시하고 합격 판정에서 제외(수락 카드에 "기존 실패" 표시).
+- 비밀값 검사: base..HEAD의 **모든 커밋**의 추가 줄 + 파일명 거부 목록(`.env*`, `*.pem`, `id_rsa*`, `*.p12`, `*.key`). 값은 기록하지 않는다.
+- 결과 `hq/checks.json`. 실패 → 재작업.
 
-## 7. 기계 검증 (hq가 직접)
-`succeeded` 판정 뒤 task `verifying`. 각 acceptance의 `check`가 `manual`이 아니면 worktree에서 `/bin/sh -c <check>` 실행(타임아웃 `checkTimeoutMinutes`, 출력 앞뒤 200줄 보관). 추가 공통 검사: 변경 diff에 비밀값 패턴(`-----BEGIN .*PRIVATE KEY`, `sk-ant-`, `ghp_`, `AKIA[0-9A-Z]{16}`, `xox[bp]-`) 없음. 결과 `checks.json`: `{checks:[{id, command, exitCode, durationMs, pass, outputTail}], secrets:[...], pass}`. 명령은 계획 승인 카드 본문에 그대로 보였으므로 승인된 명령으로 본다. 실패 → 재작업.
+## 10. 교차 검토
+- 검토 worktree: `git worktree add --detach <path> <head_sha>` + setup. 모델: `task.review_model`(§3). 독립성은 새 세션·새 worktree에서 오며 같은 Claude 계열임을 표시한다(`sameFamily: true`).
+- VERDICT 스키마(정식 JSON Schema, 추가 필드 금지): `pass, blocking[{id,summary,evidence}], advisory[{id,summary}], criteria[{id,result pass|fail|manual,evidence}], tests_run[{command,exit_code,summary}]`.
+- hq 검증:
+  1. `criteria[].id` 집합 = 작업 acceptance id 집합(누락·중복·모르는 id → 무효).
+  2. `tests_run[]`의 각 명령은 검토자 stream의 실제 Bash `tool_use`와 대응 `tool_result`에서 찾아 종료 코드가 일치해야 한다(불일치 → 무효). 코드 변경이 있는데 `tests_run` 비면 무효.
+  3. `pass=true`인데 blocking 또는 fail 기준 → 무효. `pass=false`인데 blocking 없음 → 무효.
+  4. 무효 → 같은 head에서 재검토 1회, 두 번째 무효 → task `blocked`.
+- hq가 verdict에 바인딩 필드를 직접 붙인다(`task, head_sha, base_sha, reviewer_model, implementer_model, sameFamily`).
+- blocking → 재작업(사유 = blocking 목록). 검토 worktree는 끝나면 제거.
 
-## 8. 교차 검토
-기계 검증 통과 → task `reviewing`. `git worktree add --detach <검토 worktree> <head_sha>`. 모델: 구현 모델과 다르게(가능하면 한 단계 위, 최상위면 한 단계 아래) — 같은 Claude 계열이므로 verdict에 `sameFamily: true` 기록. 실행: `claude -p --output-format stream-json --verbose --model <m> --json-schema <VERDICT_SCHEMA> --permission-mode acceptEdits --allowedTools Bash,Read,Glob,Grep --disallowedTools Edit,Write,NotebookEdit,<workerDisallowedTools> --setting-sources "" --strict-mcp-config --disable-slash-commands`. 프롬프트: 원 지시서, 수용 기준, 변경 요약(diff stat), hq의 checks.json 요약, review_brief. **관련 테스트를 직접 실행하고 명령·종료 코드·결과를 `tests_run`에 적을 것**을 요구.
-```json
-VERDICT_SCHEMA = { pass: boolean, blocking: [{id, summary, evidence}], advisory: [{id, summary}],
-  criteria: [{id, result: "pass|fail|manual", evidence}], tests_run: [{command, exit_code, summary}] }
-```
-hq 검사: `pass=true`인데 blocking 있음·fail 기준 있음·tests_run 비어 있음(코드 변경이 있을 때) → 검토 무효로 보고 재검토 1회, 또 무효면 `blocked`. hq가 verdict.json에 `{task, head_sha, base_sha, reviewer_model, implementer_model, sameFamily}`를 직접 붙인다(검토자에게 옮겨 쓰게 하지 않는다). blocking → 재작업(사유 = blocking 목록). 검토 worktree는 끝나면 제거.
+## 10a. 지시서 수정 턴 (CEO)
+작업자 `blocked` → CEO 수정 턴: 입력 원 PlanTask·report.md·diff stat. 출력 `{ revised_task | null, questions }` 정확히 하나.
+- 자동 적용 조건: `key·project·role` 동일, `owns`가 원래의 부분집합, acceptance check 명령 집합 동일. 그 밖은 카드 `revise:<taskId>`(수정 전후 diff 표시).
+- 적용 시 task `revision+1`, 이 작업에 의존하는 후행 작업 무효화(§11).
+- task당 최대 2회, 초과 → `blocked`.
 
-## 9. 재작업 사다리·회로 차단
-작업 실패(`failed`, `runaway`, 기계 검증 실패, 검토 blocking, 결과 반려) 시 `attempts < maxAttempts`면 다음 시도: 2번째는 같은 모델, 3번째는 `ladder`에서 한 단계 위(최상위면 그대로). 같은 worktree에서 이어서(이전 커밋 유지). `maxAttempts` 도달 → task `blocked`, request `blocked`, 사람 카드 "작업 X가 3번 실패했어요" [한 번 더(최상위 모델)] [이 작업 취소하고 계속] [요청 중단].
+## 11. 재작업·의존·무효화
+- 실패(`failed`, `runaway`, 검사 실패, 검토 blocking, 결과 반려) 시 `attempts < maxAttempts`면 재작업: 2번째는 같은 모델, 3번째는 ladder 한 단계 위. 도달 → `blocked`("N번 실패", N = 실제 횟수).
+- **작업별 base**: 같은 프로젝트 의존이 없으면 요청 base(승인 시점 프로젝트 HEAD), 하나면 그 `head_sha`, 여럿이면 hq가 worktree에서 의존 head들을 `--no-ff` 병합한 커밋(충돌 → `blocked`). owns·diff·검토는 모두 이 `base_sha` 기준.
+- 다른 프로젝트 의존·collect 의존: 봉인된 산출물(보고서 경로·해시, 선행 head SHA)을 프롬프트로 전달.
+- **무효화**: `passed` 작업의 `head_sha`가 바뀌면(재작업·수정·반려) 그 작업에 전이적으로 의존하는 모든 작업을 `pending`으로 되돌리고 worktree·브랜치를 폐기(브랜치는 `hq/<req>/<key>-v<n>`로 보관), attempts 0, 이전 검증·검토 무효. 수락 카드가 열려 있으면 superseded.
 
-## 10. 동시성·스케줄
-- 전역 동시 시도(작업+검토) ≤ `maxWorkers`. 요청은 접수 순서, 작업은 의존이 모두 `passed`인 것 중 계획 순서.
-- 한도: 매 stream의 `rate_limit_event.rate_limit_info.unifiedWindows`를 quota 테이블에 기록. `max(five_hour, seven_day) ≥ holdAt` 또는 status `rejected` → 새 시작 금지, 해당 창의 `resetsAt`까지 보류(CEO 턴 포함). `≥ reviewOnlyAt` → 새 작업 시작 금지, 검토·CEO만. `≥ saveAt` → 동시 1. 관측이 없으면 0으로 보지 않는다: 첫 시작은 허용하고 관측을 기다린다.
-- 폭주 감시: 시도 경과 > `attemptWallMinutes[grade]` 또는 같은 도구 오류 문자열 3회 연속 → 프로세스 그룹 SIGTERM, 10초 뒤 SIGKILL → `runaway`.
+## 12. 수락·통합·병합
+- 모든 작업이 `passed` 또는 `cancelled`(최소 1개 passed) → 프로젝트별 **통합**: 통합 worktree를 대상 브랜치의 현재 SHA에서 만들고 통과 작업의 **기록된 head SHA**를 계획 순서로 `--no-ff` 병합 → setup → 모든 작업의 non-manual check + 비밀값 검사. 결과 `integration_sha`. 충돌·검사 실패 → 요청 `blocked` + 카드 `integration:<req>:<project>`(다시 통합 / 요청 중단).
+- 수락 카드 `accept:<req>` (옵션 `수락`·`반려`), subject = 정렬된 `(taskId, head_sha, report sha256, checks 결과 해시)` + 프로젝트별 `integration_sha`. 본문: 작업별 요약·변경 파일 수·검사·검토·보호 경로 변경·기존 실패·취소된 작업. collect만 있는 요청은 수락으로 `merged`와 같은 완료 상태 `accepted`에서 끝난다(병합 없음 → `merged`로 표시하지 않고 `accepted` 종결).
+- 반려: 사유 + 선택적 작업 key 목록(없으면 통과 작업 전부) → 해당 작업 재작업, 후행 무효화.
+- 수락 → 프로젝트별 병합 카드 `merge:<req>:<project>` (옵션 `병합`·`보류`), subject = `(target, target_sha, integration_sha)`.
+- 병합 실행: 저장소 뮤텍스 → 사용자 checkout이 `target` 브랜치·`target_sha`·깨끗함인지 확인 → `git merge --ff-only <integration_sha>` 한 번. 다르면 병합하지 않고 통합부터 다시(새 카드, 본문 첫 줄 사유). 사용자 checkout이 detached HEAD면 카드 대신 사유 표시.
+- 모든 프로젝트 병합 → `merged`, 작업 worktree·브랜치 정리(worktree는 `--force` 제거 — 검증된 SHA가 이미 병합됨, 브랜치 `-d`). 대상 프로젝트가 hq 자신이면 "hq 재시작 필요" 알림.
+- 카드 만료: plan 7일(만료 → 요청 `expired`), accept·merge·revise·integration·blocked는 만료 없음(해시 고정). 보류된 병합은 `POST /api/requests/:id/merge`로 다시 제시.
 
-## 11. 결과 수락·병합
-- 모든 task `passed` → request `awaiting_acceptance`, 승인 카드 `accept:<requestId>` (옵션 `수락`, `반려`), subjectHash = 각 task head_sha 목록 해시. 본문: 작업별 요약·변경 파일 수·검사 결과·검토 결과. 반려는 사유 입력(`POST /api/requests/:id/reject {reason}`)을 받아 해당 요청의 모든 task를 재작업(사유 첨부).
-- 수락 → request `accepted` → 프로젝트별 병합 카드 `merge:<requestId>:<project>` (옵션 `병합`, `보류`), subjectHash = (대상 브랜치명 + 대상 브랜치 현재 SHA + 병합할 head_sha들)의 해시. 대상 브랜치 = 프로젝트 checkout의 현재 브랜치.
-- 병합 실행(`src/exec/merge.ts`): 결정 순간 다시 확인 — 프로젝트 checkout이 같은 브랜치·같은 SHA·`git status --porcelain` 비어 있음. 아니면 병합하지 않고 카드를 새 해시로 다시 만든다(사유 표시). 통과하면 의존 순서대로 `git merge --no-ff -m "hq: <title> (<requestId>/<taskKey>)" <branch>`. 충돌 → `git merge --abort`, request `blocked`(충돌 파일 표시). 성공 → `merged`, 해당 worktree·브랜치 정리(`git worktree remove`, 브랜치는 병합됐으므로 `git branch -d`). push 없음.
+## 13. 한도·동시성·폭주
+- quota: stream의 `rate_limit_event.rate_limit_info`(`status`, `resetsAt` epoch초, `unifiedWindows.{창}.{utilization,resetsAt}`)를 창별 행으로 저장. `resets_at`이 지난 창은 알 수 없음으로 본다.
+- 모드: `hold` = 어떤 창이든 `rejected` 또는 ≥ holdAt → 모든 시작 중지(CEO 턴·팀 포함), 가장 늦은 차단 창의 resetsAt까지. `save` = ≥ saveAt → 동시 1. 관측 없음 → 동시 1(관측을 얻기 위한 별도 호출은 하지 않음).
+- CEO 턴도 stream-json으로 실행해 관측을 얻는다. 팀 스케줄러도 hold를 따른다. 기존 `limit.blockedUntil`은 quota 관리자로 통합.
+- 동시성: 살아 있는 claude 프로세스(작업·검토·CEO) 합계 ≤ `maxWorkers + 1`(CEO 1자리 예약).
+- 폭주: 경과 > `attemptWallMinutes[grade]`(검토·collect·resume도 동일 적용), 또는 같은 도구 오류 3회 연속 → 그룹 SIGTERM→KILL → `runaway`.
 
-## 12. 재시작 복구
-데몬 시작 시 `attempts.status in (starting, running)`:
-- `process.json` 없음 → `start_failed` (시도 수에 안 셈, 작업 `pending`으로 되돌림).
-- pid 살아 있고 시작 시각이 일치(`ps -o lstart= -p <pid>`) → `running` 유지, stream.jsonl 꼬리 추적 재개.
-- 죽었음 → §6 판정 진행.
-모든 상태 전이는 DB 트랜잭션 하나로. 외부 부작용(spawn, merge) 전에 의도를 먼저 기록.
+## 14. 활동 로그
+stream.jsonl → activity.jsonl `{at, kind: message|tool|error|usage, text}`. 표시 전에 비밀 패턴 마스킹 + 제어문자 제거 + 200자 제한. `(attemptId, byte offset)` 체크포인트로 재시작 후 중복 없이 이어감. 로그 보존: 시도당 stream 50MB 상한(초과 시 앞부분 절단 표시), 요청 종결 30일 후 정리.
 
-## 13. 활동 로그
-stream.jsonl을 꼬리 추적해 `activity.jsonl`에 `{at, kind, text}`로 변환: `message`(assistant 텍스트 첫 200자), `tool`(도구명 + 대상: Bash 명령 첫 120자, Edit/Write 파일 경로), `error`(tool_result is_error), `usage`(result의 토큰·비용). 마지막 활동 한 줄이 펫 말풍선·웹에 표시된다.
-
-## 14. API (데몬, `127.0.0.1` 전용)
-기존 인증(Bearer 토큰 + Origin 거부)은 펫·CLI용. 웹 화면용은 §15.
+## 15. API (`127.0.0.1` 전용)
+인증: Host가 정확히 `127.0.0.1:<port>`, Origin 없음, Bearer 토큰(펫·CLI). 웹은 §16.
 | 메서드·경로 | 설명 |
 | --- | --- |
-| `GET /api/state` | Snapshot (§16) |
-| `GET /api/events` | SSE |
-| `GET /api/requests/:id` | RequestDetail (§16) |
-| `GET /api/attempts/:id/activity?after=<n>` | 활동 로그 줄 (n번째 이후) |
-| `GET /api/attempts/:id/files/:name` | 증거 파일 원문 (`report.md`, `checks.json`, `verdict.json`, `done.json`, `stderr.log` 만 허용, 1MB 제한) |
-| `GET /api/requests/:id/diff?task=<key>` | base..head diff (최대 2MB) |
-| `POST /api/requests` | 기존 |
-| `POST /api/requests/:id/answer` | 기존 (CEO 질문) |
-| `POST /api/tasks/:id/answer` | `{questionIndex, answer}` 작업자 질문 답변 → 같은 세션 `--resume`으로 재개 |
-| `POST /api/requests/:id/reject` | `{reason}` 결과 반려 |
-| `POST /api/requests/:id/cancel` | 요청 중단 (실행 중 시도 SIGTERM) |
-| `POST /api/tasks/:id/decide` | 회로 차단 카드 결정 `{decision: "retry"|"skip"|"stop"}` |
-| `POST /api/approvals/:id` | 기존 (plan:/accept:/merge: 접두어별 처리) |
-| `GET /api/quota` | 최근 관측 |
+| `GET /api/state` | Snapshot |
+| `GET /api/events` | SSE (`id:` 연속 번호) |
+| `GET /api/requests/:id` | RequestDetail |
+| `GET /api/attempts/:id/activity?after=<n>` | `{lines, next}` (최대 500줄) |
+| `GET /api/attempts/:id/files/:name` | `report.md, done.json`(out) · `checks.json, verdict.json, stderr.log`(hq), `text/plain` + nosniff, 1MB |
+| `GET /api/requests/:id/diff?task=<key>` | `{files:[{path,added,removed}], diff, truncated}` base..head, 2MB |
+| `POST /api/requests` / `POST /api/requests/:id/answer` | 기존 (answer는 questionId가 그 요청 소유일 때만) |
+| `POST /api/tasks/:id/answer` | `{questionId, answer, revision}` |
+| `POST /api/tasks/:id/decide` | `{decision: retry|skip|stop, revision}` |
+| `POST /api/requests/:id/reject` | `{reason, tasks?: string[]}` |
+| `POST /api/requests/:id/cancel` | 중단 |
+| `POST /api/requests/:id/merge` | 보류된 병합 다시 제시 |
+| `POST /api/approvals/:id` | `{decision, subjectHash}` — plan/accept/merge/revise/integration/team |
+| `POST /api/approvals` | 팀 전용: id는 `team:<teamId>:`로 시작해야 함, 예약 접두어 거부 |
+| `POST /api/ui-code` | 웹 로그인 코드 |
+| `GET /api/quota` | 창별 관측 |
+잘못된 상태·오래된 revision → 409(한국어 사유). 크기 초과 413. JSON 본문 64KB 제한.
 
-## 15. 웹 화면 인증
-- `GET /ui/open?code=<일회용 코드>`: 펫이 `POST /api/ui-code`(Bearer)로 60초 유효 일회용 코드를 받아 브라우저로 연다. 성공하면 `hq_session` 쿠키(HttpOnly, SameSite=Strict, Path=/)와 CSRF 토큰을 발급하고 `/ui`로 리다이렉트.
-- `/ui*`, `/ui-api/*`는 쿠키 인증. `/ui-api/*` 쓰기 요청은 `X-CSRF-Token` 헤더 + `Origin: http://127.0.0.1:<port>` 필수. `/ui-api/*`는 `/api/*`와 같은 핸들러를 공유한다.
-- Host는 `127.0.0.1:<port>`만 허용(DNS 재바인딩 방지).
+## 16. 웹 화면 인증
+- `POST /api/ui-code`(Bearer) → `http://127.0.0.1:<port>/ui/#code=<32바이트 랜덤, 60초, 1회>`. 코드는 fragment라 서버 로그·Referer에 남지 않는다.
+- 페이지 JS가 `POST /ui-api/session {code}`로 교환(원자적 1회 소비) → 세션 토큰(32바이트, 유휴 12시간·최대 7일)을 `sessionStorage`에 두고 `Authorization: Bearer`로 호출. **쿠키 없음**(포트 간 쿠키 공유 문제 제거, CSRF 불필요). 데몬 재시작 시 세션 폐기.
+- `/ui-api/*`: 세션 토큰 확인 → `/api/*` 라우터로 위임(Bearer를 데몬 토큰으로 교체). SSE는 `EventSource`가 헤더를 못 보내므로 `?t=<세션 토큰>` 쿼리 허용(해당 경로만).
+- 모든 `/ui*` 응답: `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`. 작업자 산출물은 textContent로만 렌더링(마크다운은 원시 HTML 불허 렌더러, 링크는 http(s)만 + `rel=noopener noreferrer`).
 
-## 16. 화면용 데이터 (src/types.ts)
-`Snapshot`에 추가: `workers: WorkerView[]`, `headline: Headline`, `quota: QuotaView | null`. `RequestView`에 `tasks: TaskView[]` 추가(plan 요약과 별도). 정확한 필드는 `src/types.ts`를 기준으로 한다(이미 작성됨).
+## 17. 화면용 데이터 (src/types.ts가 권위)
+Snapshot: `workers`, `headline`, `quota`, `decisions: DecisionItem[]`, `RequestView.tasks`. `needsYou = decisions.length`.
+DecisionItem 순서: plan → ceo_question → worker_question → revise → blocked → integration → accept → merge (각 종류 안에서는 오래된 순). 알림은 `decision id + revision`으로 중복 방지.
 
-### 상황 문장 (headline) 규칙
-사람이 할 일이 있으면 그것부터. 없으면 진행 중인 것. 모두 한국어 한 문장.
-- 할 일 있음: "회장님 결정 N건: <첫 항목 제목>" (`needsYou = N`)
-- 실행 중: "<모델>가 <작업 제목> 구현 중 · 다음: <다음 단계>" / "검증 중" / "검토 중"
-- 한도 보류: "사용 한도 <창> <n>% — <시각>까지 쉬어요"
-- 한가함: "지금 하실 일은 없어요"
+## 18. 상황 문장 (headline)
+우선순위: 결정 → 장애(blocked·unverifiable·통합 실패) → 실행 중 → 한도 보류·대기 → 유휴.
+- `회장님 결정 N건: <첫 항목>`
+- `<작업>이 막혔어요: <사유 한 줄>`
+- `<모델>가 <작업> <구현|검토|검증> 중 · 다음: <단계>` (+ `외 N명`)
+- `사장이 계획 중이에요` / `빈 자리 기다리는 중 (N건)`
+- `사용 한도 <창> <n>% — <HH:mm>까지 쉬어요` / `한도 관측 전이라 하나씩 실행 중`
+- `병합 완료: <요청>` (완료 후 10분간)
+- `지금 하실 일은 없어요` / 데몬 끊김은 펫이 `hq 꺼짐`
 
-## 17. 펫 표시 규칙
-- CEO(피카츄)는 항상. 요청 처리 중이면 CEO 말풍선에 headline.
-- `workers`마다 캐릭터 하나(모델별 캐릭터: haiku/sonnet/opus 서로 다르게), 상태별 말풍선 = 마지막 활동. 끝나면 사라진다.
-- 결정 필요(`needsYou > 0`) → CEO가 뛰고 배지 숫자, macOS 알림(결정 항목 생길 때 1회).
-- 한도 보류 → 캐릭터 잠자는 표시.
-- 결과 수락·병합 카드는 CEO 창에서 요약 + [수락][반려(사유)] / [병합][보류] + "자세히 보기"(웹 화면 열기).
+## 19. 펫 표시 규칙
+- CEO(피카츄) 항상, 말풍선 = headline, 배지 = needsYou, 결정 있을 때만 튐.
+- `workers`마다 캐릭터(모델별), 검토는 `검토` 표식, `held`는 잠자는 표시. 종료된 작업의 실패 사유는 CEO 창의 "최근 결과"에 남는다.
+- CEO 창: 결정 카드 전부(§17 순서) + 최근 결과 + 새 요청 + 자세히 보기(웹).
+
+## 20. 검토 판정 기록 (v1 → v2)
+Codex(X-B01~B15, A01~A07)와 Claude(C-B1~B13, A1~A15)의 지적에 대한 오케스트레이터 판정.
+| 지적 | 판정 | 반영 |
+| --- | --- | --- |
+| 작업자 Bash가 거부 규칙 우회·토큰 읽기로 자기 승인 (C-B1, X-B05) | 채택 | §6 Seatbelt 샌드박스(실측 검증), env 허용 목록, 팀 승인 namespace §15 |
+| hq 판정 파일이 작업자 쓰기 폴더에 (C-B2, X-B06) | 채택 | §1 `hq/`·`out/` 분리, lstat·O_NOFOLLOW |
+| collect 쓰기 제한 무효 (C-B3) | 채택 | §6 dontAsk + `--tools` + `//` 절대경로 규칙 |
+| 기계 검증 무력화·check 명령 미표시 (C-B4, X-B08) | 채택 | §3 카드에 check 원문, §8.9 보호 경로 표시, §9 검사 전후 불변 |
+| 새 worktree 의존성 없음·기존 실패 (C-B5) | 채택 | §2 setup, §9 기준선 |
+| 작업별 base·다중 의존·무효화 (C-B6, X-B04) | 채택 | §11 |
+| 수락과 병합 대상 불일치·부분 병합 (C-B7, X-B09) | 채택 | §12 통합 worktree + `--ff-only <integration_sha>` |
+| 끝나지 않는 상태 (C-B8, X-B02) | 채택 | §5 불변식 + 조정기, 전이표(spec §C) |
+| 재시작 중복 실행 (C-B9, X-B01) | 채택 | §7 시작 프로토콜 + pgrep 세션 id |
+| 한도 정규식 오판 (C-B10, X-B12) | 채택 | §8.1 구조화 신호, 연속 상한 |
+| model none·external (C-B11, X-B03, X-B11) | 채택(범위 축소) | §3 거부 |
+| XSS → 승인 위조 (C-B12, X-B15) | 채택 | §16 CSP·textContent·쿠키 폐지 |
+| tests_run 자기 보고 (C-B13, X-B07) | 채택 | §10 stream 대조, criteria 집합 일치 |
+| WAL 단순 복사 (X-B13) | 채택 | §4 VACUUM INTO |
+| id 인코딩·질문 소유 (X-B14, C-A9) | 채택 | §1 URL 안전 id, §15 소유 검증 |
+| verify 역할 폐지 (C-A14) | 채택 | §3 review 필드 |
+| 검토 모델 하향 규칙이 등급 표와 충돌 (C-A2) | 채택 | §3·§10 review_model |
+| unverifiable 범위 축소 (C-A1) | 채택 | §8.2·8.3 |
+| 시도 사이 더러운 worktree (C-A4) | 채택 | §7.6 |
+| 반려 범위 (C-A5, X-A03) | 채택 | §12 작업 지정 반려 |
+| git 동시성 (C-A6) | 채택 | §7.5 뮤텍스 |
+| 비밀값·로그 마스킹 (C-A8, X-A02) | 채택 | §9, §14 |
+| 웹 쿠키 포트 공유 (C-A10) | 채택 | §16 |
+| 상황 문장 누락 (C-A12, X-A01) | 채택 | §17·§18 |
+| hq 자신 병합 (C-A13) | 채택 | §12 재시작 알림 |
+| quota 3단계 과설계 (C-A14) | 채택 | §2·§13 2단계 |
+| 전체 OS 수준 격리(사용자 분리·VM) (X-B05 일부) | 보류 | 1인 로컬 도구 위협 모델에서 Seatbelt로 충분하다고 판단, 한계는 §6에 명시 |
+| 결과 manifest 서명 (X-B06 일부) | 보류 | 작업자가 hq/ 폴더·DB에 접근 불가(§6)하므로 해시 기록으로 대체 |
+| 조사 후 계획 revision 경로 (X-A06) | 부분 채택 | §10a 작업 단위 수정 턴. 계획 전체 재작성은 다음 단계 |
+| 스키마 생성 프레임워크 (X-A05) | 기각 | types.ts + 런타임 검증 + fixture로 충분 |
