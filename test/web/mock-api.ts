@@ -405,6 +405,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
     if (req.method === 'POST') {
       if (parts[1] === 'approvals' && parts.length === 3) {
         const a = approvals.find((x) => x.id === parts[2] && x.decision === null)
+        if (a && a.id.startsWith('accept:') && b.decision === '반려') return send(res, 409, { error: '반려는 사유와 함께 따로 보내 주세요' })
         if (!a || a.subjectHash !== b.subjectHash || !a.options.includes(b.decision)) return send(res, 409, { error: '이미 결정됐거나 내용이 바뀐 카드예요' })
         a.decision = b.decision; a.decidedAt = new Date().toISOString()
         emit({ kind: 'approval', teamId: a.teamId, text: `결정: ${a.title} → ${a.decision}`, data: { id: a.id } })
@@ -422,6 +423,8 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
       if (parts[1] === 'requests' && parts[3] === 'reject') {
         const r = requests.find((x) => x.id === parts[2])
         if (!r || typeof b.reason !== 'string' || !b.reason.trim()) return send(res, 400, { error: '반려 사유가 필요해요' })
+        const acceptCard = approvals.find((x) => x.id === `accept:${r.id}` && x.decision === null)
+        if (!acceptCard || b.subjectHash !== acceptCard.subjectHash) return send(res, 409, { error: '수락 카드가 바뀌었거나 이미 결정됐어요' })
         r.status = 'executing'
         const a = approvals.find((x) => x.id === `accept:${r.id}`); if (a) { a.decision = '반려'; a.decidedAt = new Date().toISOString() }
         const only: string[] | null = Array.isArray(b.tasks) && b.tasks.length ? b.tasks : null

@@ -394,7 +394,13 @@ function decisionCard(d) {
     const chosen = ui.rejectTasks.get(key) ?? new Set()
     const passed = (req?.tasks ?? []).filter((t) => t.status === 'passed')
     body.push(h('div', { class: 'reject-form' },
-      h('textarea', { class: 'input', rows: 3, 'data-fkey': dk, placeholder: '무엇을 고쳐야 하는지 적어 주세요', 'aria-label': '반려 사유', value: drafts.get(dk) ?? '', oninput: (e) => drafts.set(dk, e.target.value), disabled: busy }),
+      h('textarea', { class: 'input', rows: 3, 'data-fkey': dk, placeholder: '무엇을 고쳐야 하는지 적어 주세요', 'aria-label': '반려 사유 (필수)', required: true, value: drafts.get(dk) ?? '', disabled: busy,
+        oninput: (e) => {
+          drafts.set(dk, e.target.value)
+          // Toggle the send button in place (no re-render while typing).
+          const btn = document.querySelector(`[data-fkey="send:${CSS.escape(key)}"]`)
+          if (btn) btn.disabled = busy || !e.target.value.trim()
+        } }),
       passed.length ? h('fieldset', { class: 'task-pick' },
         h('legend', null, '다시 할 작업 (고르지 않으면 통과한 작업 전부)'),
         passed.map((t) => h('label', { class: 'check-row' },
@@ -402,10 +408,11 @@ function decisionCard(d) {
             onchange: (e) => { const set = ui.rejectTasks.get(key) ?? new Set(); if (e.target.checked) set.add(t.key); else set.delete(t.key); ui.rejectTasks.set(key, set); rerenderDecisions() } }),
           h('span', { class: 'mono' }, t.key), h('span', null, t.title)))) : null))
     actions.push(
-      h('button', { class: 'btn btn-danger', type: 'button', disabled: busy, 'data-fkey': `send:${key}`, onclick: () => {
+      h('button', { class: 'btn btn-danger', type: 'button', disabled: busy || !(drafts.get(dk) ?? '').trim() || !d.subjectHash, 'data-fkey': `send:${key}`, onclick: () => {
         const reason = (drafts.get(dk) ?? '').trim()
-        if (!reason) { ui.errors.set(key, '반려 사유를 입력해 주세요'); rerenderDecisions(); return }
-        const payload = chosen.size ? { reason, tasks: [...chosen] } : { reason }
+        if (!reason || !d.subjectHash) return
+        // Accept 반려 always goes through /reject with the card's subjectHash, never approvals/:id (execution.md §12).
+        const payload = chosen.size ? { reason, subjectHash: d.subjectHash, tasks: [...chosen] } : { reason, subjectHash: d.subjectHash }
         post(`/requests/${enc(d.requestId)}/reject`, payload, '반려했어요', () => { ui.rejectOpen.delete(key); ui.rejectTasks.delete(key); drafts.delete(dk) })
       } }, busy ? '보내는 중…' : '반려 보내기'),
       h('button', { class: 'btn', type: 'button', disabled: busy, onclick: () => { ui.rejectOpen.delete(key); ui.errors.delete(key); rerenderDecisions() } }, '취소'))
