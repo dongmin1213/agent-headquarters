@@ -12,7 +12,7 @@ import { decisionItems } from '../../src/exec/decisions.ts'
 import { atomicWrite } from '../../src/exec/fsx.ts'
 import { checkVerdict } from '../../src/exec/review.ts'
 import { sandboxProfile } from '../../src/exec/sandbox.ts'
-import { commitFile, harness, req, sh, task, tmp, tsk, type Harness } from './helpers.ts'
+import { acceptKnownToMerged, commitFile, harness, req, sh, task, tmp, tsk, type Harness } from './helpers.ts'
 import { NESTED_SKIP, nestedSandbox, useFakeSandboxIfNested } from '../nested.ts'
 
 useFakeSandboxIfNested()
@@ -121,7 +121,8 @@ test('v3-5. a regression check failing on the base and again on the candidate be
   try {
     const id = h.plan([task('A', { acceptance: [{ id: 'R1', text: '기존에 깨진 검사', check: 'test -f missing.txt', kind: 'regression' }] })])
     await h.approve(id)
-    await h.waitFor(() => req(h, id).status === 'awaiting_acceptance', 'awaiting_acceptance')
+    // No exemption in integration (F02): the chairman accepts the known failure on the integration card, then merges.
+    await acceptKnownToMerged(h, id)
     const work = h.store.attempts(`${id}.A`).find((a) => a.kind === 'work' && a.status === 'succeeded')!
     const checks = JSON.parse(readFileSync(join(work.dir, 'hq', 'checks.json'), 'utf8'))
     assert.deepEqual(checks.manual, ['R1'])
@@ -131,6 +132,7 @@ test('v3-5. a regression check failing on the base and again on the candidate be
     const review = h.store.attempts(`${id}.A`).find((a) => a.kind === 'review')!
     assert.match(readFileSync(join(review.dir, 'hq', 'prompt.md'), 'utf8'), /R1\].*manual .*기존 실패/)
     assert.match(h.store.approval(`accept:${id}`)!.body, /기존 실패\(검토자 판단\): R1/)
+    assert.match(h.store.approval(`accept:${id}`)!.body, /검토자 판정: \[R1\] pass — checked/)
   } finally { await h.close() }
 })
 

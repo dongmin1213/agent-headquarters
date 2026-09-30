@@ -1,4 +1,5 @@
 // Cross review (execution.md §10): VERDICT schema and hq's verdict validation.
+import { unsafeCommand } from '../ceo.ts'
 import type { ModelAlias } from '../config.ts'
 import type { Verdict } from '../types.ts'
 
@@ -27,17 +28,18 @@ export type VerdictCheck = { kind: 'pass'; verdict: Verdict } | { kind: 'blockin
 const isArr = (v: unknown): v is Record<string, unknown>[] => Array.isArray(v) && v.every((x) => x && typeof x === 'object')
 const norm = (s: string) => s.replace(/\s+/g, ' ').trim()
 
-/** Commands whose exit code can hide a failure are not evidence (§10.2). */
+/** Commands whose exit code can hide a failure are not evidence (§10.2). Same rule as plan checks, on the raw string. */
 export function unreliableCommand(cmd: string): boolean {
-  const c = norm(cmd)
-  return /[|;]/.test(c) || /(^|\s)true$/.test(c)
+  return unsafeCommand(cmd) !== null
 }
 
 /**
  * hq's rules on top of the schema (§10): criteria ids must equal the acceptance ids, every tests_run entry must match
  * a Bash run in the reviewer's stream with the same exit code, and pass/blocking must agree.
+ * `judgeIds`: items handed to the reviewer to judge (explicit `manual` criteria and base-failed checks) — each must be
+ * answered `pass` or `fail`; `manual` there means nobody judged it.
  */
-export function checkVerdict(raw: unknown, o: { acceptanceIds: string[]; codeChanged: boolean; bashRuns: { command: string; exitCode: number | null }[] }): VerdictCheck {
+export function checkVerdict(raw: unknown, o: { acceptanceIds: string[]; codeChanged: boolean; bashRuns: { command: string; exitCode: number | null }[]; judgeIds?: string[] }): VerdictCheck {
   if (!raw || typeof raw !== 'object') return { kind: 'invalid', reason: '검토 결과(structured_output) 없음', verdict: null }
   const v = raw as Record<string, unknown>
   if (typeof v.pass !== 'boolean' || !isArr(v.blocking) || !isArr(v.advisory) || !isArr(v.criteria) || !isArr(v.tests_run))
@@ -56,10 +58,13 @@ export function checkVerdict(raw: unknown, o: { acceptanceIds: string[]; codeCha
   const missing = o.acceptanceIds.filter((x) => !ids.includes(x)), unknown = ids.filter((x) => !o.acceptanceIds.includes(x))
   if (missing.length) return bad(`criteria에 빠진 수용 기준: ${missing.join(', ')}`)
   if (unknown.length) return bad(`criteria에 모르는 id: ${unknown.join(', ')}`)
+  const unjudged = (o.judgeIds ?? []).filter((id) => { const c = verdict.criteria.find((x) => x.id === id); return !c || (c.result !== 'pass' && c.result !== 'fail') })
+  if (unjudged.length) return bad(`사람 확인이 필요한 기준을 판정하지 않음(pass 또는 fail이어야 함): ${unjudged.join(', ')}`)
   if (o.codeChanged && !verdict.tests_run.length) return bad('코드 변경이 있는데 tests_run이 비어 있음')
   for (const t of verdict.tests_run) {
     const cmd = t.command.slice(0, 120)
-    if (unreliableCommand(t.command)) return bad(`tests_run 명령이 파이프·;·|| 또는 true로 실패를 가릴 수 있어 근거가 아님: ${cmd}`)
+    const tok = unsafeCommand(t.command)
+    if (tok) return bad(`tests_run 명령이 이어 붙이기·백그라운드·종료 코드 덮기(${tok})로 실패를 가릴 수 있어 근거가 아님: ${cmd}`)
     const matches = o.bashRuns.filter((r) => norm(r.command) === norm(t.command))
     if (!matches.length) return bad(`tests_run 명령이 실제 실행 기록과 정확히 일치하지 않음: ${cmd}`)
     const run = matches.at(-1)!

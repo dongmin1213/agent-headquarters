@@ -353,7 +353,8 @@ function decisionCard(d) {
   const key = `${d.kind}:${d.id}`
   const busy = ui.pending.has(key)
   const err = ui.errors.get(key)
-  const [kl, kt] = DECISION_KIND[d.kind] ?? [txt(d.kind), 'neutral']
+  const [kl0, kt] = DECISION_KIND[d.kind] ?? [txt(d.kind), 'neutral']
+  const kl = typeof d.label === 'string' && d.label ? d.label : kl0
   const req = requestOf(d.requestId)
   const tkey = taskKeyOf(d)
   const meta = [

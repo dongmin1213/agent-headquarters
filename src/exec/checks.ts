@@ -2,10 +2,12 @@
 // Acceptance `check` commands were shown verbatim on the approved plan card, so they run as approved —
 // but inside the sandbox, with a minimal env, stdin /dev/null, in their own process group.
 import { spawn } from 'node:child_process'
+import { lstatSync, readlinkSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { basename, join } from 'node:path'
 import type { CheckResult } from '../types.ts'
 import { atomicWrite } from './fsx.ts'
-import { hqGit, removeMirrorWorktree, SAFE_DIFF, verifyWorktree, wtGit, wtStatus, type MirrorWorktree } from './repos.ts'
+import { hqGit, removeMirrorWorktree, SAFE_DIFF, verifyWorktree, wtGit, type MirrorWorktree } from './repos.ts'
 import { childEnv, sandboxProfile, wrap, type SandboxOpts } from './sandbox.ts'
 
 /** `baseFailed`: a regression check that already failed on the base for an ordinary reason — still run; its failure alone does not fail the file. */
@@ -17,11 +19,17 @@ export type CheckOutcome = CheckResult & { kind?: string; baseFailed?: boolean }
  * `manual`: regression checks that failed on the base and failed again on the candidate — handed to the reviewer (§9).
  * `baseTails`: base output tail for each id in `manual`.
  */
-export interface ChecksFile { checks: CheckOutcome[]; secrets: SecretHit[]; pass: boolean; error: string | null; warnings?: string[]; manual?: string[]; baseTails?: Record<string, string> }
+export interface ChecksFile {
+  checks: CheckOutcome[]; secrets: SecretHit[]; pass: boolean; error: string | null; warnings?: string[]; manual?: string[]; baseTails?: Record<string, string>
+  /** The worktree's tracked content differed from the commit under test before any check ran (setup changed it): an environment failure. */
+  setupChanged?: boolean
+}
 /** One check's result on the base (§9 baseline). `setupFailed`: the project setup failed, so the check never ran. */
 export interface BaseResult { pass: boolean; exitCode: number | null; timedOut: boolean; setupFailed?: boolean; tail: string }
 /** The base run says nothing about the code: setup failed, timed out, or the command could not be found/executed. */
 export const envFailure = (b: BaseResult): boolean => !!b.setupFailed || b.timedOut || b.exitCode === 126 || b.exitCode === 127
+/** A base-failed check may be handed to the reviewer only when it failed like on the base: not a timeout or 126/127. */
+export const plainFailure = (r: { pass: boolean; exitCode: number | null }): boolean => !r.pass && r.exitCode !== null && r.exitCode !== 126 && r.exitCode !== 127
 /** Called with each spawned check process so a restart can kill leftover groups (§9). */
 export type OnSpawn = (pid: number) => void
 
@@ -116,6 +124,62 @@ export async function secretScan(mirror: string, base: string, head: string): Pr
   return hits
 }
 
+const LIST_MAX = 10
+const fileList = (files: string[]) => files.slice(0, LIST_MAX).join(', ') + (files.length > LIST_MAX ? ` 외 ${files.length - LIST_MAX}개` : '')
+export const setupChangedReason = (files: string[]) => `setup이 추적 파일을 바꿨어요: ${fileList(files)}`
+
+const gitBlobSha = (data: Buffer | string) => { const b = Buffer.isBuffer(data) ? data : Buffer.from(data); return createHash('sha1').update(`blob ${b.length}\0`).update(b).digest('hex') }
+
+/**
+ * Tracked files whose content (or type/mode) in the worktree or index differs from commit `sha` (§9, F01).
+ * Content-based: every tracked file is hashed (`git hash-object`, with the repository's attributes), not only
+ * those whose stat changed; git's own worktree/index diffs catch deletions, type changes and index edits.
+ * Untracked and ignored files are not looked at (build outputs are allowed). Fails closed: a git error is a change.
+ */
+export async function trackedChanges(wt: MirrorWorktree, sha: string): Promise<string[]> {
+  const changed = new Set<string>()
+  const z = (out: string) => out.split('\0').filter(Boolean)
+  const w = await wtGit(wt, ['diff', '--name-only', '-z', '--no-renames', '--ignore-submodules', ...SAFE_DIFF, sha, '--'])
+  const c = await wtGit(wt, ['diff', '--cached', '--name-only', '-z', '--no-renames', '--ignore-submodules', ...SAFE_DIFF, sha, '--'])
+  const t = await wtGit(wt, ['ls-tree', '-r', '-z', '--full-tree', sha])
+  if (w.code !== 0 || c.code !== 0 || t.code !== 0) return [`(git 확인 실패: ${(w.stderr || c.stderr || t.stderr).trim().slice(0, 200)})`]
+  for (const f of [...z(w.stdout), ...z(c.stdout)]) changed.add(f)
+  const regular: { path: string; blob: string }[] = []
+  for (const entry of z(t.stdout)) {
+    const m = /^(\d{6}) (\w+) ([0-9a-f]{40,64})\t([\s\S]*)$/.exec(entry)
+    if (!m) continue
+    const [, mode, type, blob, path] = m
+    if (type !== 'blob') continue // submodules
+    let st
+    try { st = lstatSync(join(wt.path, path)) } catch { changed.add(path); continue }
+    if (mode === '120000') {
+      if (!st.isSymbolicLink() || gitBlobSha(readlinkSync(join(wt.path, path), { encoding: 'buffer' })) !== blob) changed.add(path)
+      continue
+    }
+    if (!st.isFile() || st.isSymbolicLink() || ((st.mode & 0o111) !== 0) !== (mode === '100755')) { changed.add(path); continue }
+    regular.push({ path, blob })
+  }
+  if (regular.length) {
+    const h = await hashPaths(wt, regular.map((r) => r.path))
+    if (!h) return [...changed, '(내용 해시 실패)']
+    regular.forEach((r, i) => { if (h[i] !== r.blob) changed.add(r.path) })
+  }
+  return [...changed].sort()
+}
+
+/** `git hash-object` of worktree paths (attributes applied like on checkout), in batches to stay under argv limits. */
+async function hashPaths(wt: MirrorWorktree, paths: string[]): Promise<string[] | null> {
+  const out: string[] = []
+  for (let i = 0; i < paths.length; i += 500) {
+    const chunk = paths.slice(i, i + 500)
+    const r = await hqGit(wt.gitDir, wt.path, ['hash-object', '--', ...chunk], { cwd: wt.path })
+    const l = r.stdout.split('\n').filter(Boolean)
+    if (r.code !== 0 || l.length !== chunk.length) return null
+    out.push(...l)
+  }
+  return out
+}
+
 export interface RunChecksOpts {
   /** Fresh mirror worktree at `head` (§9); hq inspects it only through the mirror admin dir. */
   wt: MirrorWorktree
@@ -131,21 +195,33 @@ export interface RunChecksOpts {
   onSpawn?: OnSpawn
 }
 
-/** Runs checks in the sandbox. No baseline exemption (v3): every automatic check must pass. */
+/**
+ * Runs checks in the sandbox. No baseline exemption (v3): every automatic check must pass.
+ * Before the first check the worktree's tracked content must equal `head` (setup may only add untracked/ignored
+ * files); after every check it is compared again, so a check that rewrites tracked files fails (§9, F01).
+ */
 export async function runChecks(o: RunChecksOpts): Promise<ChecksFile> {
   const headOf = async () => { const r = await wtGit(o.wt, ['rev-parse', 'HEAD']); return r.code === 0 ? r.stdout.trim() : null }
   const head = await headOf()
   if (head !== o.head) return { checks: [], secrets: [], pass: false, error: `검증 worktree HEAD(${head?.slice(0, 10) ?? '없음'})가 기록된 head_sha와 다름` }
+  const before = await trackedChanges(o.wt, o.head)
+  if (before.length) return { checks: [], secrets: [], pass: false, error: setupChangedReason(before), setupChanged: true }
   atomicWrite(o.profilePath, sandboxProfile(o.sandbox))
   const results: CheckOutcome[] = []
   const warnings: string[] = []
+  let dirty = false
   for (const c of o.checks) {
-    const before = await wtStatus(o.wt)
     const { timedOut: _t, ...ran } = await runSandboxed(c.command, o.wt.path, o.timeoutMs, o.profilePath, c.id, o.onSpawn)
     const r: CheckOutcome = { ...ran, kind: c.kind }
-    const after = await wtStatus(o.wt).catch(() => '?')
-    if (after !== before || (await headOf()) !== o.head) { r.pass = false; r.outputTail += '\n[hq] 검사가 작업 폴더(파일 또는 HEAD)를 바꿈 — 실패로 처리' }
-    else if (c.baseFailed && !r.pass) r.baseFailed = true
+    // Once a check changed tracked files, later checks run on content that is not the commit: they fail too.
+    const changed = dirty ? [] : await trackedChanges(o.wt, o.head).catch(() => ['?'])
+    const moved = (await headOf()) !== o.head
+    if (dirty) { r.pass = false; r.outputTail += '\n[hq] 앞선 검사가 추적 파일을 바꾼 뒤라 결과를 인정하지 않음 — 실패로 처리' }
+    else if (changed.length || moved) {
+      dirty = true
+      r.pass = false
+      r.outputTail += `\n[hq] 검사가 작업 폴더의 추적 파일 또는 HEAD를 바꿈${changed.length ? `: ${fileList(changed)}` : ''} — 실패로 처리`
+    } else if (c.baseFailed && plainFailure(r)) r.baseFailed = true
     if (c.kind === 'new' && o.basePassed?.[c.id]) warnings.push(`[${c.id}] 이 검사는 base에서도 통과해서 새 동작을 확인하지 않아요`)
     results.push(r)
   }
@@ -163,13 +239,21 @@ export async function baseline(o: { mirror: string; base: string; path: string; 
   const wt = await verifyWorktree(o.mirror, o.path, o.base)
   try {
     atomicWrite(o.profilePath, sandboxProfile(o.sandbox(wt.path)))
+    const setupFailed = (tail: string) => { for (const c of o.checks) res[c.id] = { pass: false, exitCode: null, timedOut: false, setupFailed: true, tail }; return res }
     if (o.setup) {
       const s = await runSandboxed(o.setup, wt.path, o.timeoutMs, o.profilePath, 'setup', o.onSpawn)
-      if (!s.pass) { for (const c of o.checks) res[c.id] = { pass: false, exitCode: null, timedOut: false, setupFailed: true, tail: s.outputTail.slice(-1500) }; return res }
+      if (!s.pass) return setupFailed(s.outputTail.slice(-1500))
     }
+    const changed = await trackedChanges(wt, o.base)
+    if (changed.length) return setupFailed(setupChangedReason(changed))
+    let dirty = false
     for (const c of o.checks) {
       const r = await runSandboxed(c.command, wt.path, o.timeoutMs, o.profilePath, c.id, o.onSpawn)
-      res[c.id] = { pass: r.pass, exitCode: r.exitCode, timedOut: r.timedOut, tail: r.outputTail.slice(-1500) }
+      res[c.id] = { pass: r.pass && !dirty, exitCode: r.exitCode, timedOut: r.timedOut, tail: r.outputTail.slice(-1500) }
+      if (!dirty && (await trackedChanges(wt, o.base)).length) {
+        dirty = true
+        res[c.id] = { ...res[c.id], pass: false, tail: `${res[c.id].tail}\n[hq] 검사가 추적 파일을 바꿈 — 실패로 기록` }
+      }
     }
     return res
   } finally { await removeMirrorWorktree(o.mirror, wt.path) }

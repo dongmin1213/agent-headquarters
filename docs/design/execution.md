@@ -126,10 +126,10 @@ schema_version: pragma user_version
 9. 보호 경로(`protectedPaths`)에 해당하는 변경은 통과시키되 목록을 기록 → 검토 프롬프트에 "보호 경로 변경: 테스트·설정 약화 여부 반드시 판정"으로, 수락 카드에 표시.
 
 ## 9. 기계 검증 (hq가 직접)
-- 미러에서 `head_sha`의 **새 검증 worktree**를 만들고 setup 후, 모든 non-manual check를 샌드박스 안 `/bin/sh -c <check>`(stdin /dev/null, 최소 env, 프로세스 그룹 타임아웃)로 실행. 검사 전후 hq가 미러 쪽에서 `git status --porcelain`과 HEAD를 확인(미러 index는 샌드박스가 쓰지 못함) — 검사가 소스를 바꾸면 실패.
+- 미러에서 `head_sha`의 **새 검증 worktree**를 만들고 setup 후, 모든 non-manual check를 샌드박스 안 `/bin/sh -c <check>`(stdin /dev/null, 최소 env, 프로세스 그룹 타임아웃)로 실행. setup 뒤·첫 검사 전에 추적 파일 내용(작업 트리·index)이 검사 대상 커밋과 같아야 한다(내용 해시 비교, 미추적·무시 파일은 허용) — 다르면 `setup이 추적 파일을 바꿨어요: <파일>`로 환경 실패(task `blocked`, 기준선은 setupFailed와 같게, 통합은 통합 카드). 검사마다 끝난 뒤 같은 비교와 HEAD를 다시 확인 — 검사가 추적 파일을 바꾸면 실패. 검증·기준선·통합·검토 worktree 모두 같은 규칙.
 - **기준선은 면제에 쓰지 않는다**(v3). base에서도 같은 check를 한 번 실행해 기록만 한다(캐시 키 `<repo>:<base_sha>:sha256(setup+check)`).
   - `kind: new`: 후보에서 반드시 통과. base에서 이미 통과했다면 "이 검사는 새 동작을 확인하지 않아요" 경고를 수락 카드에 표시.
-  - `kind: regression`: 후보에서 통과해야 한다. base에서 일반 실패(0이 아닌 종료)였어도 **후보에서 반드시 실행**한다. 후보에서 통과하면 통과. 후보에서도 실패하면 그 항목만 `manual`로 돌려 검토자가 후보·base 출력을 비교해 "악화 없음"을 증거로 판정하고, 수락 카드에 "기존 실패"로 표시.
+  - `kind: regression`: 후보에서 통과해야 한다. base에서 일반 실패(0이 아닌 종료)였어도 **후보에서 반드시 실행**한다. 후보에서 통과하면 통과. 후보에서도 일반 실패(126/127·시간 초과 제외 — 그건 그냥 실패)면 그 항목만 `manual`로 돌려 검토자가 후보·base 출력을 비교해 "악화 없음"을 증거로 판정하고, 수락 카드에 "기존 실패"로 표시.
   - **환경 실패는 기존 실패가 아니다**: base에서 setup 실패·시간 초과, 또는 regression 검사의 exit 126/127(실행 불가·명령 없음)이면 작업자를 띄우기 전에 task를 `blocked`로 멈추고 원인(명령·종료 코드·마지막 출력 줄)과 해결(setup 등록·계획 수정)을 적는다. 이 결과는 캐시하지 않아 재시도 때 다시 잰다. `kind: new` 검사의 126/127은 아직 없는 파일을 실행하는 정상 경우라 제외.
 - 비밀값 검사: base..HEAD의 **모든 커밋**의 추가 줄 + 파일명 거부 목록(`.env*`, `*.pem`, `id_rsa*`, `*.p12`, `*.key`). 값은 기록하지 않는다.
 - 검사 실행도 시도처럼 기록(pid·시작 시각). 재시작 복구 때 남은 검사 프로세스 그룹을 종료한 뒤 다시 실행.
@@ -141,7 +141,8 @@ schema_version: pragma user_version
 - hq 검증:
   1. `criteria[].id` 집합 = 작업 acceptance id 집합(누락·중복·모르는 id → 무효).
   2. `tests_run[]`의 각 명령은 검토자 stream의 실제 Bash `tool_use`와 **공백 정규화 후 정확히 같은 명령**이어야 한다(부분 일치 불인정: 실사용에서 다른 명령과 잘못 짝지어졌다). 종료 코드: `tool_result.is_error=false` → 0, `Exit code N` 접두어 → N, 중단·백그라운드 → 알 수 없음(무효). `|`, `||`, `;`, `true`로 끝나는 명령은 근거로 인정하지 않는다. 검토 프롬프트에 "테스트 명령은 이어 붙이지 말고 하나씩 실행하고, 실행한 문자열 그대로 적을 것"을 넣는다. 코드 변경이 있는데 `tests_run` 비면 무효.
-  2a. `pass=true`이면 모든 `tests_run.exit_code == 0`이어야 한다. manual 기준은 검토자가 증거와 함께 판정하고 수락 카드에 "검토자 판단"으로 표시.
+  2a. `pass=true`이면 모든 `tests_run.exit_code == 0`이어야 한다. manual 기준(명시적 `manual`과 기존 실패)은 검토자가 증거와 함께 **pass 또는 fail**로 판정해야 한다(`manual`·누락 → 무효). 수락 카드에 `검토자 판정: [id] 결과 — 근거 한 줄`로 표시. 검토 모델이 none인데 이런 기준이 있으면 sonnet 검토를 추가한다.
+  명령 규칙(계획 check와 tests_run 공통, 원문 문자열 기준): 줄바꿈, `;`, `|`, `||`, `&&`, 단독 `&`, 백틱, `$(`, 단어 `exit`, 끝의 `true`/`:` 거부.
   3. `pass=true`인데 blocking 또는 fail 기준 → 무효. `pass=false`인데 blocking 없음 → 무효.
   4. 무효 → 같은 head에서 재검토 1회, 두 번째 무효 → task `blocked`.
 - hq가 verdict에 바인딩 필드를 직접 붙인다(`task, head_sha, base_sha, reviewer_model, implementer_model, sameFamily`).
@@ -152,7 +153,8 @@ schema_version: pragma user_version
 - 자동 적용 조건(v3): **`brief`와 `title`만 바뀌었을 때**. 나머지(`owns`, `acceptance` 전체, `depends_on`, `grade`, `model`, `review`)가 하나라도 다르면 카드 `revise:<taskId>`(수정 전후 차이 표시). 적용 전 전체 계획 `validate()` 재실행, 적용 시 generation +1.
 - 적용 시 task `revision+1`, 이 작업에 의존하는 후행 작업 무효화(§11).
 - task당 최대 2회, 초과 → `blocked`.
-- 수정 턴이 질문을 내면(v2 단계): task `blocked`, 질문은 note와 결정 카드 진단에 표시. 회장의 retry/skip/stop으로 진행.
+- 작업 id·project·role 변경은 거부(`지시서 수정으로 프로젝트·역할은 바꿀 수 없어요`).
+- 수정 턴이 질문을 내면: 작업 질문(task_questions, 표시 `사장 질문`)으로 저장하고 task `question`. 모두 답하면 `revising`으로 돌아가 답을 붙여 수정 턴을 다시 실행한다(질문 라운드는 수정 횟수에 세지 않고 최대 3라운드).
 
 ## 11. 재작업·의존·무효화
 - 실패(`failed`, `runaway`, 검사 실패, 검토 blocking, 결과 반려) 시 `attempts < maxAttempts`면 재작업: 2번째는 같은 모델, 3번째는 ladder 한 단계 위. 도달 → `blocked`("N번 실패", N = 실제 횟수).
@@ -161,7 +163,7 @@ schema_version: pragma user_version
 - **무효화**: 선행 작업의 산출물(코드 `head_sha` 또는 collect 보고서 해시)이 바뀌면 전이적으로 의존하는 모든 작업의 generation +1, 살아 있는 시도 종료 확인, `pending`, 작업 복제본 폐기(미러 ref는 보관), attempts 0(시도 번호 n은 계속 증가), 이전 질문·세션·base·검증·검토 무효. 수락 카드가 열려 있으면 superseded.
 
 ## 12. 수락·통합·병합
-- 모든 작업이 `passed` 또는 `cancelled`(최소 1개 passed) → 프로젝트별 **통합**: 통합 worktree를 대상 브랜치의 현재 SHA에서 만들고 통과 작업의 **기록된 head SHA**를 계획 순서로 `--no-ff` 병합 → setup → 모든 작업의 non-manual check + 비밀값 검사. 결과 `integration_sha`. 충돌·검사 실패 → 요청 `blocked` + 카드 `integration:<req>:<project>`(다시 통합 / 요청 중단).
+- 모든 작업이 `passed` 또는 `cancelled`(최소 1개 passed) → 프로젝트별 **통합**: 통합 worktree를 대상 브랜치의 현재 SHA에서 만들고 통과 작업의 **기록된 head SHA**를 계획 순서로 `--no-ff` 병합 → setup → 모든 작업의 non-manual check + 비밀값 검사. 결과 `integration_sha`. 충돌·검사 실패 → 요청 `blocked` + 카드 `integration:<req>:<project>`(다시 통합 / 요청 중단). 통합에는 기존 실패 면제가 없다: 작업 검증에서 기존 실패였던 검사가 통합본에서도 실패하면 `기존 실패 검사 <id>(<command>)가 통합본에서도 실패해요 · …`로 통합 실패. 실패가 모두 기존 실패이고 작업 검토자가 각각 `pass`(악화 없음)로 판정했으면 통합 카드에 `기존 실패로 인정하고 진행`이 추가된다: 인정한 id와 integration_sha를 merges.known_failures(스키마 6)에 기록하고 같은 SHA로 병합 단계에 넘어간다(병합 카드에 `회장이 인정한 기존 실패: [id] command`). 새 통합은 인정을 물려받지 않는다.
 - 수락 카드 `accept:<req>` (옵션 `수락`·`반려`), subject = 정렬된 `(taskId, generation, head_sha, report sha256, checks 결과 해시, verdict 해시)`. **수락은 작업 결과에 대한 판단**이고, 통합 SHA는 병합 카드가 묶는다(재통합돼도 수락은 유지, 병합 카드가 새 통합 SHA와 "대상 브랜치에 새로 생긴 커밋 N개"를 보여 준다). 통합 검사는 실제로 포함한 passed 작업의 기준만 실행한다.
 - 반려는 `POST /api/requests/:id/reject {reason(필수), subjectHash, tasks?}` 로만(카드의 `반려` 결정은 거부 409). 계획 카드 `반려` → 요청 `rejected`.
 - 통합 충돌·검사 실패 카드 선택지: `다시 통합` · `해당 작업 재작업`(새 대상 위에서, 무효화 규칙) · `요청 중단`. 다중 의존 base 충돌도 같은 카드.
