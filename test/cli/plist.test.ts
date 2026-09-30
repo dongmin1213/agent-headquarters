@@ -28,11 +28,32 @@ test('values are XML-escaped', () => {
   assert.match(renderPlist({ 'k&': 'v' }), /<key>k&amp;<\/key>/)
 })
 
+const petOpts = { label: 'com.agent-headquarters.pet', appBinary: '/r/pet/HQPet.app/Contents/MacOS/hqpet', logFile: '/h/logs/pet.log', port: 7777, tokenFile: '/Users/me/.config/hq/token', suffix: null }
+
 test('pet plist runs the app binary at load', () => {
-  const x = petPlist({ label: 'com.agent-headquarters.pet', appBinary: '/r/pet/HQPet.app/Contents/MacOS/hqpet', logFile: '/h/logs/pet.log' })
+  const x = petPlist(petOpts)
   assert.match(x, /<string>com\.agent-headquarters\.pet<\/string>/)
   assert.match(x, /<key>ProgramArguments<\/key>\s*<array>\s*<string>\/r\/pet\/HQPet\.app\/Contents\/MacOS\/hqpet<\/string>/)
   assert.match(x, /<key>RunAtLoad<\/key>\s*<true\/>/)
+})
+
+test('pet plist tells the pet where the daemon and token are; non-default installs get their own defaults suite', () => {
+  const def = petPlist(petOpts)
+  assert.match(def, /<key>EnvironmentVariables<\/key>\s*<dict>/)
+  assert.match(def, /<key>HQ_URL<\/key>\s*<string>http:\/\/127\.0\.0\.1:7777<\/string>/)
+  assert.match(def, /<key>HQ_TOKEN_FILE<\/key>\s*<string>\/Users\/me\/\.config\/hq\/token<\/string>/)
+  assert.doesNotMatch(def, /HQ_DEFAULTS_SUITE|HQ_ALLOW_SECOND_INSTANCE/)
+  const other = petPlist({ ...petOpts, port: 7790, tokenFile: '/tmp/x/token', suffix: 'ab12cd34' })
+  assert.match(other, /<key>HQ_URL<\/key>\s*<string>http:\/\/127\.0\.0\.1:7790<\/string>/)
+  assert.match(other, /<key>HQ_TOKEN_FILE<\/key>\s*<string>\/tmp\/x\/token<\/string>/)
+  assert.match(other, /<key>HQ_DEFAULTS_SUITE<\/key>\s*<string>hqpet\.ab12cd34<\/string>/)
+  assert.match(other, /<key>HQ_ALLOW_SECOND_INSTANCE<\/key>\s*<string>1<\/string>/)
+})
+
+test('the pet reads exactly the env names the plist sets', async () => {
+  const { readFileSync } = await import('node:fs')
+  const swift = readFileSync(new URL('../../pet/main.swift', import.meta.url), 'utf8')
+  for (const k of ['HQ_URL', 'HQ_TOKEN_FILE', 'HQ_DEFAULTS_SUITE', 'HQ_ALLOW_SECOND_INSTANCE']) assert.ok(swift.includes(`env["${k}"]`), k)
 })
 
 test('launchPath puts tool dirs first and dedupes', () => {

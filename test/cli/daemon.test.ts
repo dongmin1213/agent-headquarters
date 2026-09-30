@@ -4,9 +4,9 @@ import { createServer } from 'node:http'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHash } from 'node:crypto'
-import { restart, rotateLog, start, stop, stopTarget } from '../../src/cli/daemon.ts'
+import { killTarget, LEGACY_LOCK_MSG, LOG_MAX_BYTES, restart, rotateLog, start, stop, stopTarget } from '../../src/cli/daemon.ts'
 import { daemonLabel, launchdJobPath, lockFile, makeCtx, petLabel, pidFile, plistPath, type Ctx } from '../../src/cli/ctx.ts'
-import { fakeDaemon, freePort, testCtx, tmp, writeToken, type TestCtx } from './helpers.ts'
+import { fakeDaemon, freePort, spawnMain, testCtx, tmp, writeJsonLock, writeToken, type TestCtx } from './helpers.ts'
 import { NESTED_PS_SKIP, nestedSandbox } from '../nested.ts'
 
 test('start refuses when a live hq already answers on the port', async (t) => {
@@ -76,7 +76,9 @@ const s = createServer((q, r) => {
   r.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' }); r.end(JSON.stringify(ok ? { teams: [] } : { error: 'unauthorized' }))
 }).listen(Number(process.env.HQ_PORT), '127.0.0.1')
 import { writeFileSync as w } from 'node:fs'
-w(process.env.HQ_HOME + '/daemon.lock', String(process.pid))
+import { execFileSync } from 'node:child_process'
+const startedAt = execFileSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } }).trim()
+w(process.env.HQ_HOME + '/daemon.lock', JSON.stringify({ pid: process.pid, port: Number(process.env.HQ_PORT), root: ${JSON.stringify(ctx.root)}, home: process.env.HQ_HOME, startedAt }))
 console.log('stand-in up')
 process.on('SIGTERM', () => { s.close(); process.exit(0) })
 `)
@@ -84,7 +86,7 @@ process.on('SIGTERM', () => { s.close(); process.exit(0) })
   assert.equal(await start(ctx), 0, ctx.text())
   const pid = Number(readFileSync(pidFile(ctx), 'utf8'))
   assert.ok(pid > 0)
-  assert.equal(Number(readFileSync(lockFile(ctx), 'utf8')), pid, 'stand-in wrote the daemon lock')
+  assert.equal(JSON.parse(readFileSync(lockFile(ctx), 'utf8')).pid, pid, 'stand-in wrote the daemon lock')
   assert.equal(await start(ctx), 1, 'second start refused')
   assert.match(ctx.errors.at(-1)!, /중복 실행 거부/)
   assert.equal(await stop(ctx), 0, ctx.text())
@@ -111,7 +113,7 @@ test('start proceeds past a stale lock (dead pid)', async () => {
 test('stop refuses to kill a lock pid whose command is not src/main.ts', { skip: nestedSandbox && NESTED_PS_SKIP }, async () => {
   const ctx = testCtx({ port: await freePort(), dryRun: false })
   mkdirSync(ctx.home, { recursive: true })
-  writeFileSync(lockFile(ctx), `${process.pid}\n`) // the test runner: alive, not hq
+  await writeJsonLock(ctx, process.pid) // the test runner: alive, not hq
   writeFileSync(pidFile(ctx), `${process.pid}\n`)
   assert.equal(await stop(ctx), 1)
   assert.match(ctx.errors.at(-1)!, /hq 데몬이 아닙니다.*종료하지 않습니다/)
@@ -198,17 +200,13 @@ const launchctlSignals = (text: string, calls: string[]) =>
 
 test('stop: a loaded job whose plist is not ours is never signalled; the pidfile/lock target is stopped instead',
   { skip: nestedSandbox && NESTED_PS_SKIP }, async () => {
-    const { spawn } = await import('node:child_process')
     const { ctx, calls } = launchdCtx(await freePort(), foreignJob, false)
     mkdirSync(ctx.home, { recursive: true })
-    // Stand-in for the 7790 test daemon of the incident: a src/main.ts process named by the lock and pidfile.
-    const dir = tmp(); mkdirSync(join(dir, 'src'))
-    writeFileSync(join(dir, 'src/main.ts'), 'setInterval(() => {}, 1000)')
-    const d = spawn(process.execPath, [join(dir, 'src/main.ts')], { stdio: 'ignore' })
+    // Stand-in for the 7790 test daemon of the incident: this checkout's src/main.ts, named by its own JSON lock.
+    const d = await spawnMain(ctx.root)
     try {
-      await new Promise((r) => setTimeout(r, 200))
       writeFileSync(pidFile(ctx), `${d.pid}\n`)
-      writeFileSync(lockFile(ctx), `${d.pid}\n`)
+      await writeJsonLock(ctx, d.pid!)
       assert.equal(await stop(ctx), 0, ctx.text())
       assert.deepEqual(launchctlSignals(ctx.text(), calls), [])
       assert.ok(calls.some((c) => c.startsWith('launchctl print')), 'ownership was checked')
@@ -261,4 +259,122 @@ test('start: installed but unloaded job is bootstrapped from our plist', async (
   writeFileSync(plistPath(ctx, daemonLabel(ctx)), '<plist/>')
   assert.equal(await start(ctx), 0, ctx.text())
   assert.ok(ctx.text().includes(`[dry-run] launchctl bootstrap gui/${ctx.uid} ${plistPath(ctx, daemonLabel(ctx))}`))
+})
+
+// ---- daemon identity (K1/K2): only this installation's verified daemon is ever signalled ----
+
+const gone = (p: { exitCode: number | null; signalCode: string | null }) => p.exitCode !== null || p.signalCode !== null
+const psSkip = { skip: nestedSandbox && NESTED_PS_SKIP }
+
+test('stop never kills a foreign `node /other/src/main.ts` named by the lock', psSkip, async () => {
+  const ctx = testCtx({ port: await freePort(), dryRun: false })
+  const other = await spawnMain(tmp()) // another project's src/main.ts
+  try {
+    await writeJsonLock(ctx, other.pid!) // lock claims our root/home/port, correct start time
+    assert.equal(await stop(ctx), 1)
+    assert.match(ctx.errors.at(-1)!, /이 저장소\(.*\)의 hq 데몬이 아닙니다.*종료하지 않습니다/)
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(gone(other), false, 'foreign process left alone')
+  } finally { other.kill('SIGKILL') }
+})
+
+test('stop never kills another hq checkout (its root in the lock and on its command line)', psSkip, async () => {
+  const ctx = testCtx({ port: await freePort(), dryRun: false })
+  const otherRoot = tmp()
+  const other = await spawnMain(otherRoot)
+  try {
+    await writeJsonLock(ctx, other.pid!, { root: otherRoot })
+    assert.equal(await stop(ctx), 1)
+    assert.match(ctx.errors.at(-1)!, /종료하지 않습니다/)
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(gone(other), false)
+  } finally { other.kill('SIGKILL') }
+  // Lock fields are checked on their own too (command line matching our root is not enough).
+  const info = async () => ({ command: `/usr/bin/node ${join(ctx.root, 'src/main.ts')}`, startedAt: 'Wed Sep 30 10:00:00 2026' })
+  await writeJsonLock(ctx, process.pid, { root: otherRoot, startedAt: 'Wed Sep 30 10:00:00 2026' })
+  const t = await killTarget(ctx, info)
+  assert.ok(t && 'refuse' in t && /다른 설치의 데몬.*저장소/.test(t.refuse), JSON.stringify(t))
+  // …and a path that merely ends with ours is not ours.
+  await writeJsonLock(ctx, process.pid, { startedAt: 'Wed Sep 30 10:00:00 2026' })
+  const suffix = await killTarget(ctx, async () => ({ command: `node /elsewhere${join(ctx.root, 'src/main.ts')}`, startedAt: 'Wed Sep 30 10:00:00 2026' }))
+  assert.ok(suffix && 'refuse' in suffix, JSON.stringify(suffix))
+  assert.ok(await killTarget(ctx, info).then((x) => x && 'pid' in x), 'all fields equal → target')
+})
+
+test('stop never kills when the process start time differs from the lock (pid reuse)', psSkip, async () => {
+  const ctx = testCtx({ port: await freePort(), dryRun: false })
+  const d = await spawnMain(ctx.root)
+  try {
+    await writeJsonLock(ctx, d.pid!, { startedAt: 'Thu Jan  1 00:00:00 1970' })
+    assert.equal(await stop(ctx), 1)
+    assert.match(ctx.errors.at(-1)!, /시작 시각이 잠금 파일과 달라요.*종료하지 않습니다/)
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(gone(d), false)
+  } finally { d.kill('SIGKILL') }
+})
+
+test('a legacy plain-pid lock is never signalled, even for this checkout\'s src/main.ts', psSkip, async () => {
+  const ctx = testCtx({ port: await freePort(), dryRun: false })
+  const d = await spawnMain(ctx.root)
+  try {
+    mkdirSync(ctx.home, { recursive: true })
+    writeFileSync(lockFile(ctx), `${d.pid}\n`)
+    assert.equal(await stop(ctx), 1)
+    assert.equal(ctx.errors.at(-1), LEGACY_LOCK_MSG)
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(gone(d), false)
+  } finally { d.kill('SIGKILL') }
+})
+
+test('HQ_PORT=7778 against a home whose daemon runs on another port refuses (port is part of the identity)', psSkip, async () => {
+  const ctx = testCtx({ port: 7778, dryRun: false })
+  const d = await spawnMain(ctx.root)
+  try {
+    await writeJsonLock(ctx, d.pid!, { port: 7790 })
+    assert.equal(await stop(ctx), 1)
+    assert.match(ctx.errors.at(-1)!, /다른 설치의 데몬이에요 \(포트 7790 · 지금 설정은 포트 7778/)
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(gone(d), false)
+  } finally { d.kill('SIGKILL') }
+})
+
+test('no lock: a pidfile process is not signalled (identity unverifiable)', psSkip, async () => {
+  const ctx = testCtx({ port: await freePort(), dryRun: false })
+  const d = await spawnMain(ctx.root)
+  try {
+    mkdirSync(ctx.home, { recursive: true })
+    writeFileSync(pidFile(ctx), `${d.pid}\n`)
+    assert.equal(await stop(ctx), 1)
+    assert.match(ctx.errors.at(-1)!, /잠금 파일이 없어 신원을 확인할 수 없어요/)
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(gone(d), false)
+  } finally { d.kill('SIGKILL') }
+})
+
+test('current install after upgrade: our launchd job + legacy live lock → stop/restart go through launchctl, no refusal', psSkip, async () => {
+  const port = await freePort()
+  const d = await spawnMain(tmp())
+  try {
+    for (const cmd of [stop, restart]) {
+      const { ctx } = launchdCtx(port, ourJob)
+      mkdirSync(ctx.home, { recursive: true })
+      writeFileSync(lockFile(ctx), `${d.pid}\n`) // what the running pre-upgrade daemon wrote
+      assert.equal(await cmd(ctx), 0, ctx.text())
+      assert.match(ctx.text(), /\[dry-run\] launchctl (kill SIGTERM|kickstart -k) /)
+      assert.doesNotMatch(ctx.text(), /잠금 파일 형식이 예전 것/)
+    }
+    assert.equal(gone(d), false)
+  } finally { d.kill('SIGKILL') }
+})
+
+test('dry-run start writes nothing: no logs dir, no rotation, no pidfile', async () => {
+  const ctx = testCtx({ port: await freePort() })
+  assert.equal(await start(ctx), 0, ctx.text())
+  assert.equal(existsSync(ctx.home), false, 'no HQ_HOME/logs created')
+  mkdirSync(join(ctx.home, 'logs'), { recursive: true })
+  const log = join(ctx.home, 'logs/daemon.log')
+  writeFileSync(log, Buffer.alloc(LOG_MAX_BYTES + 1))
+  assert.equal(await start(ctx), 0, ctx.text())
+  assert.equal(existsSync(`${log}.1`), false, 'not rotated')
+  assert.equal(existsSync(pidFile(ctx)), false)
 })

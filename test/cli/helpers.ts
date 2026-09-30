@@ -3,7 +3,10 @@ import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, chmodSync } from '
 import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { makeCtx, type Ctx, type ExecResult } from '../../src/cli/ctx.ts'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { makeCtx, lockFile, type Ctx, type ExecResult } from '../../src/cli/ctx.ts'
+import { HQ_HEADER } from '../../src/cli/api.ts'
+import { pidStart } from '../../src/cli/daemon.ts'
 
 export interface TestCtx extends Ctx { lines: string[]; errors: string[]; text(): string }
 
@@ -30,10 +33,10 @@ export function writeToken(ctx: Ctx, value = 'test-token-abc', mode = 0o600) {
   writeFileSync(ctx.tokenFile, value); chmodSync(ctx.tokenFile, mode)
 }
 
-/** A fake daemon: checks Host + Bearer like src/server.ts and serves the given snapshot. */
+/** A fake daemon: checks Host + Bearer like src/server.ts, marks every response with the hq header, and serves the given snapshot. */
 export async function fakeDaemon(token: string, snapshot: unknown, extra?: (path: string) => { status: number; body: unknown } | null): Promise<{ server: Server; port: number }> {
   const server = createServer((req, res) => {
-    const send = (s: number, b: unknown) => { res.writeHead(s, { 'content-type': 'application/json' }); res.end(JSON.stringify(b)) }
+    const send = (s: number, b: unknown) => { res.writeHead(s, { 'content-type': 'application/json', [HQ_HEADER.name]: HQ_HEADER.value }); res.end(JSON.stringify(b)) }
     if (!/^127\.0\.0\.1:\d+$/.test(req.headers.host ?? '') || req.headers.origin || req.headers.authorization !== `Bearer ${token}`) return send(401, { error: 'unauthorized' })
     const x = extra?.(req.url ?? '')
     if (x) return send(x.status, x.body)
@@ -50,4 +53,20 @@ export async function freePort(): Promise<number> {
   const port = (s.address() as { port: number }).port
   await new Promise((r) => s.close(r))
   return port
+}
+
+/** Spawns `node <dir>/src/main.ts` running a do-nothing loop (a stand-in daemon process; the file is created if missing). */
+export async function spawnMain(dir: string, body = 'setInterval(() => {}, 1000)'): Promise<ChildProcess> {
+  mkdirSync(join(dir, 'src'), { recursive: true })
+  writeFileSync(join(dir, 'src/main.ts'), body)
+  const p = spawn(process.execPath, [join(dir, 'src/main.ts')], { stdio: 'ignore' })
+  await new Promise((r) => setTimeout(r, 200))
+  return p
+}
+
+/** Writes a JSON daemon lock like src/main.ts does; fields default to ctx's own identity and the pid's real start time. */
+export async function writeJsonLock(ctx: Ctx, pid: number, over: Record<string, unknown> = {}): Promise<void> {
+  mkdirSync(ctx.home, { recursive: true })
+  const lock = { pid, port: ctx.port, root: ctx.root, home: ctx.home, startedAt: await pidStart(pid), ...over }
+  writeFileSync(lockFile(ctx), JSON.stringify(lock) + '\n')
 }

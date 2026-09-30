@@ -45,11 +45,29 @@ test('status when down says how to start, exit 1', async () => {
   assert.match(ctx.text(), /hq start/)
 })
 
-test('status with a wrong token reports 401', async (t) => {
+test('status with a wrong token: 401 with the x-hq header is a token mismatch, naming the token file', async (t) => {
   const d = await fakeDaemon(TOKEN, newSnap); t.after(() => d.server.close())
   const ctx = testCtx({ port: d.port }); writeToken(ctx, 'wrong')
   assert.equal(await status(ctx, { json: false }), 1)
-  assert.match(ctx.text(), /토큰 불일치/)
+  assert.ok(ctx.text().includes(`토큰이 맞지 않아요 (${ctx.tokenFile}) · hq restart로 데몬을 다시 띄우거나 토큰 파일을 확인해 주세요`), ctx.text())
+  assert.doesNotMatch(ctx.text(), /다른 프로그램/)
+})
+
+test('a 401 without the x-hq header is another program, not a token mismatch', async (t) => {
+  const { createServer } = await import('node:http')
+  const s = createServer((_q, r) => { r.writeHead(401, { 'content-type': 'application/json' }); r.end('{"error":"unauthorized"}') })
+  await new Promise<void>((r) => s.listen(0, '127.0.0.1', () => r())); t.after(() => s.close())
+  const ctx = testCtx({ port: (s.address() as { port: number }).port }); writeToken(ctx, 'x')
+  assert.equal(await status(ctx, { json: false }), 1)
+  assert.match(ctx.text(), /다른 프로그램이 포트 사용 \(HTTP 401\)/)
+})
+
+test('the real server marks its JSON responses with the same header the CLI checks', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { HQ_HEADER } = await import('../../src/cli/api.ts')
+  const src = readFileSync(new URL('../../src/server.ts', import.meta.url), 'utf8')
+  const helper = src.slice(src.indexOf('function json('))
+  assert.ok(helper.includes(`'${HQ_HEADER.name}': '${HQ_HEADER.value}'`), 'src/server.ts json() sets x-hq: 1')
 })
 
 test('open posts /api/ui-code and opens the returned local url (dry-run)', async (t) => {

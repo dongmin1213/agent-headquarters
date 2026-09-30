@@ -20,24 +20,29 @@ const cfg = loadConfig(root)
 const port = Number(process.env.HQ_PORT ?? 7777)
 mkdirSync(cfg.home, { recursive: true })
 
-// Single instance (§7.8): daemon.lock is created with O_CREAT|O_EXCL and holds our pid as one integer line.
+// Single instance (§7.8): daemon.lock is created with O_CREAT|O_EXCL and holds our identity as JSON
+// {pid, port, root, home, startedAt} so the CLI can verify it before signalling (startedAt = `ps -o lstart=` under LC_ALL=C).
+// Older daemons wrote a plain pid line; the first integer of either format is the pid.
 // An existing lock whose pid is alive and runs src/main.ts means another daemon; anything else is stale.
 const lockPath = resolve(cfg.home, 'daemon.lock')
+const lockPid = (text: string) => { const m = /\d+/.exec(text); return m ? Number(m[0]) : 0 }
+const startedAt = (() => { try { return execFileSync('ps', ['-o', 'lstart=', '-p', String(process.pid)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } }).trim() } catch { return '' } })()
+const lockBody = JSON.stringify({ pid: process.pid, port, root, home: resolve(cfg.home), startedAt }) + '\n'
 const tryLock = () => {
-  try { const fd = openSync(lockPath, 'wx', 0o644); writeSync(fd, `${process.pid}\n`); closeSync(fd); return true } catch (e) {
+  try { const fd = openSync(lockPath, 'wx', 0o644); writeSync(fd, lockBody); closeSync(fd); return true } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false
     throw e
   }
 }
 if (!tryLock()) {
-  const other = Number((() => { try { return readFileSync(lockPath, 'utf8').trim() } catch { return '' } })())
+  const other = lockPid((() => { try { return readFileSync(lockPath, 'utf8') } catch { return '' } })())
   let cmd = ''
   if (other > 0 && other !== process.pid) try { cmd = execFileSync('ps', ['-o', 'command=', '-p', String(other)], { encoding: 'utf8' }) } catch { /* not running */ }
   if (cmd.includes('src/main.ts')) { console.error(`hq가 이미 실행 중이에요 (pid ${other})`); process.exit(1) }
   rmSync(lockPath, { force: true })
   if (!tryLock()) { console.error('daemon.lock을 만들지 못했어요 (다른 hq가 동시에 시작 중)'); process.exit(1) }
 }
-const releaseLock = () => { try { if (readFileSync(lockPath, 'utf8').trim() === String(process.pid)) rmSync(lockPath) } catch { /* gone */ } }
+const releaseLock = () => { try { if (lockPid(readFileSync(lockPath, 'utf8')) === process.pid) rmSync(lockPath) } catch { /* gone */ } }
 process.on('exit', releaseLock)
 
 const dbPath = resolve(cfg.home, 'hq.db')
