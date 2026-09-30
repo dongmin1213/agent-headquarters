@@ -1029,7 +1029,7 @@ export class Runner {
     if (res.kind !== 'conflict' && res.checks) atomicJson(join(hq, 'checks.json'), res.checks)
     if (res.kind === 'conflict') {
       const who = tasks.find((t) => t.id === res.taskId)
-      fail('conflict', `통합 충돌 (${who?.key ?? res.taskId}): ${res.files.join(', ')}`, `작업 ${who?.title ?? res.taskId}을(를) ${target}(${res.targetSha.slice(0, 10)}) 위에 합치다 충돌했어요.\n충돌 파일:\n${res.files.map((f) => `- ${f}`).join('\n')}`, [res.taskId])
+      fail('conflict', `통합 충돌 (${who?.key ?? res.taskId}): ${res.files.join(', ')}`, `'${who?.title ?? res.taskId}' 작업을 ${target}(${res.targetSha.slice(0, 10)}) 위에 합치다 충돌했어요.\n충돌 파일:\n${res.files.map((f) => `- ${f}`).join('\n')}`, [res.taskId])
       this.notify('통합 충돌', `${project.name}: ${res.files.slice(0, 3).join(', ')}`)
       return
     }
@@ -1058,7 +1058,7 @@ export class Runner {
         const t = this.store.task(id)
         if (!t) continue
         this.resetTask(t, '통합 실패로 새 대상 위에서 다시 해요', m.target_sha)
-        for (const d of this.dependents(t)) if (d.status !== 'cancelled') this.resetTask(d, `선행 작업 ${t.key}을(를) 다시 해서 처음부터 다시 해요`)
+        for (const d of this.dependents(t)) if (d.status !== 'cancelled') this.resetTask(d, `선행 작업(${t.key})을 다시 해서 처음부터 다시 해요`)
       }
       this.store.raw().prepare('delete from merges where request_id = ?').run(requestId)
       this.store.supersede(`accept:${requestId}`)

@@ -65,7 +65,7 @@ export function decisionItems(store: Store, now = Date.now()): DecisionItem[] {
       ex = { situation: `사장이 작업 ${n}개짜리 계획을 올렸어요 · 실행할 명령과 범위를 확인해 주세요`, cause: null, causeConfirmed: false, recommendation: null, optionHelp: PLAN_HELP }
     } else if (a.kind === 'revise') {
       const t = store.task(taskId!)
-      ex = { situation: `작업자가 ${t?.title ?? '작업'}을(를) 지시서대로 할 수 없다고 멈췄고, 사장이 지시서를 고쳤어요 · 범위나 검사 명령이 바뀌어 승인이 필요해요`,
+      ex = { situation: `작업자가 '${t?.title ?? '작업'}' 작업을 지시서대로 할 수 없다고 멈췄고, 사장이 지시서를 고쳤어요 · 범위나 검사 명령이 바뀌어 승인이 필요해요`,
         cause: firstLine(t?.note ?? null) || null, causeConfirmed: true, recommendation: null, optionHelp: REVISE_HELP }
     } else if (a.kind === 'integration') {
       const project = a.id.split(':')[2]
@@ -80,7 +80,7 @@ export function decisionItems(store: Store, now = Date.now()): DecisionItem[] {
       const project = a.id.split(':')[2]
       const m = store.mergeRow(requestId, project)
       const files = store.tasks(requestId).filter((t) => t.project === project && t.role === 'implement' && t.status === 'passed').length
-      ex = { situation: `${m?.target ?? '대상 브랜치'} (${m?.target_sha?.slice(0, 10) ?? '?'})에 작업 ${files}개의 통합본 ${m?.integration_sha?.slice(0, 10) ?? '?'}을(를) 반영할 준비가 됐어요`,
+      ex = { situation: `${m?.target ?? '대상 브랜치'} (${m?.target_sha?.slice(0, 10) ?? '?'})에 작업 ${files}개의 통합본(${m?.integration_sha?.slice(0, 10) ?? '?'})을 반영할 준비가 됐어요`,
         cause: m?.note ?? null, causeConfirmed: !!m?.note, recommendation: null, optionHelp: { 병합: OPTION_HELP.병합, 보류: OPTION_HELP.보류 } }
     }
     items.push({ kind: a.kind as DecisionItem['kind'], id: a.id, revision: a.revision, requestId: a.kind === 'system' ? '' : requestId, taskId, title: a.title, detail: a.body, ...ex,
@@ -96,14 +96,14 @@ export function decisionItems(store: Store, now = Date.now()): DecisionItem[] {
   for (const t of store.tasksByStatus(['question'])) for (const q of store.taskQuestions(t.id)) {
     if (q.answer !== null || q.revision !== t.revision) continue
     items.push({ kind: 'worker_question', id: q.id, revision: t.revision, requestId: t.request_id, taskId: t.id, title: `${t.title}: ${q.question}`, detail: `기본값: ${q.default}`,
-      situation: `작업자가 ${t.title}을(를) 하다가 물어볼 게 있어요: ${q.question}`, cause: firstLine(t.note) || null, causeConfirmed: false,
+      situation: `작업자가 '${t.title}' 작업 중에 물어볼 게 있어요: ${q.question}`, cause: firstLine(t.note) || null, causeConfirmed: false,
       recommendation: q.options.includes(q.default) ? { option: q.default, reason: '작업자가 제안한 기본값이에요' } : null, optionHelp: answerHelp(q.options, q.default),
       detailPath: detailPath(t.request_id, t.id), options: q.options, subjectHash: null, createdAt: q.created_at })
   }
   for (const t of store.tasksByStatus(['blocked'])) {
-    const ex = diagnosed(t.diagnosis, BLOCKED_OPTIONS, { situation: `작업 ${t.title}이(가) 멈췄어요 · 어떻게 할지 정해 주세요`, cause: t.note, causeConfirmed: true, recommendation: null,
+    const ex = diagnosed(t.diagnosis, BLOCKED_OPTIONS, { situation: `작업이 멈췄어요: ${t.title} · 어떻게 할지 정해 주세요`, cause: t.note, causeConfirmed: true, recommendation: null,
       optionHelp: { retry: OPTION_HELP.retry, skip: OPTION_HELP.skip, stop: OPTION_HELP.stop } })
-    items.push({ kind: 'blocked', id: t.id, revision: t.block_count, requestId: t.request_id, taskId: t.id, title: `작업 ${t.title}이(가) 막혔어요`, detail: t.note ?? '', ...ex,
+    items.push({ kind: 'blocked', id: t.id, revision: t.block_count, requestId: t.request_id, taskId: t.id, title: `작업이 막혔어요: ${t.title}`, detail: t.note ?? '', ...ex,
       detailPath: detailPath(t.request_id, t.id), options: BLOCKED_OPTIONS, subjectHash: null, createdAt: t.updated_at })
   }
   return items.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || a.createdAt.localeCompare(b.createdAt))
@@ -165,7 +165,7 @@ export interface HeadlineInput {
 export function buildHeadline(h: HeadlineInput): Headline {
   const needsYou = h.decisions.length
   if (needsYou) return { text: `회장님 결정 ${needsYou}건: ${h.decisions[0].title}`, needsYou }
-  if (h.failures.length) return { text: `${h.failures[0].title}이 막혔어요: ${h.failures[0].reason.split('\n')[0].slice(0, 80)}`, needsYou }
+  if (h.failures.length) return { text: `막혔어요 · ${h.failures[0].title}: ${h.failures[0].reason.split('\n')[0].slice(0, 80)}`, needsYou }
   const active = h.workers.filter((w) => w.state !== 'held' && w.state !== 'blocked')
   if (active.length) {
     const w = active[0]

@@ -12,7 +12,7 @@ const w = (o: Partial<WorkerView>): WorkerView => ({ attemptId: 'a', taskId: 't'
 test('18. headline sentences', () => {
   const d = { kind: 'plan', title: '계획 승인: X' } as DecisionItem
   assert.deepEqual(buildHeadline({ ...base, decisions: [d, d] }), { text: '회장님 결정 2건: 계획 승인: X', needsYou: 2 })
-  assert.equal(buildHeadline({ ...base, failures: [{ title: '요청 A', reason: '통합 충돌\n자세히' }] }).text, '요청 A이 막혔어요: 통합 충돌')
+  assert.equal(buildHeadline({ ...base, failures: [{ title: '요청 A', reason: '통합 충돌\n자세히' }] }).text, '막혔어요 · 요청 A: 통합 충돌')
   assert.equal(buildHeadline({ ...base, workers: [w({}), w({ kind: 'review', model: 'opus', state: 'reviewing' })] }).text, 'sonnet가 로그인 고치기 구현 중 · 다음: 검증 외 1명')
   assert.equal(buildHeadline({ ...base, workers: [w({ kind: 'review', model: 'opus', state: 'reviewing' })] }).text, 'opus가 로그인 고치기 검토 중 · 다음: 통합')
   assert.equal(buildHeadline({ ...base, workers: [w({ kind: 'verify', model: 'hq', state: 'verifying' })] }).text, 'hq가 로그인 고치기 검증 중 · 다음: 검토')

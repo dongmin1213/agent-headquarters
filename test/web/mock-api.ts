@@ -299,7 +299,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
     const workerQ: DecisionItem[] = allTasks().filter((t) => t.status === 'question').flatMap((t) => t.questions.map((q) => ({
       kind: 'worker_question' as const, id: q.id, revision: t.revision, requestId: t.requestId, taskId: t.id, title: q.question, detail: `${t.title} · 기본값: ${q.default}`, ...explain(q.id, t.requestId, t.id, q.options), options: q.options, subjectHash: null, createdAt: t.updatedAt })))
     const blocked: DecisionItem[] = allTasks().filter((t) => t.status === 'blocked').map((t) => ({
-      kind: 'blocked' as const, id: t.id, revision: t.revision, requestId: t.requestId, taskId: t.id, title: `작업 "${t.title}"이 막혔어요`, detail: t.note ?? '',
+      kind: 'blocked' as const, id: t.id, revision: t.revision, requestId: t.requestId, taskId: t.id, title: `작업이 막혔어요: ${t.title}`, detail: t.note ?? '',
       ...explain(t.id, t.requestId, t.id, ['retry', 'skip', 'stop']), options: ['retry', 'skip', 'stop'], subjectHash: null, createdAt: t.updatedAt }))
     return [...fromApproval('plan:', 'plan'), ...ceoQ, ...workerQ, ...fromApproval('revise:', 'revise'), ...blocked, ...fromApproval('integration:', 'integration'),
       ...fromApproval('accept:', 'accept'), ...fromApproval('merge:', 'merge')]
