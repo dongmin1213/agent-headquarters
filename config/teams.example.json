@@ -21,6 +21,10 @@
     ],
     "cwd": "~/code/pipeline",
     "everyMinutes": 30,
-    "enabled": false
+    "enabled": false,
+    "sandbox": {
+      "readable": [],
+      "writable": []
+    }
   }
 ]

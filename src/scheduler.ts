@@ -4,25 +4,36 @@
 // A team reports progress by printing lines starting with "STATUS:" (shown as the pet's bubble).
 //
 // Least privilege (teams are trusted user code, but they read the web): each run gets a scoped API token (quota +
-// its own team cards, never a decision), an environment without secrets, and a Seatbelt profile that hides the
-// daemon token and $HQ_HOME. Runs are detached process groups writing to a log file, so a daemon restart adopts a
-// live run (pid + `ps` start time) instead of starting a duplicate; the exit code survives as a marker line.
-import { spawn, type ChildProcess } from 'node:child_process'
-import { accessSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
+// its own team cards, never a decision), an environment without secrets, a per-run package cache, and the v4 Seatbelt
+// rules shared with workers (teamProfile). Runs are detached process groups writing to a log file, so a daemon restart
+// adopts a live run (pid + `ps` start time) instead of starting a duplicate; the exit code survives as a marker line.
+// A live pid whose identity cannot be confirmed is never signalled; the chairman gets a card to release it (N3).
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import { accessSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { createHash, randomBytes } from 'node:crypto'
+import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import type { Bus } from './bus.ts'
 import type { Store } from './store.ts'
 import type { RunRecord, TeamConfig, TeamState, TeamView } from './types.ts'
-import { real, wrap } from './exec/sandbox.ts'
-import { killGroup, pidAlive, psLstart, type PsLstart } from './exec/worker.ts'
+import {
+  cacheEnv, claudeOwnFilters, claudeWriteRules, homeReadFilters, homeSecretFilters, launchRules, machRules, makeCacheDir, real,
+  signalRules, subpathOf, TEAM_MACH_ALLOWED, tempRoots, wrap,
+} from './exec/sandbox.ts'
+import { killGroup, pidAlive, psLstart, removeCacheDir, type PsLstart } from './exec/worker.ts'
 
 const LIMIT_BACKOFF_MS = 30 * 60_000
 const SPAWN_FAILED = '실행할 수 없어요:'
 const TIMED_OUT = '시간 초과'
 export const INTERRUPTED = '지난 실행이 중단됐어요 · 다음 실행 때 이어서 해요'
 export const UNCONFIRMED = '이전 실행이 아직 도는지 확인할 수 없어요 · 확인 전에는 새로 시작하지 않아요'
+/** Options of the hq-owned card for an unconfirmed run (N3). */
+export const RELEASE = '끝난 것으로 보고 다시 시작'
+export const KEEP_WAITING = '계속 기다림'
+/** Summary line / bubble after the chairman released an unconfirmed run. */
+export const RELEASED = '확인할 수 없던 이전 실행을 끝난 것으로 봤어요 · 다시 시작해요'
+const REPOST_MS = 24 * 60 * 60_000
 const DEFAULT_TIMEOUT_MINUTES = 180
 const KEEP_LOGS = 50
 const EXIT_MARKER = '__HQ_EXIT__'
@@ -44,6 +55,10 @@ export interface TeamIsolation {
   /** SIGTERM → SIGKILL grace on timeout (default 10 s). */
   killGraceMs?: number
   ps?: PsLstart
+  /** Command line of a live pid (`ps -o command=`), null when unknown; shown on the unconfirmed-run card. */
+  psCommand?: (pid: number) => Promise<string | null>
+  /** Clock for the unconfirmed-run card's 24h re-ask (tests). */
+  now?: () => number
 }
 
 interface Active {
@@ -52,6 +67,10 @@ interface Active {
   offset: number; decoder: StringDecoder; partial: string; tail: string[]; marker: number | null
   startedMs: number; timer: NodeJS.Timeout | null; killing: string | null; nextKillCheck: number
   unconfirmed: boolean; done: boolean; resolve: () => void
+  /** Per-run cache folder (npm/pip/XDG), removed when the run ends. */
+  cacheDir: string | null
+  /** The chairman card for an unconfirmed run: its id, the revision hq posted, and when to ask again after 계속 기다림. */
+  card: { id: string; rev: number; waitUntil: number | null; posting: boolean } | null
 }
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex')
@@ -64,10 +83,79 @@ export function teamEnv(extra: Record<string, string>, from: NodeJS.ProcessEnv =
   return { ...env, ...extra }
 }
 
-/** Seatbelt profile for team commands: everything allowed except the daemon token folder and $HQ_HOME. */
-export function teamProfile(hqHome: string, tokenDir: string): string {
-  const deny = [...new Set([real(tokenDir), real(hqHome)])].map((p) => `(subpath ${JSON.stringify(p)})`).join(' ')
-  return `(version 1)\n(allow default)\n(deny file-read-data file-write* ${deny})\n`
+export interface TeamProfileOpts {
+  /** The team repo: readable and writable. */
+  cwd: string
+  hqHome: string
+  tokenDir: string
+  /** Extra read-only roots (TeamConfig.sandbox.readable, already expanded). */
+  readable?: string[]
+  /** Extra read-write roots (TeamConfig.sandbox.writable, already expanded). */
+  writable?: string[]
+  /** Extra mach services (TeamConfig.sandbox.mach, already checked against TEAM_MACH_ALLOWED). */
+  mach?: string[]
+  /** Home directory for ~ paths (tests use a fake one). */
+  home?: string
+}
+
+/**
+ * Seatbelt profile for team commands: the worker v4 rules (sandbox.ts: signals only inside the sandbox, mach-lookup
+ * allow-list, ~ content reads deny-by-default + the measured list, ~/.claude write limits, no open/osascript/launchctl)
+ * plus the team's own allowances: its cwd (read+write), temp, its own ~/.claude/projects/<cwd>/ (claude -p transcripts,
+ * minus memory/) and the configured extra paths. The network stays open, including the hq port (the team talks to hq with
+ * its scoped token). The daemon token folder, $HQ_HOME and ~ credentials are denied last, so nothing re-allows them.
+ */
+export function teamProfile(o: TeamProfileOpts): string {
+  const home = real(o.home ?? homedir())
+  const readable = o.readable ?? [], writable = o.writable ?? []
+  const claude = claudeOwnFilters(home, o.cwd)
+  const w = [o.cwd, ...tempRoots(), '/dev', ...writable].map(subpathOf)
+  return [
+    '(version 1)',
+    '(allow default)',
+    ...signalRules(),
+    ...machRules(),
+    ...(o.mach ?? []).map((n) => `(allow mach-lookup (global-name ${JSON.stringify(n)})) ; team config`),
+    `(deny file-read-data ${subpathOf(home)} ${subpathOf(o.hqHome)})`,
+    `(allow file-read-data ${[...homeReadFilters(home), ...[...readable, ...writable, o.cwd].map(subpathOf), claude.own].join(' ')})`,
+    `(deny file-write* (require-not (require-any ${w.join(' ')} ${claude.own})))`,
+    ...claudeWriteRules(home, claude),
+    `(deny file-read-data file-write* ${[...new Set([o.tokenDir, o.hqHome].map(subpathOf))].join(' ')} ${homeSecretFilters(home).join(' ')})`,
+    ...launchRules(),
+    '',
+  ].join('\n')
+}
+
+/** A team's sandbox setting that cannot be applied; the run ends with `실행할 수 없어요: <message>`. */
+export class TeamSandboxError extends Error {}
+
+/**
+ * TeamConfig.sandbox → profile paths (~ expanded, relative to cwd) and allowed extra mach services, or 'none'.
+ * Throws TeamSandboxError on a malformed value or a mach service outside TEAM_MACH_ALLOWED.
+ */
+export function teamSandboxPaths(t: TeamConfig, home = homedir()): { readable: string[]; writable: string[]; mach: string[] } | 'none' {
+  const sb = t.sandbox
+  if (sb === 'none') return 'none'
+  if (sb === undefined) return { readable: [], writable: [], mach: [] }
+  const list = (v: unknown, key: string): string[] => {
+    if (v === undefined) return []
+    if (!Array.isArray(v) || v.some((x) => typeof x !== 'string' || !x)) throw new TeamSandboxError(`teams.json sandbox.${key}는 목록이어야 해요`)
+    return v as string[]
+  }
+  const path = (p: string) => resolve(t.cwd, p.replace(/^~(?=\/|$)/, home))
+  if (!sb || typeof sb !== 'object' || Array.isArray(sb)) throw new TeamSandboxError('teams.json sandbox는 {readable, writable, mach} 또는 "none"이어야 해요')
+  for (const k of Object.keys(sb)) if (!['readable', 'writable', 'mach'].includes(k)) throw new TeamSandboxError(`teams.json sandbox: 알 수 없는 키 "${k}"`)
+  const mach = list(sb.mach, 'mach')
+  for (const n of mach) if (!TEAM_MACH_ALLOWED.some(([name]) => name === n)) throw new TeamSandboxError(`허용되지 않은 mach 서비스 ${n}`)
+  return { readable: list(sb.readable, 'readable').map(path), writable: list(sb.writable, 'writable').map(path), mach: [...new Set(mach)] }
+}
+
+function psCommand(pid: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    try {
+      execFile('ps', ['-o', 'command=', '-p', String(pid)], { env: { ...process.env, LC_ALL: 'C' } }, (err, out) => resolve(err ? null : String(out).trim() || null))
+    } catch { resolve(null) }
+  })
 }
 
 const errno = (code: string) => Object.assign(new Error(code), { code }) as NodeJS.ErrnoException
@@ -110,7 +198,7 @@ export class Scheduler {
   /** `quota` connects teams to the shared quota hold (execution.md §13); without it the legacy kv hold is used. */
   constructor(teams: TeamConfig[], store: Store, bus: Bus, hqUrl: string, iso: TeamIsolation, quota: TeamQuota | null = null) {
     this.teams = teams; this.store = store; this.bus = bus; this.hqUrl = hqUrl; this.quota = quota
-    this.iso = { pollMs: 1000, killGraceMs: 10_000, ps: psLstart, ...iso }
+    this.iso = { pollMs: 1000, killGraceMs: 10_000, ps: psLstart, psCommand, now: Date.now, ...iso }
     const pending: Promise<void>[] = []
     for (const t of teams) {
       const last = store.lastRun(t.id)
@@ -162,8 +250,13 @@ export class Scheduler {
 
   private tick(): void {
     if (this.stopped) return
-    // A run whose identity could not be confirmed is only watched for its pid disappearing; it is never signalled.
-    for (const a of this.active.values()) if (a.unconfirmed && !pidAlive(a.pid!)) this.drain(a)
+    // A run whose identity could not be confirmed is only watched for its pid disappearing (never signalled), or
+    // released by the chairman's card.
+    for (const a of this.active.values()) {
+      if (!a.unconfirmed) continue
+      if (!pidAlive(a.pid!)) this.drain(a)
+      else this.checkCard(a)
+    }
     if (this.blockedUntil()) return
     for (const t of this.teams) {
       if (!t.enabled || this.state.get(t.id)!.running) continue
@@ -175,7 +268,11 @@ export class Scheduler {
 
   runNow(teamId: string): boolean {
     const t = this.teams.find((x) => x.id === teamId)
-    if (this.stopped || !t || !t.enabled || this.state.get(t.id)!.running) return false
+    if (this.stopped || !t) return false
+    // The server calls runNow right after a team card is decided: apply an unconfirmed-run decision first.
+    const a = this.active.get(t.id)
+    if (a?.unconfirmed) this.checkCard(a)
+    if (!t.enabled || this.state.get(t.id)!.running) return false
     if (this.blockedUntil()) return false
     void this.runTeam(t)
     return true
@@ -192,7 +289,7 @@ export class Scheduler {
   private newActive(t: TeamConfig, run: RunRecord, hash: string, adopted: boolean, pid: number | null, lstart: string | null): Active {
     return { team: t, runId: run.id, hash, log: join(this.logDir(t), `${run.id}.log`), adopted, pid, lstart, child: null, childExit: undefined,
       offset: 0, decoder: new StringDecoder('utf8'), partial: '', tail: [], marker: null, startedMs: Date.parse(run.startedAt), timer: null,
-      killing: null, nextKillCheck: 0, unconfirmed: false, done: false, resolve: () => {} }
+      killing: null, nextKillCheck: 0, unconfirmed: false, done: false, resolve: () => {}, cacheDir: null, card: null }
   }
 
   private runTeam(t: TeamConfig): Promise<void> {
@@ -210,16 +307,24 @@ export class Scheduler {
       const spawnFailed = (err: NodeJS.ErrnoException) => this.finish(a, -1, `${SPAWN_FAILED} ${err.code ?? err.message} (${cmd})`)
       let fd: number | null = null
       try {
-        const env = teamEnv({ HQ_URL: this.hqUrl, HQ_TOKEN: token, HQ_TEAM: t.id })
+        const paths = teamSandboxPaths(t)
+        // Per-run package caches (S4), recorded next to the log so a later daemon can remove them too.
+        a.cacheDir = makeCacheDir()
+        const env = teamEnv({ ...cacheEnv(a.cacheDir), HQ_URL: this.hqUrl, HQ_TOKEN: token, HQ_TEAM: t.id })
         const exe = resolveCommand(cmd, t.cwd, env.PATH)
         const dir = this.logDir(t)
         mkdirSync(dir, { recursive: true })
         pruneLogs(dir, runId)
-        const profile = join(dir, `${runId}.sb`)
-        writeFileSync(profile, teamProfile(this.iso.hqHome, this.iso.tokenDir))
+        writeFileSync(join(dir, `${runId}.cache`), a.cacheDir)
+        let argv = [exe, ...args]
+        if (paths !== 'none') {
+          const profile = join(dir, `${runId}.sb`)
+          writeFileSync(profile, teamProfile({ cwd: t.cwd, hqHome: this.iso.hqHome, tokenDir: this.iso.tokenDir, ...paths }))
+          argv = wrap(argv, profile)
+        }
         fd = openSync(a.log, 'a')
         // detached: own process group, so it outlives a daemon restart and a timeout can stop the whole tree.
-        const child = spawn('/bin/sh', ['-c', WRAPPER, 'hq-team', ...wrap([exe, ...args], profile)], { cwd: t.cwd, env, detached: true, stdio: ['ignore', fd, fd] })
+        const child = spawn('/bin/sh', ['-c', WRAPPER, 'hq-team', ...argv], { cwd: t.cwd, env, detached: true, stdio: ['ignore', fd, fd] })
         a.child = child
         child.on('error', spawnFailed)
         child.on('exit', (code) => { a.childExit = code; this.poll(a) })
@@ -235,7 +340,8 @@ export class Scheduler {
         a.timer = setInterval(() => this.poll(a), this.iso.pollMs)
         a.timer.unref()
       } catch (err) {
-        spawnFailed(err as NodeJS.ErrnoException)
+        if (err instanceof TeamSandboxError) this.finish(a, -1, `${SPAWN_FAILED} ${err.message}`)
+        else spawnFailed(err as NodeJS.ErrnoException)
       } finally {
         if (fd !== null) closeSync(fd)
       }
@@ -246,6 +352,7 @@ export class Scheduler {
   private async recover(t: TeamConfig, run: RunRecord): Promise<void> {
     const proc = this.store.runProcess(run.id)
     const a = this.newActive(t, run, proc?.tokenHash ?? '', true, proc?.pid ?? null, proc?.lstart ?? null)
+    try { a.cacheDir = readFileSync(join(this.logDir(t), `${run.id}.cache`), 'utf8').trim() || null } catch { /* none recorded */ }
     this.active.set(t.id, a)
     if (a.pid === null || !pidAlive(a.pid)) { this.drain(a); return }
     const now = await this.iso.ps(a.pid).catch(() => null)
@@ -255,6 +362,7 @@ export class Scheduler {
       if (!pidAlive(a.pid)) { this.drain(a); return }
       a.unconfirmed = true
       this.set(t.id, 'error', UNCONFIRMED)
+      await this.postUnconfirmed(a, false)
       return
     }
     this.readLog(a)
@@ -262,6 +370,55 @@ export class Scheduler {
     a.timer = setInterval(() => this.poll(a), this.iso.pollMs)
     a.timer.unref()
     this.poll(a)
+  }
+
+  private cardId(a: Active): string { return `team:${a.team.id}:unconfirmed-${a.runId}` }
+
+  /**
+   * N3: an hq-owned card asking the chairman about a run whose pid lives on but cannot be confirmed as ours.
+   * After a daemon restart a decision already made on this run's card is applied instead of asking again — only on the
+   * revision hq itself posted (recorded in kv, which team tokens cannot reach), so a card a team posted under this id
+   * never counts.
+   */
+  private async postUnconfirmed(a: Active, again: boolean): Promise<void> {
+    const id = this.cardId(a)
+    const subjectHash = sha(`unconfirmed:${a.team.id}:${a.runId}:${a.pid}`)
+    const prev = this.store.approval(id)
+    const ownRev = Number(this.store.get(`teamcard.${id}`) ?? -1)
+    if (!again && prev && prev.revision === ownRev && prev.subjectHash === subjectHash && prev.state === 'decided') {
+      a.card = { id, rev: prev.revision, waitUntil: null, posting: false }
+      this.checkCard(a)
+      return
+    }
+    a.card = { id, rev: -1, waitUntil: null, posting: true }
+    const cmd = await this.iso.psCommand(a.pid!).catch(() => null)
+    if (a.done) return
+    const body = [
+      `이전 hq가 시작한 실행(#${a.runId})의 프로세스가 아직 있지만, 같은 프로세스인지 확인할 수 없어요 (pid가 다른 프로그램에 다시 쓰였을 수도 있어요).`,
+      '그래서 신호를 보내지 않고, 새 실행도 시작하지 않고 있어요.',
+      `pid: ${a.pid}`,
+      cmd ? `명령 (ps): ${cmd}` : `명령 (기록된 팀 명령, ps로 확인 못 함): ${a.team.command.join(' ')}`,
+      `· ${RELEASE}: 이 실행을 끝난 것(-1)으로 기록하고 새 실행을 허용해요. 프로세스에는 신호를 보내지 않아요.`,
+      `· ${KEEP_WAITING}: 그대로 두고, 24시간 뒤에도 확인이 안 되면 다시 물어요.`,
+    ].join('\n')
+    const rev = this.store.putApproval({ id, teamId: a.team.id, title: `${a.team.name}: 이전 실행을 확인할 수 없어요`, body,
+      options: [RELEASE, KEEP_WAITING], subjectHash, kind: 'team' })
+    this.store.set(`teamcard.${id}`, String(rev))
+    a.card = { id, rev, waitUntil: null, posting: false }
+    this.bus.emit({ kind: 'approval', teamId: a.team.id, text: `승인 요청: ${a.team.name}: 이전 실행을 확인할 수 없어요`, data: { id } })
+  }
+
+  /** Applies the chairman's decision on an unconfirmed run's card; re-asks 24h after 계속 기다림. */
+  private checkCard(a: Active): void {
+    const c = a.card
+    if (!a.unconfirmed || a.done || !c || c.posting) return
+    const row = this.store.approval(c.id)
+    if (row && row.revision === c.rev && row.state === 'decided') {
+      // No signal: the pid may belong to someone else. The run is only closed in the DB.
+      if (row.decision === RELEASE) return this.finish(a, -1, RELEASED)
+      if (row.decision === KEEP_WAITING && c.waitUntil === null) c.waitUntil = Date.parse(row.decidedAt ?? '') + REPOST_MS
+    }
+    if (c.waitUntil !== null && this.iso.now() >= c.waitUntil) void this.postUnconfirmed(a, true)
   }
 
   /** Is the run's process still the one we started? (Our own unreaped child, or same pid with the same start time.) */
@@ -333,6 +490,8 @@ export class Scheduler {
     if (a.timer) clearInterval(a.timer)
     this.tokens.delete(a.hash)
     if (this.active.get(a.team.id) === a) this.active.delete(a.team.id)
+    if (a.card) this.store.supersede(a.card.id) // an unconfirmed run's open card is moot once the run is closed
+    removeCacheDir(a.cacheDir ?? undefined)
     const t = a.team
     const tail = a.tail
     // Keep the last STATUS line even when it scrolled out of the last 8, so a restart can restore the bubble.
@@ -358,7 +517,7 @@ export class Scheduler {
 function pruneLogs(dir: string, current: number): void {
   try {
     for (const f of readdirSync(dir)) {
-      const id = Number(/^(\d+)\.(log|sb)$/.exec(f)?.[1])
+      const id = Number(/^(\d+)\.(log|sb|cache)$/.exec(f)?.[1])
       if (id > 0 && id <= current - KEEP_LOGS) rmSync(join(dir, f), { force: true })
     }
   } catch { /* best effort */ }
@@ -371,7 +530,7 @@ function lastStatus(tail: string[]): string | null {
 
 /** The one exit→state mapping, used when a run ends and when restoring after a restart. */
 function runOutcome(exit: number, lines: string[], failure: string | null): { state: TeamState; bubble: string } {
-  if (failure === INTERRUPTED) return { state: 'idle', bubble: INTERRUPTED }
+  if (failure === INTERRUPTED || failure === RELEASED) return { state: 'idle', bubble: failure }
   if (failure) return { state: 'error', bubble: failure.slice(0, 140) }
   if (exit === 0) return { state: 'idle', bubble: lastStatus(lines) ?? '완료' }
   if (exit === 3) return { state: 'waiting', bubble: lastStatus(lines) ?? '승인 대기' }
@@ -384,6 +543,6 @@ function restoredOutcome(run: RunRecord): { state: TeamState; bubble: string } {
   const lines = run.summary ? run.summary.split('\n') : []
   // finish() appends a failure (spawn failure, timeout, interruption) as the summary's last line; split it back out.
   const last = lines.at(-1) ?? ''
-  const failure = run.exitCode === -1 && (last.startsWith(SPAWN_FAILED) || last.startsWith(TIMED_OUT) || last === INTERRUPTED) ? lines.pop()! : null
+  const failure = run.exitCode === -1 && (last.startsWith(SPAWN_FAILED) || last.startsWith(TIMED_OUT) || last === INTERRUPTED || last === RELEASED) ? lines.pop()! : null
   return runOutcome(run.exitCode ?? -1, lines, failure)
 }

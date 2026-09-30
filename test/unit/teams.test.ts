@@ -2,10 +2,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Bus } from '../../src/bus.ts'
-import { INTERRUPTED, Scheduler, UNCONFIRMED, type TeamIsolation } from '../../src/scheduler.ts'
+import { INTERRUPTED, KEEP_WAITING, RELEASE, RELEASED, Scheduler, UNCONFIRMED, type TeamIsolation } from '../../src/scheduler.ts'
 import { startServer } from '../../src/server.ts'
 import { Store } from '../../src/store.ts'
 import { pidAlive, psLstart } from '../../src/exec/worker.ts'
@@ -242,6 +243,123 @@ test('restart: ps unavailable while the pid is alive → unconfirmed as well; a 
     assert.equal(pidAlive(other.pid!), true)
     s.stop(); store.close()
   } finally { other.kill('SIGKILL') }
+})
+
+// N3: an unconfirmed run gets an hq-owned chairman card instead of waiting forever on a possibly reused pid.
+const TEAM_TOK = 'team-token-of-the-old-run'
+function seedUnconfirmed(dir: string, pid: number): string {
+  const db = join(dir, 'home', 'hq.db')
+  const s = new Store(db)
+  const id = s.startRun('revenue')
+  s.setRunProcess(id, pid, null, createHash('sha256').update(TEAM_TOK).digest('hex'))
+  s.close()
+  return db
+}
+const CARD = 'team:revenue:unconfirmed-1'
+
+test('N3: unconfirmed run → card; team token cannot decide it; chairman 끝난 것으로 보고 다시 시작 → run 1 ends -1 (no signal), a new run starts', async () => {
+  const h = harness()
+  const dir = h.dir
+  const other = spawn('/bin/sleep', ['60'], { detached: true, stdio: 'ignore' }); other.unref()
+  const db = seedUnconfirmed(dir, other.pid!)
+  const store = new Store(db)
+  const port = 30000 + Math.floor(Math.random() * 20000)
+  const MASTER = 'master-token-n3'
+  const t = team(dir, 'echo started >> started; exit 0')
+  const sched = new Scheduler([t], store, new Bus(store), `http://127.0.0.1:${port}`, iso(dir, { psCommand: async () => '/bin/sleep 60' }), quota)
+  const server = startServer({ port, store, bus: h.bus, scheduler: sched, token: MASTER, engine: h.engine, runner: h.runner, projects: h.projects })
+  await new Promise((r) => server.once('listening', r))
+  const call = async (token: string, method: string, path: string, body?: unknown) => {
+    const r = await fetch(`http://127.0.0.1:${port}${path}`, { method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) })
+    return { status: r.status, body: await r.json() as any }
+  }
+  try {
+    await sched.ready
+    assert.deepEqual([sched.views()[0].state, sched.views()[0].bubble], ['error', UNCONFIRMED])
+    const card = store.approval(CARD)!
+    assert.equal(card.state, 'open'); assert.equal(card.kind, 'team')
+    assert.equal(card.title, '수익: 이전 실행을 확인할 수 없어요')
+    assert.deepEqual(card.options, [RELEASE, KEEP_WAITING])
+    assert.match(card.body, new RegExp(`pid: ${other.pid}`)); assert.match(card.body, /명령 \(ps\): \/bin\/sleep 60/)
+    assert.ok(store.openApprovals().some((a) => a.id === CARD), 'shown to the chairman')
+    // The old run's (still live) scoped token may read its card but never decide it.
+    assert.equal(sched.teamOfToken(TEAM_TOK), 'revenue')
+    assert.equal((await call(TEAM_TOK, 'GET', `/api/approvals/${encodeURIComponent(CARD)}`)).status, 200)
+    assert.equal((await call(TEAM_TOK, 'POST', `/api/approvals/${encodeURIComponent(CARD)}`, { decision: RELEASE, subjectHash: card.subjectHash })).status, 403)
+    assert.equal(store.approval(CARD)!.state, 'open')
+    const d = await call(MASTER, 'POST', `/api/approvals/${encodeURIComponent(CARD)}`, { decision: RELEASE, subjectHash: card.subjectHash })
+    assert.equal(d.status, 200, JSON.stringify(d.body))
+    await until(() => existsSync(join(dir, 'started')), 'a new run starts right after the decision')
+    await ended(store, 2)
+    assert.equal(pidAlive(other.pid!), true, 'the old pid was never signalled')
+    assert.equal(sched.teamOfToken(TEAM_TOK), null, 'the released run lost its token')
+  } finally { sched.stop(); server.close(); store.close(); other.kill('SIGKILL'); await h.close() }
+  // Run 1 was closed as -1 with the release line; restoring shows no error for it.
+  const again = new Store(db)
+  try {
+    const row = again.raw().prepare('select exit_code, summary from runs where id = 1').get() as { exit_code: number; summary: string }
+    assert.equal(row.exit_code, -1); assert.equal(row.summary.split('\n').at(-1), RELEASED)
+  } finally { again.close() }
+})
+
+test('N3: 계속 기다림 → no new run; the card is asked again only after 24h (also across a restart); pid gone → card closed', async () => {
+  const dir = tmp('hq-teams-')
+  const other = spawn('/bin/sleep', ['60'], { detached: true, stdio: 'ignore' }); other.unref()
+  const db = seedUnconfirmed(dir, other.pid!)
+  let now = Date.now()
+  const t = team(dir, 'echo started >> started; exit 0', { everyMinutes: 0 })
+  let store = new Store(db)
+  let s = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', iso(dir, { psCommand: async () => null, now: () => now }), quota)
+  try {
+    await s.ready
+    let card = store.approval(CARD)!
+    assert.match(card.body, /명령 \(기록된 팀 명령, ps로 확인 못 함\): \/bin\/sh -c echo started/)
+    assert.ok(store.decide(CARD, KEEP_WAITING, card.subjectHash))
+    assert.equal(s.runNow('revenue'), false, 'still waiting')
+    ;(s as unknown as { tick(): void }).tick()
+    await new Promise((r) => setTimeout(r, 200))
+    assert.equal(existsSync(join(dir, 'started')), false)
+    assert.equal(store.lastRun('revenue')!.endedAt, null)
+    assert.equal(store.approval(CARD)!.revision, card.revision, 'not asked again yet')
+    s.stop(); store.close()
+
+    // A daemon restart within 24h keeps the decision (no new card).
+    store = new Store(db)
+    s = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', iso(dir, { psCommand: async () => null, now: () => now }), quota)
+    await s.ready
+    assert.equal(store.approval(CARD)!.revision, card.revision)
+    assert.equal(store.approval(CARD)!.state, 'decided')
+    now += 25 * 60 * 60_000
+    ;(s as unknown as { tick(): void }).tick()
+    await until(() => store.approval(CARD)!.revision === card.revision + 1, 'asked again after 24h')
+    card = store.approval(CARD)!
+    assert.equal(card.state, 'open')
+    assert.equal(existsSync(join(dir, 'started')), false, 'still no new run')
+    // The pid goes away on its own: the run closes as usual and its card is no longer open.
+    other.kill('SIGKILL')
+    await until(() => !pidAlive(other.pid!), 'sleep gone')
+    ;(s as unknown as { tick(): void }).tick()
+    assert.equal(store.approval(CARD)!.state, 'superseded')
+    await ended(store, 2) // the (due) team starts again once the old pid is gone
+  } finally { s.stop(); store.close(); try { other.kill('SIGKILL') } catch { /* gone */ } }
+})
+
+test('N3: a card a team posted under the unconfirmed id is never taken as the chairman\'s decision after a restart', async () => {
+  const dir = tmp('hq-teams-')
+  const other = spawn('/bin/sleep', ['60'], { detached: true, stdio: 'ignore' }); other.unref()
+  const db = seedUnconfirmed(dir, other.pid!)
+  const store = new Store(db)
+  // Forged earlier through the team API (upsert) with a guessable subject, and "decided".
+  const subject = createHash('sha256').update(`unconfirmed:revenue:1:${other.pid}`).digest('hex')
+  store.upsertApproval({ id: CARD, teamId: 'revenue', title: 'x', body: '', options: [RELEASE], subjectHash: subject, expiresAt: new Date(Date.now() + 3600_000).toISOString(), createdAt: new Date().toISOString() })
+  assert.ok(store.decide(CARD, RELEASE, subject))
+  const s = new Scheduler([team(dir, 'exit 0')], store, new Bus(store), 'http://127.0.0.1:1', iso(dir, { psCommand: async () => null }), quota)
+  try {
+    await s.ready
+    assert.equal(store.lastRun('revenue')!.endedAt, null, 'not released')
+    const card = store.approval(CARD)!
+    assert.equal(card.state, 'open'); assert.equal(card.title, '수익: 이전 실행을 확인할 수 없어요')
+  } finally { s.stop(); store.close(); other.kill('SIGKILL') }
 })
 
 test('timeout: SIGTERM then SIGKILL to the whole process group, run ends -1 with 시간 초과', async () => {

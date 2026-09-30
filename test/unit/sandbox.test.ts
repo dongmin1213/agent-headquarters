@@ -11,11 +11,12 @@ import { join } from 'node:path'
 import { createServer } from 'node:net'
 import { runSandboxed } from '../../src/exec/checks.ts'
 import { atomicWrite } from '../../src/exec/fsx.ts'
-import { cacheEnv, childEnv, claudeProjectDir, real, sandboxProfile, type SandboxOpts } from '../../src/exec/sandbox.ts'
+import { cacheEnv, childEnv, claudeProjectDir, real, sandboxProfile, tempRoots, type SandboxOpts } from '../../src/exec/sandbox.ts'
 import { claudeArgs, killGroup, launch, removeCacheDir } from '../../src/exec/worker.ts'
 import { DEFAULTS } from '../../src/config.ts'
 import { makeRepo, sh, tmp } from './helpers.ts'
 import { NESTED_SKIP, nestedSandbox } from '../nested.ts'
+import { launchServicesAttack } from './launch-attack.ts'
 
 const skip = nestedSandbox && NESTED_SKIP
 const HOME = real(homedir())
@@ -140,36 +141,7 @@ test('attack: signal to an outside process (F04)', { skip }, async () => {
 
 test('attack: LaunchServices launch via NSWorkspace (S1), copied open/launchctl, defaults write', { skip }, async (t) => {
   const s = await setup()
-  const evil = join(s.dir, 'evil'), leak = join(evil, 'leak.txt')
-  const app = join(evil, 'Evil.app', 'Contents')
-  mkdirSync(join(app, 'MacOS'), { recursive: true })
-  writeFileSync(join(app, 'Info.plist'), `<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>x</string><key>CFBundleIdentifier</key><string>test.hq.evil.${rand()}</string><key>CFBundlePackageType</key><string>APPL</string><key>LSUIElement</key><true/></dict></plist>`)
-  writeFileSync(join(app, 'MacOS', 'x'), `#!/bin/sh\ncat '${s.tok}/token' > '${leak}' 2>&1\n`); chmodSync(join(app, 'MacOS', 'x'), 0o755)
-  const label = `test.hq.evil.${rand()}`
-  try {
-    const hasSwift = spawnSync('/usr/bin/xcrun', ['--find', 'swiftc'], { stdio: 'ignore' }).status === 0
-    if (!hasSwift) t.diagnostic('swiftc 없음: NSWorkspace 공격은 건너뜀 (Xcode 명령행 도구 필요)')
-    else {
-      writeFileSync(join(evil, 'l.swift'), 'import AppKit\nlet c = NSWorkspace.OpenConfiguration(); c.activates = false\nlet s = DispatchSemaphore(value: 0)\n'
-        + 'NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: CommandLine.arguments[1]), configuration: c) { app, err in print(app == nil ? "LAUNCH-FAILED" : "LAUNCHED"); s.signal() }\n_ = s.wait(timeout: .now() + 15)\n')
-      // Compiled outside the sandbox so the attack binary certainly runs; only the launch happens inside.
-      execFileSync('/usr/bin/xcrun', ['swiftc', '-o', join(evil, 'launcher'), join(evil, 'l.swift')], { stdio: 'ignore', timeout: 120_000 })
-      const r = await s.run(`'${join(evil, 'launcher')}' '${join(evil, 'Evil.app')}'`, 30_000)
-      assert.doesNotMatch(r.outputTail, /LAUNCHED/, 'LaunchServices must refuse the launch')
-      assert.match(r.outputTail, /LAUNCH-FAILED/, `the attack binary ran and was refused: ${r.outputTail}`)
-    }
-    for (const [src, name] of [['/usr/bin/open', 'op'], ['/bin/launchctl', 'lc']]) execFileSync('/bin/cp', [src, join(evil, name)])
-    execFileSync('/usr/bin/codesign', ['-s', '-', '-f', join(evil, 'lc')], { stdio: 'ignore' })
-    assert.equal((await s.run(`'${join(evil, 'op')}' -a '${join(evil, 'Evil.app')}'`)).pass, false, 'copied open')
-    assert.equal((await s.run(`/usr/bin/open -a '${join(evil, 'Evil.app')}'`)).pass, false, '/usr/bin/open')
-    assert.equal((await s.run(`'${join(evil, 'lc')}' submit -l ${label} -- /bin/sh -c "cat '${s.tok}/token' > '${leak}'"`)).pass, false, 'ad-hoc signed launchctl submit')
-    assert.equal((await s.run(`/usr/bin/defaults write com.apple.hq-test-${rand()} x 1`)).pass, false, 'defaults write (cfprefsd)')
-    await new Promise((r) => setTimeout(r, 3_000))
-    assert.equal(existsSync(leak), false, 'no process outside the sandbox read the token')
-  } finally {
-    spawnSync('/bin/launchctl', ['remove', label], { stdio: 'ignore' })
-    s.server.close()
-  }
+  try { await launchServicesAttack(t, s.dir, s.tok, s.run) } finally { s.server.close() }
 })
 
 test('positive: git commit in own clone, npm ci (per-run cache), node --test with child processes, mirror objects readable', { skip }, async () => {
@@ -215,6 +187,20 @@ test('fake home: ~/.claude control files and ~/.claude.json are not writable or 
   assert.equal((await run(`cat '${join(home, '.ssh/id_ed25519')}'`)).pass, false, '~/.ssh unreadable')
   assert.equal((await run(`cat '${join(home, '.zshrc')}'`)).pass, false, 'shell rc unreadable')
   assert.equal((await run('/usr/bin/osascript -e "return 1"')).pass, false, 'osascript denied')
+})
+
+test('worker profile text is byte-identical to the v4 snapshot (shared rule pieces did not change it)', () => {
+  // Fixed, non-existent paths (real() leaves them as they are); the machine's own temp folder becomes <USER_TEMP>.
+  const R = '/nonexistent-hq-snap'
+  const inputs: SandboxOpts[] = [
+    { worktree: `${R}/hq/work/req-1/A`, out: `${R}/hq/runs/req-1/A/a1/out`, hqHome: `${R}/hq`, tokenDir: `${R}/cfg/hq`, hqPort: 7777, extraWritable: [`${R}/extra`],
+      projects: [`${R}/home/proj`], mirror: `${R}/hq/repos/p.git`, readable: [`${R}/bin`], home: `${R}/home` },
+    { worktree: `${R}/hq/verify/${'x'.repeat(220)}`, out: null, hqHome: `${R}/hq`, tokenDir: `${R}/cfg/hq`, hqPort: 1234, extraWritable: [], projects: [], home: `${R}/home` },
+  ]
+  const userTemp = tempRoots().filter((p) => p !== '/private/tmp')
+  const got = inputs.map((o) => userTemp.reduce((text, p) => text.split(p).join('<USER_TEMP>'), sandboxProfile(o)))
+  const want = JSON.parse(readFileSync(new URL('./fixtures/worker-profile.snap.json', import.meta.url), 'utf8')) as string[]
+  assert.deepEqual(got, want)
 })
 
 test('claudeProjectDir matches the CLI folder naming (measured on 2.1.285)', () => {

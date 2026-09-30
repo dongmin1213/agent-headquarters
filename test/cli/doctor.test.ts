@@ -214,3 +214,19 @@ test('tracked secret-like files in a registered project → warn (read-only git 
   const clean = await runDoctor(healthy(), probes({ run: async (cmd, args) => cmd.endsWith('git') && args.includes('ls-files') ? { code: 0, stdout: 'src/a.ts\0', stderr: '' } : base.run(cmd, args) }))
   assert.equal(clean.find((c) => c.id.startsWith('project-secrets:')), undefined)
 })
+
+test('team with sandbox "none" → warn with the opt-out text and fix; sandboxed teams add no check', async () => {
+  const ctx = healthy()
+  writeFileSync(join(ctx.root, 'config/teams.json'), JSON.stringify([
+    { id: 'revenue', name: '수익자동화', pack: 'digimon', command: ['x'], cwd: '.', everyMinutes: 30, enabled: true, sandbox: 'none' },
+    { id: 'smoke', name: '시험 팀', pack: 'digimon', command: ['x'], cwd: '.', everyMinutes: 60, enabled: true, sandbox: { readable: ['~/x'] } },
+  ]))
+  const code = await doctorCommand(ctx, { json: false, probes: probes() })
+  assert.equal(code, 6, ctx.text())
+  assert.match(ctx.text(), /\[경고\] 팀 수익자동화: 샌드박스 없이 실행돼요 \(config\/teams\.json sandbox: "none"\)/)
+  assert.match(ctx.text(), /해결: config\/teams\.json에서 이 팀의 "sandbox": "none"을 지우면/)
+  assert.doesNotMatch(ctx.text(), /팀 시험 팀/)
+  // No teams.json → the committed example (no opt-out) is used: nothing to warn about.
+  const clean = healthy()
+  assert.equal(await doctorCommand(clean, { json: false, probes: probes() }), 0, clean.text())
+})
