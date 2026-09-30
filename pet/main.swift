@@ -149,87 +149,97 @@ func charSpec(model: String) -> CharSpec {
     override func mouseUp(with e: NSEvent) { DragImageView.dragging = false; if moved > 3 { onDrop?() } else { onClick?() } }
 }
 
-enum Mood: Equatable { case idle, busy, attention, sleeping, error }
+enum Mood: Equatable { case idle, busy, attention, sleeping, blocked, error }
 /// Everything that decides how a character looks; views are touched only when this changes.
 struct Look: Equatable {
-    var bubble = ""
+    var bubble = ""               // empty = no bubble
     var mood = Mood.idle
     var badge: String? = nil      // top-right (red count, or "zz")
-    var tag: String? = nil        // top-left ("검토")
     var hop = false
-    var bubbleMax: CGFloat = 200
+    var plate = ""                // name plate under the character
+}
+
+/// "<prefix> · <title> · <suffix>" cut to `limit` characters by shortening the title first.
+func plateText(_ prefix: String, _ title: String, _ suffix: String, limit: Int = 34) -> String {
+    let room = limit - prefix.count - suffix.count - 6
+    let t = title.count <= room ? title : String(title.prefix(max(room - 1, 3))) + "…"
+    let s = "\(prefix) · \(t) · \(suffix)"
+    return s.count <= limit ? s : String(s.prefix(limit - 1)) + "…"
 }
 
 @MainActor final class Critter {
     enum Kind { case ceo, team, worker }
     let id: String
     let kind: Kind
-    let posKey: String
     let view = DragImageView()
     let bubble = NSTextField(labelWithString: "")
     let badge = NSTextField(labelWithString: "")
-    let tag = NSTextField(labelWithString: "")
-    var x: CGFloat
-    var y: CGFloat
+    let plate = NSTextField(labelWithString: "")
+    var x: CGFloat = 0
+    var y: CGFloat = 0
+    /// Row slot key; a dragged character remembers its position under this key.
+    private(set) var posKey = ""
+    private(set) var saved: NSPoint?
+    var dragging = false
     var bubbleLift: CGFloat = 0
+    var slotWidth: CGFloat = 120
     var look = Look()
     var hovered = false { didSet { if hovered != oldValue { updateAnimates() } } }
     var worker: WorkerView?
     var team: TeamView?
-    var slot = -1
     let size: CGFloat = 40
 
-    init(id: String, kind: Kind, posKey: String, image: NSImage, in content: NSView, defaultPos: NSPoint) {
-        self.id = id; self.kind = kind; self.posKey = posKey
-        let saved = defaults.array(forKey: posKey) as? [Double]
-        let b = content.bounds
-        x = min(max(0, saved.map { CGFloat($0[0]) } ?? defaultPos.x), b.width - size)
-        y = min(max(0, saved.map { CGFloat($0[1]) } ?? defaultPos.y), b.height - size - 24)
+    init(id: String, kind: Kind, image: NSImage, in content: NSView) {
+        self.id = id; self.kind = kind
         view.image = image
         view.imageScaling = .scaleProportionallyUpOrDown
         view.animates = false
         view.wantsLayer = true
         view.layer?.magnificationFilter = .nearest
-        for (f, pt) in [(bubble, 10.0), (badge, 9.0), (tag, 8.5)] {
-            f.font = .systemFont(ofSize: pt, weight: f === bubble ? .medium : .bold)
-            f.wantsLayer = true; f.layer?.cornerRadius = 6
+        for (f, pt) in [(bubble, 10.0), (badge, 9.0), (plate, 10.0)] {
+            f.font = .systemFont(ofSize: pt, weight: f === badge ? .bold : .medium)
+            f.wantsLayer = true; f.layer?.cornerRadius = f === plate ? 5 : 6
             f.drawsBackground = true; f.alignment = .center
             f.maximumNumberOfLines = 1; f.lineBreakMode = .byTruncatingTail
         }
-        badge.isHidden = true; tag.isHidden = true
-        content.addSubview(view); content.addSubview(bubble); content.addSubview(badge); content.addSubview(tag)
+        plate.backgroundColor = NSColor.black.withAlphaComponent(0.72); plate.textColor = .white
+        badge.isHidden = true; bubble.isHidden = true
+        content.addSubview(view); content.addSubview(bubble); content.addSubview(badge); content.addSubview(plate)
     }
 
+    func setPosKey(_ k: String) {
+        guard k != posKey else { return }
+        posKey = k
+        saved = (defaults.array(forKey: k) as? [Double]).flatMap { $0.count == 2 ? NSPoint(x: $0[0], y: $0[1]) : nil }
+    }
+    func forgetPosition() { posKey = ""; saved = nil }
     func move(dx: CGFloat, dy: CGFloat, bounds: NSRect) {
         x = min(max(0, x + dx), bounds.width - size)
-        y = min(max(0, y + dy), bounds.height - size - 24)
+        y = min(max(18, y + dy), bounds.height - size - 24)
     }
-    func savePosition() { defaults.set([Double(x), Double(y)], forKey: posKey) }
+    func savePosition() { saved = NSPoint(x: x, y: y); defaults.set([Double(x), Double(y)], forKey: posKey) }
 
     func set(_ l: Look) {
         guard l != look else { return }
         let old = look; look = l
-        if l.bubble != old.bubble { bubble.stringValue = l.bubble; view.toolTip = l.bubble }
+        if l.bubble != old.bubble { bubble.stringValue = l.bubble; bubble.isHidden = l.bubble.isEmpty }
+        if l.plate != old.plate { plate.stringValue = l.plate; view.toolTip = l.plate }
         if l.mood != old.mood || l.bubble != old.bubble {
             let (bg, fg): (NSColor, NSColor) = switch l.mood {
                 case .error: (.systemRed, .white)
                 case .attention: (.systemYellow, .black)
                 case .sleeping: (.systemGray, .white)
+                case .blocked: (.systemOrange, .white)
                 default: (NSColor.windowBackgroundColor.withAlphaComponent(0.92), .labelColor)
             }
             bubble.backgroundColor = bg; bubble.textColor = fg
-            view.alphaValue = l.mood == .sleeping ? 0.5 : 1
+            view.alphaValue = l.mood == .sleeping ? 0.5 : (l.mood == .blocked ? 0.75 : 1)
         }
         if l.badge != old.badge {
             badge.isHidden = l.badge == nil
             badge.stringValue = l.badge ?? ""
-            let zz = l.badge == "zz"
-            badge.backgroundColor = zz ? NSColor.systemGray.withAlphaComponent(0.85) : .systemRed
+            badge.backgroundColor = l.badge == "zz" ? NSColor.systemGray.withAlphaComponent(0.85) : .systemRed
             badge.textColor = .white
-        }
-        if l.tag != old.tag {
-            tag.isHidden = l.tag == nil; tag.stringValue = l.tag ?? ""
-            tag.backgroundColor = .systemIndigo; tag.textColor = .white
         }
         if l.hop != old.hop { setHop(l.hop) }
         updateAnimates()
@@ -237,7 +247,7 @@ struct Look: Equatable {
 
     /// Only busy characters play their GIF: motion itself means "working", and still ones cost no CPU.
     func updateAnimates() {
-        let a = look.mood == .busy || look.mood == .attention || (hovered && look.mood != .sleeping)
+        let a = look.mood == .busy || look.mood == .attention || (hovered && look.mood != .sleeping && look.mood != .blocked)
         if view.animates != a { view.animates = a }
     }
 
@@ -253,31 +263,30 @@ struct Look: Equatable {
         layer.add(a, forKey: "hop")
     }
 
-    func bubbleWidth() -> CGFloat { min(bubble.fittingSize.width + 12, look.bubbleMax) }
-    func baseBubbleFrame() -> NSRect {
-        let bw = bubbleWidth()
-        return NSRect(x: max(0, x + size / 2 - bw / 2), y: y + size + 4, width: bw, height: 16)
+    func naturalPlateWidth() -> CGFloat { plate.fittingSize.width + 12 }
+    private func centered(_ w: CGFloat, _ bounds: NSRect) -> CGFloat { min(max(0, x + size / 2 - w / 2), bounds.width - w) }
+    func bubbleFrame(_ bounds: NSRect) -> NSRect {
+        let w = min(bubble.fittingSize.width + 12, slotWidth)
+        return NSRect(x: centered(w, bounds), y: y + size + 6, width: w, height: 16)
     }
 
-    func layout() {
+    func layout(_ bounds: NSRect) {
         let f = NSRect(x: x, y: y, width: size, height: size)
         if view.frame != f { view.frame = f; if look.hop { setHop(true) } }
-        var bf = baseBubbleFrame(); bf.origin.y += bubbleLift
+        var bf = bubbleFrame(bounds); bf.origin.y += bubbleLift
         if bubble.frame != bf { bubble.frame = bf }
+        let pw = min(naturalPlateWidth(), slotWidth)
+        let pf = NSRect(x: centered(pw, bounds), y: y - 18, width: pw, height: 15)
+        if plate.frame != pf { plate.frame = pf }
         if !badge.isHidden {
             let w = max(16, badge.fittingSize.width + 8)
-            let r = NSRect(x: x + size - w / 2 - 2, y: y + size - 10, width: w, height: 14)
+            let r = NSRect(x: x + size - w / 2 - 2, y: y + size - 14, width: w, height: 14)
             if badge.frame != r { badge.frame = r }
-        }
-        if !tag.isHidden {
-            let w = tag.fittingSize.width + 8
-            let r = NSRect(x: x - 4, y: y - 2, width: w, height: 13)
-            if tag.frame != r { tag.frame = r }
         }
     }
 
-    var hitRect: NSRect { view.frame.union(bubble.frame) }
-    func remove() { view.removeFromSuperview(); bubble.removeFromSuperview(); badge.removeFromSuperview(); tag.removeFromSuperview() }
+    var hitRect: NSRect { (bubble.isHidden ? view.frame : view.frame.union(bubble.frame)).union(plate.frame) }
+    func remove() { view.removeFromSuperview(); bubble.removeFromSuperview(); badge.removeFromSuperview(); plate.removeFromSuperview() }
 }
 
 func firstLine(_ s: String?, max: Int = 90) -> String {
@@ -293,7 +302,9 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     let panel: NSPanel
     var critters: [String: Critter] = [:]
     var lastActive: [String: Date] = [:]
-    var slots: [String: Int] = [:]          // attemptId → slot index (positions are remembered per slot)
+    var workerOrder: [String] = []
+    var teamOrder: [String] = []
+    var rowSnapped = false
     var snapshot: Snapshot?
     var lastData: Data?
     var offline = false
@@ -395,51 +406,43 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         let items = offline ? [] : (s.decisions ?? [])
         let needsYou = offline ? 0 : (s.decisions?.count ?? s.headline?.needsYou ?? 0)
 
-        // CEO
+        // CEO: bubble = "확인해 주세요 (N)" while decisions wait, else the headline, else none (§19).
         let active = reqs.first { ["thinking", "asking", "planned", "queued", "executing"].contains($0.status) } ?? reqs.first
-        var ceoLook = Look(bubbleMax: 280)
+        var ceoLook = Look(plate: "사장 · 구독 기본 모델")
         if offline { ceoLook.bubble = "hq 꺼짐"; ceoLook.mood = .sleeping }
         else {
-            if let h = s.headline, !h.text.isEmpty { ceoLook.bubble = h.text }
-            else {
-                ceoLook.bubble = switch active?.status {
-                    case "thinking": "검토 중"; case "queued": "대기열"; case "asking": "질문 있어요"; case "planned": "계획 승인 요청"
-                    case "failed": "실패: \(active?.note ?? "")"; case "approved": "계획 승인됨"; case "rejected": "계획 반려됨"
-                    default: "요청하려면 클릭" }
-            }
+            ceoLook.bubble = needsYou > 0 ? "확인해 주세요 (\(needsYou))" : (s.headline?.text ?? "")
             let working = ["thinking", "queued"].contains(active?.status ?? "")
-            ceoLook.mood = needsYou > 0 ? .attention : (working ? .busy : (active?.status == "failed" && s.headline == nil ? .error : .idle))
+            ceoLook.mood = needsYou > 0 ? .attention : (working ? .busy : .idle)
             ceoLook.badge = needsYou > 0 ? "\(needsYou)" : nil
             ceoLook.hop = needsYou > 0
         }
         let ceo = critters["ceo"] ?? {
-            let c = Critter(id: "ceo", kind: .ceo, posKey: "pos.ceo", image: Sprites.character(characters["ceo"]!), in: content, defaultPos: NSPoint(x: 40, y: 4))
+            let c = Critter(id: "ceo", kind: .ceo, image: Sprites.character(characters["ceo"]!), in: content)
             wire(c); critters["ceo"] = c; return c
         }()
         ceo.set(ceoLook)
 
-        // Workers: one per live attempt, in a row next to the CEO. Slots are reused so remembered positions stick.
+        // Workers: one per live attempt, in the daemon's order.
         let workers = offline ? [] : (s.workers ?? [])
-        let live = Set(workers.map { "w:" + $0.attemptId })
-        for (id, c) in critters where c.kind == .worker && !live.contains(id) {
-            c.remove(); critters[id] = nil; slots[String(id.dropFirst(2))] = nil
-        }
+        workerOrder = workers.map { "w:" + $0.attemptId }
+        let live = Set(workerOrder)
+        for (id, c) in critters where c.kind == .worker && !live.contains(id) { c.remove(); critters[id] = nil }
         for w in workers {
             let key = "w:" + w.attemptId
-            let c: Critter
-            if let e = critters[key] { c = e } else {
-                let used = Set(slots.values)
-                let slot = (0...).first { !used.contains($0) }!
-                slots[w.attemptId] = slot
-                let def = NSPoint(x: ceo.x + 110 * CGFloat(slot + 1), y: ceo.y)
-                c = Critter(id: key, kind: .worker, posKey: "pos.worker.\(slot)", image: Sprites.character(charSpec(model: w.model)), in: content, defaultPos: def)
-                c.slot = slot
-                wire(c); critters[key] = c
-            }
+            let c = critters[key] ?? {
+                let c = Critter(id: key, kind: .worker, image: Sprites.character(charSpec(model: w.model)), in: content)
+                wire(c); critters[key] = c; return c
+            }()
             c.worker = w
-            var l = Look(bubble: w.bubble.isEmpty ? w.title : w.bubble, bubbleMax: 150)
-            if w.state == "held" { l.mood = .sleeping; l.badge = "zz" } else { l.mood = .busy }
-            if w.kind == "review" { l.tag = "검토" }
+            var l = Look(bubble: w.bubble, mood: .busy)
+            l.plate = switch w.kind {
+                case "review": plateText("검토", w.title, w.model)
+                case "verify": plateText("기계 검증", w.title, "hq")
+                default: plateText(w.project, w.title, w.model)
+            }
+            if w.state == "held" { l.mood = .sleeping; l.badge = "zz" }
+            if w.state == "blocked" { l.mood = .blocked; l.bubble = "멈춤 · 사장에게 보고" }
             c.set(l)
         }
 
@@ -448,25 +451,30 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         let now = Date()
         for t in s.teams where t.state != "idle" { lastActive[t.id] = now }
         let teams = s.teams.filter { showIdle || $0.state != "idle" || now.timeIntervalSince(lastActive[$0.id] ?? .distantPast) < 300 }
-        let teamIds = Set(teams.map { "t:" + $0.id })
+        teamOrder = teams.map { "t:" + $0.id }
+        let teamIds = Set(teamOrder)
         for (id, c) in critters where c.kind == .team && !teamIds.contains(id) { c.remove(); critters[id] = nil }
-        for (i, t) in teams.enumerated() {
+        for t in teams {
             let key = "t:" + t.id
             let c = critters[key] ?? {
-                let c = Critter(id: key, kind: .team, posKey: "pos." + t.id, image: Sprites.team(t), in: content,
-                                defaultPos: NSPoint(x: 40 + (panel.frame.width - 120) * CGFloat(i + 1) / CGFloat(teams.count + 1), y: 4))
+                let c = Critter(id: key, kind: .team, image: Sprites.team(t), in: content)
                 wire(c); critters[key] = c; return c
             }()
             c.team = t
             let icon: String = ["waiting": "✋ ", "sleeping": "💤 ", "error": "⚠️ "][t.state] ?? ""
             let mood: Mood = ["working": .busy, "waiting": .attention, "sleeping": .sleeping, "error": .error][t.state] ?? .idle
-            c.set(Look(bubble: "\(icon)\(t.name) · \(t.bubble)", mood: mood, hop: t.state == "waiting"))
+            c.set(Look(bubble: "\(icon)\(t.bubble)", mood: mood, hop: t.state == "waiting", plate: String(t.name.prefix(34))))
         }
 
         layoutAll()
         trackMouse()
         updateStatus(s, needsYou: needsYou)
         notifyNew(items)
+        // Test hook: HQ_ROW_SNAPSHOT=<png> renders the character row offscreen once (works with the display asleep).
+        if let path = env["HQ_ROW_SNAPSHOT"], !rowSnapped {
+            rowSnapped = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.snapshotRow(path) }
+        }
         // Test hook: HQ_OPEN=ceo|worker opens that popover once after the first snapshot (screenshots without clicking).
         if let which = env["HQ_OPEN"], !openedForTest {
             openedForTest = true
@@ -490,22 +498,72 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         c.view.onClick = { [weak self, weak c] in if let c { self?.showDetail(for: c) } }
         c.view.onDrag = { [weak self, weak c] dx, dy in
             guard let self, let c else { return }
-            self.popover?.close(); c.move(dx: dx, dy: dy, bounds: self.panel.contentView!.bounds); self.layoutAll()
+            self.popover?.close(); c.dragging = true
+            c.move(dx: dx, dy: dy, bounds: self.panel.contentView!.bounds); self.layoutAll()
         }
-        c.view.onDrop = { [weak c] in c?.savePosition() }
+        c.view.onDrop = { [weak c] in c?.dragging = false; c?.savePosition() }
         c.bubble.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(clicked(_:))))
     }
 
-    /// Places everything; a bubble that would overlap an earlier one is lifted a row.
+    /// CEO leftmost, then workers in the daemon's order, then teams.
+    func rowOrder() -> [Critter] {
+        ([critters["ceo"]] + workerOrder.map { critters[$0] } + teamOrder.map { critters[$0] }).compactMap { $0 }
+    }
+
+    /// One row just above the Dock (the panel is the screen's visible frame, so y≈0 is the Dock's top edge).
+    /// Each slot is as wide as its name plate (min 120pt), with an even gap between slots; if the row is wider
+    /// than the screen every slot shrinks and plates truncate. A dragged character keeps its remembered spot.
     func layoutAll() {
-        var placed: [NSRect] = []
-        for c in critters.values.sorted(by: { ($0.kind == .ceo ? 0 : 1, $0.x) < ($1.kind == .ceo ? 0 : 1, $1.x) }) {
-            var r = c.baseBubbleFrame(); var lift: CGFloat = 0
-            while placed.contains(where: { $0.insetBy(dx: -2, dy: 0).intersects(r) }) && lift < 100 { r.origin.y += 19; lift += 19 }
-            placed.append(r)
-            c.bubbleLift = lift
-            c.layout()
+        let bounds = panel.contentView!.bounds
+        let row = rowOrder()
+        let margin: CGFloat = 16, gap: CGFloat = 10, rowY: CGFloat = 22
+        var widths = row.map { max($0.naturalPlateWidth(), 120) }
+        let total = widths.reduce(0, +) + gap * CGFloat(max(row.count - 1, 0))
+        let avail = bounds.width - 2 * margin
+        if total > avail { let k = (avail - gap * CGFloat(max(row.count - 1, 0))) / (total - gap * CGFloat(max(row.count - 1, 0))); widths = widths.map { $0 * k } }
+        var left = margin
+        for (i, c) in row.enumerated() {
+            c.slotWidth = widths[i]
+            let key: String = switch c.kind { case .ceo: "row.ceo"; case .worker: "row.\(i)"; case .team: "row." + c.id }
+            c.setPosKey(key)
+            if !c.dragging {
+                if let p = c.saved {
+                    c.x = min(max(0, p.x), bounds.width - c.size); c.y = min(max(18, p.y), bounds.height - c.size - 24)
+                } else {
+                    c.x = left + widths[i] / 2 - c.size / 2; c.y = rowY
+                }
+            }
+            left += widths[i] + gap
         }
+        // Bubbles that would overlap an earlier one (only possible after dragging) are lifted a row.
+        var placed: [NSRect] = []
+        for c in row {
+            var lift: CGFloat = 0
+            if !c.bubble.isHidden {
+                var r = c.bubbleFrame(bounds)
+                while placed.contains(where: { $0.insetBy(dx: -2, dy: 0).intersects(r) }) && lift < 100 { r.origin.y += 19; lift += 19 }
+                placed.append(r)
+            }
+            c.bubbleLift = lift
+            c.layout(bounds)
+        }
+    }
+
+    func snapshotRow(_ path: String) {
+        guard let v = panel.contentView else { return }
+        let rect = NSRect(x: 0, y: 0, width: v.bounds.width, height: 170)
+        guard let rep = v.bitmapImageRepForCachingDisplay(in: rect) else { return }
+        v.cacheDisplay(in: rect, to: rep)
+        let out = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: rep.pixelsWide, pixelsHigh: rep.pixelsHigh, bitsPerSample: 8, samplesPerPixel: 4,
+                                   hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        out.size = rect.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: out)
+        NSColor(calibratedRed: 0.42, green: 0.5, blue: 0.6, alpha: 1).setFill(); NSRect(origin: .zero, size: rect.size).fill()
+        rep.draw(in: NSRect(origin: .zero, size: rect.size), from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: false, hints: nil)
+        NSGraphicsContext.restoreGraphicsState()
+        try? out.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+        log("row snapshot → \(path)")
     }
 
     // MARK: menu bar
@@ -885,11 +943,10 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         }
     }
 
+    /// Back to the row: forget every dragged position.
     @objc func resetPositions() {
-        for k in defaults.dictionaryRepresentation().keys where k.hasPrefix("pos.") { defaults.removeObject(forKey: k) }
-        let w = panel.frame.width
-        let ordered = critters.values.sorted { ($0.kind == .ceo ? -1 : $0.slot, $0.id) < ($1.kind == .ceo ? -1 : $1.slot, $1.id) }
-        for (i, c) in ordered.enumerated() { c.x = min(40 + CGFloat(i) * 110, w - 60); c.y = 4 }
+        for k in defaults.dictionaryRepresentation().keys where k.hasPrefix("pos.") || k.hasPrefix("row.") { defaults.removeObject(forKey: k) }
+        for c in critters.values { c.forgetPosition() }
         layoutAll()
     }
 

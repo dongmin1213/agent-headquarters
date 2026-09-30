@@ -43,7 +43,7 @@ const decisions: DecisionItem[] = [
 const snapshot: Snapshot = {
   updatedAt: iso(0),
   lastEventId: 1,
-  teams: [],
+  teams: [{ id: 'revenue', name: '수익 자동화', pack: 'digimon', state: 'working', bubble: '상품 목록 갱신 중', lastRun: null, nextRunAt: null }],
   projects: [{ id: 'hq', name: 'agent-headquarters' }, { id: 'blog', name: 'blog' }],
   limit: { blockedUntil: null },
   decisions,
@@ -64,6 +64,8 @@ const snapshot: Snapshot = {
       kind: 'work', state: 'held', bubble: '한도 보류 — 15:00까지', startedAt: iso(-20 * 60_000) },
     { attemptId: 'req-search01.cache~a1', taskId: 'req-search01.cache', requestId: 'req-search01', title: '캐시 계층', project: 'hq', role: 'build', model: 'hq',
       kind: 'verify', state: 'verifying', bubble: '검사 2/3: npm test', startedAt: iso(-60_000) },
+    { attemptId: 'req-search01.perf~a3', taskId: 'req-search01.perf', requestId: 'req-search01', title: '성능 측정 벤치마크 스크립트와 기준선 기록', project: 'hq', role: 'build', model: 'opus',
+      kind: 'work', state: 'blocked', bubble: '벤치마크 시간 초과', startedAt: iso(-40 * 60_000) },
   ],
   requests: [
     request({ id: 'req-a1b2c3d4', text: '로그인 화면 다듬기', status: 'planned', updatedAt: iso(-60_000),
