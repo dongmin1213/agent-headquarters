@@ -153,7 +153,7 @@ export interface DecisionItem {
   taskId: string | null
   title: string
   detail: string
-  /** Button labels; answers/decisions go to the endpoint for this kind (execution.md §15). */
+  /** Exact values to send (approval option, answer choice, or retry|skip|stop for blocked); see execution.md §17. */
   options: string[]
   /** For approval-backed kinds. */
   subjectHash: string | null
