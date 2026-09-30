@@ -1,66 +1,72 @@
-// Subscription quota tracking from stream-json `rate_limit_event` lines (docs/design/execution.md §10).
+// Subscription quota from stream-json `rate_limit_event` lines, one row per window (execution.md §13).
+// The quota table is the only source of truth for holding new starts (workers, reviewers, CEO turns, teams).
 import type { HqConfig } from '../config.ts'
-import type { QuotaRow } from '../store.ts'
+import type { QuotaRow, Store } from '../store.ts'
 import type { QuotaView } from '../types.ts'
 
-export type QuotaMode = 'normal' | 'save' | 'review_only' | 'hold'
+export type QuotaMode = 'normal' | 'save' | 'hold' | 'unobserved'
 export interface QuotaState {
   mode: QuotaMode
-  /** When a hold ends (ISO), if holding. */
+  /** Hold end (ISO): the latest reset among blocking windows. */
   until: string | null
-  /** Window that decided the mode (five_hour | seven_day | limit). */
+  /** Window that decided the mode. */
   window: string | null
-  /** Utilization (0..1) of that window. */
   pct: number | null
-  /** False until the first rate_limit_event was seen. */
-  observed: boolean
 }
 
 const HOLD_FALLBACK_MS = 60 * 60_000
 const iso = (sec: unknown) => (typeof sec === 'number' && Number.isFinite(sec) ? new Date(sec * 1000).toISOString() : null)
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 
-/** Converts one rate_limit_event line into a quota row; null if the line is not one. */
-export function quotaFromEvent(line: Record<string, unknown>, prev: QuotaRow | null, now = new Date()): QuotaRow | null {
-  if (line.type !== 'rate_limit_event') return null
+/** Window rows carried by one rate_limit_event line (empty if the line is not one). */
+export function quotaFromEvent(line: Record<string, unknown>, now: number): QuotaRow[] {
+  if (line.type !== 'rate_limit_event') return []
   const info = line.rate_limit_info as Record<string, unknown> | undefined
-  if (!info || typeof info !== 'object') return null
-  const w = (info.unifiedWindows ?? {}) as Record<string, Record<string, unknown> | undefined>
-  const row: QuotaRow = {
-    five_hour: num(w.five_hour?.utilization) ?? prev?.five_hour ?? null,
-    seven_day: num(w.seven_day?.utilization) ?? prev?.seven_day ?? null,
-    five_hour_resets_at: iso(w.five_hour?.resetsAt) ?? prev?.five_hour_resets_at ?? null,
-    seven_day_resets_at: iso(w.seven_day?.resetsAt) ?? prev?.seven_day_resets_at ?? null,
-    status: typeof info.status === 'string' ? info.status : null,
-    observed_at: now.toISOString(),
-  }
-  // A rejection names its window; make sure that window's reset time is known even without unifiedWindows.
-  if (row.status === 'rejected') {
-    const reset = iso(info.resetsAt)
-    if (info.rateLimitType === 'seven_day' && reset && !w.seven_day) { row.seven_day_resets_at = reset; row.seven_day = Math.max(row.seven_day ?? 0, 1) }
-    else if (reset && !w.five_hour) { row.five_hour_resets_at = reset; row.five_hour = Math.max(row.five_hour ?? 0, 1) }
-  }
-  return row
+  if (!info || typeof info !== 'object') return []
+  const at = new Date(now).toISOString()
+  const named = typeof info.rateLimitType === 'string' ? info.rateLimitType : null
+  const status = typeof info.status === 'string' ? info.status : null
+  const wins = (info.unifiedWindows && typeof info.unifiedWindows === 'object' ? info.unifiedWindows : {}) as Record<string, Record<string, unknown> | undefined>
+  const rows: QuotaRow[] = Object.entries(wins).filter(([, w]) => w && typeof w === 'object').map(([name, w]) => ({
+    window: name, utilization: num(w!.utilization), resets_at: iso(w!.resetsAt) ?? (name === named ? iso(info.resetsAt) : null),
+    status: name === named ? status : null, observed_at: at,
+  }))
+  const target = named ?? (status === 'rejected' ? 'unknown' : null)
+  if (target && !rows.some((r) => r.window === target)) rows.push({ window: target, utilization: null, resets_at: iso(info.resetsAt), status, observed_at: at })
+  return rows
 }
 
-export function quotaState(q: QuotaRow | null, limits: HqConfig['quota'], blockedUntil: string | null, now = Date.now()): QuotaState {
-  if (blockedUntil && Date.parse(blockedUntil) > now) return { mode: 'hold', until: blockedUntil, window: 'limit', pct: null, observed: q !== null }
-  if (!q) return { mode: 'normal', until: null, window: null, pct: null, observed: false }
-  // A window whose reset time has passed no longer says anything about the present.
-  const wins = [['five_hour', q.five_hour, q.five_hour_resets_at], ['seven_day', q.seven_day, q.seven_day_resets_at]] as const
-  const live = wins.filter(([, u, r]) => u !== null && !(r && Date.parse(r) <= now)).map(([name, u, r]) => ({ name, u: u as number, r }))
-  const top = live.sort((a, b) => b.u - a.u)[0]
-  if (!top) return { mode: 'normal', until: null, window: null, pct: null, observed: true }
-  const mode: QuotaMode = q.status === 'rejected' || top.u >= limits.holdAt ? 'hold' : top.u >= limits.reviewOnlyAt ? 'review_only' : top.u >= limits.saveAt ? 'save' : 'normal'
-  if (mode !== 'hold') return { mode, until: null, window: top.name, pct: top.u, observed: true }
-  // Without a known reset time, hold for an hour from the observation and then look again.
-  const until = top.r ?? new Date(Date.parse(q.observed_at ?? new Date(now).toISOString()) + HOLD_FALLBACK_MS).toISOString()
-  if (Date.parse(until) <= now) return { mode: 'normal', until: null, window: top.name, pct: top.u, observed: true }
-  return { mode, until, window: top.name, pct: top.u, observed: true }
+export function recordRateLimit(store: Store, line: Record<string, unknown>, now: number): boolean {
+  const rows = quotaFromEvent(line, now)
+  for (const r of rows) store.setQuotaWindow(r)
+  return rows.length > 0
 }
 
-export function quotaView(q: QuotaRow | null, s: QuotaState): QuotaView | null {
-  if (!q && s.mode === 'normal') return null
-  return { fiveHour: q?.five_hour ?? null, sevenDay: q?.seven_day ?? null, fiveHourResetsAt: q?.five_hour_resets_at ?? null,
-    sevenDayResetsAt: q?.seven_day_resets_at ?? null, mode: s.mode, observedAt: q?.observed_at ?? null }
+/** Windows whose reset time has passed say nothing about the present. */
+const liveRows = (rows: QuotaRow[], now: number) => rows.filter((r) => !(r.resets_at && Date.parse(r.resets_at) <= now))
+
+export function quotaState(rows: QuotaRow[], limits: HqConfig['quota'], now: number): QuotaState {
+  const live = liveRows(rows, now)
+  if (!live.length) return { mode: 'unobserved', until: null, window: null, pct: null }
+  const blocking = live.map((r) => ({ r, until: r.resets_at ?? new Date(Date.parse(r.observed_at) + HOLD_FALLBACK_MS).toISOString() }))
+    .filter(({ r, until }) => (r.status === 'rejected' || (r.utilization ?? 0) >= limits.holdAt) && Date.parse(until) > now)
+  if (blocking.length) {
+    const last = blocking.sort((a, b) => Date.parse(b.until) - Date.parse(a.until))[0]
+    return { mode: 'hold', until: last.until, window: last.r.window, pct: last.r.utilization }
+  }
+  const top = [...live].sort((a, b) => (b.utilization ?? 0) - (a.utilization ?? 0))[0]
+  const mode: QuotaMode = (top.utilization ?? 0) >= limits.saveAt ? 'save' : 'normal'
+  return { mode, until: null, window: top.window, pct: top.utilization }
+}
+
+export function quotaView(rows: QuotaRow[], s: QuotaState, now: number): QuotaView | null {
+  if (!rows.length) return null
+  const live = liveRows(rows, now)
+  const w = (n: string) => live.find((r) => r.window === n)
+  return {
+    windows: live.map((r) => ({ name: r.window, utilization: r.utilization, resetsAt: r.resets_at, status: r.status })),
+    fiveHour: w('five_hour')?.utilization ?? null, sevenDay: w('seven_day')?.utilization ?? null,
+    fiveHourResetsAt: w('five_hour')?.resets_at ?? null, sevenDayResetsAt: w('seven_day')?.resets_at ?? null,
+    mode: s.mode, observedAt: rows.map((r) => r.observed_at).sort().at(-1) ?? null,
+  }
 }

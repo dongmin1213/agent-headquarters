@@ -1,31 +1,27 @@
-// Spawning and supervising detached `claude -p` processes (docs/design/execution.md §5 §10 §12 §13).
-// The process outlives the daemon: stdin is the prompt file, stdout/stderr go straight to evidence files,
-// and hq follows stream.jsonl by offset, so a restart can pick up where it left off.
+// Spawning and supervising detached, sandboxed `claude -p` processes (execution.md §6 §7 §13).
+// The process outlives the daemon: stdin is the prompt file, stdout/stderr go straight to hq/ log files.
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
-import { appendFileSync, closeSync, fstatSync, mkdirSync, openSync, readSync } from 'node:fs'
+import { closeSync, mkdirSync, openSync } from 'node:fs'
 import { join } from 'node:path'
 import type { HqConfig } from '../config.ts'
-import { atomicJson, atomicWrite, readJson, readText } from './fsx.ts'
+import { atomicJson, atomicWrite, readJson } from './fsx.ts'
+import { childEnv, sandboxProfile, wrap, type SandboxOpts } from './sandbox.ts'
 
-export const WORK_TOOLS = ['Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'WebFetch', 'WebSearch']
-export const REVIEW_TOOLS = ['Bash', 'Read', 'Glob', 'Grep']
-
+export type Role = 'implement' | 'collect' | 'review'
 export interface ProcessInfo { pid: number; startedAt: string; sessionId: string; lstart: string | null }
 
-/** Tool lists are passed one argv item per entry: patterns like `Bash(git push:*)` contain spaces. */
-export function workArgs(cfg: HqConfig, o: { model: string; sessionId: string; resume: boolean; role: 'implement' | 'collect'; dir: string }): string[] {
-  const tools = o.role === 'collect' ? ['Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch', `Write(${o.dir}/**)`] : WORK_TOOLS
-  return ['-p', '--output-format', 'stream-json', '--verbose', '--model', cfg.models[o.model as keyof HqConfig['models']] ?? o.model,
-    ...(o.resume ? ['--resume', o.sessionId] : ['--session-id', o.sessionId]),
-    '--permission-mode', 'acceptEdits', '--allowedTools', ...tools, '--disallowedTools', ...cfg.workerDisallowedTools,
-    '--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--add-dir', o.dir, '--max-turns', String(cfg.maxTurns)]
-}
+const modelArg = (cfg: HqConfig, m: string) => cfg.models[m as keyof HqConfig['models']] ?? m
 
-export function reviewArgs(cfg: HqConfig, o: { model: string; sessionId: string; schema: object }): string[] {
-  return ['-p', '--output-format', 'stream-json', '--verbose', '--model', cfg.models[o.model as keyof HqConfig['models']] ?? o.model,
-    '--session-id', o.sessionId, '--json-schema', JSON.stringify(o.schema), '--permission-mode', 'acceptEdits',
-    '--allowedTools', ...REVIEW_TOOLS, '--disallowedTools', 'Edit', 'Write', 'NotebookEdit', ...cfg.workerDisallowedTools,
-    '--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--max-turns', String(cfg.maxTurns)]
+/** §6 argv per role. Tool rule lists are separate argv items (rules like `Bash(git push:*)` contain spaces). */
+export function claudeArgs(cfg: HqConfig, o: { role: Role; model: string; sessionId: string; resume: boolean; out: string | null; schema?: object }): string[] {
+  const base = ['-p', '--output-format', 'stream-json', '--verbose', '--model', modelArg(cfg, o.model),
+    ...(o.resume ? ['--resume', o.sessionId] : ['--session-id', o.sessionId]), '--max-turns', String(cfg.maxTurns)]
+  const guard = ['--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--disallowedTools', ...cfg.workerDisallowedTools]
+  if (o.role === 'implement') return [...base, '--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch', '--permission-mode', 'acceptEdits', '--add-dir', o.out!, ...guard]
+  if (o.role === 'collect') return [...base, '--tools', 'Read,Glob,Grep,WebFetch,WebSearch,Write', '--permission-mode', 'dontAsk',
+    '--allowedTools', 'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch', `Write(/${o.out}/**)`, ...guard]
+  return [...base, '--tools', 'Bash,Read,Glob,Grep', '--permission-mode', 'dontAsk', '--allowedTools', 'Bash', 'Read', 'Glob', 'Grep',
+    '--json-schema', JSON.stringify(o.schema), ...guard]
 }
 
 export function psLstart(pid: number): Promise<string | null> {
@@ -37,165 +33,63 @@ export function pidAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM' }
 }
 
-/** Alive and the same process we started (pid reuse is ruled out by the start time). */
-export async function sameProcessAlive(p: ProcessInfo): Promise<boolean> {
-  if (!pidAlive(p.pid)) return false
-  const now = await psLstart(p.pid)
+/** Alive and the same process we started: pid reuse is ruled out by the recorded start time. */
+export async function sameProcessAlive(pid: number, lstart: string | null, startedAt: string | null): Promise<boolean> {
+  if (!pidAlive(pid)) return false
+  const now = await psLstart(pid)
   if (!now) return false
-  if (p.lstart) return now === p.lstart
-  return Math.abs(Date.parse(now) - Date.parse(p.startedAt)) <= 2_000
+  if (lstart) return now === lstart
+  return !!startedAt && Math.abs(Date.parse(now) - Date.parse(startedAt)) <= 2_000
 }
 
 export function killGroup(pid: number, sig: NodeJS.Signals): void {
   try { process.kill(-pid, sig) } catch { try { process.kill(pid, sig) } catch { /* gone */ } }
 }
 
+/** SIGTERM the whole process group now and SIGKILL it after the grace period (§7.4). */
+export function terminateGroup(pid: number, graceMs = 10_000): void {
+  killGroup(pid, 'SIGTERM')
+  setTimeout(() => killGroup(pid, 'SIGKILL'), graceMs).unref()
+}
+
+/** A process still running this session (started before hq could record its pid). §7.3 */
+export function findOrphan(sessionId: string): Promise<number | null> {
+  const probe = (flag: string) => new Promise<number | null>((resolve) => execFile('pgrep', ['-f', '--', `${flag} ${sessionId}`], (err, out) => {
+    if (err) return resolve(null)
+    const pids = String(out).split('\n').map(Number).filter((p) => p > 0 && p !== process.pid)
+    resolve(pids[0] ?? null)
+  }))
+  return probe('--session-id').then((p) => p ?? probe('--resume'))
+}
+
 export interface Launched { info: ProcessInfo; child: ChildProcess }
 
 /**
- * Writes prompt.md/spec.json, spawns the CLI detached (own process group) and records process.json atomically.
- * Throws when the executable cannot be started.
+ * Writes prompt.md, spec.json and the sandbox profile into hq/, spawns the CLI inside the sandbox
+ * as its own process group, and records process.json atomically. Throws when the process cannot start.
  */
-export async function launch(o: { claudeBin: string; argv: string[]; cwd: string; dir: string; prompt: string; sessionId: string; spec: object; env?: NodeJS.ProcessEnv }): Promise<Launched> {
-  mkdirSync(o.dir, { recursive: true })
-  atomicWrite(join(o.dir, 'prompt.md'), o.prompt)
-  atomicJson(join(o.dir, 'spec.json'), { argv: [o.claudeBin, ...o.argv.map((a) => (a.length > 2000 ? a.slice(0, 2000) + '…' : a))], cwd: o.cwd, ...o.spec })
-  const env = { ...process.env, ...o.env, HQ_ATTEMPT_DIR: o.dir }
-  delete env.CLAUDECODE
-  const fin = openSync(join(o.dir, 'prompt.md'), 'r')
-  const fout = openSync(join(o.dir, 'stream.jsonl'), 'a')
-  const ferr = openSync(join(o.dir, 'stderr.log'), 'a')
+export async function launch(o: { claudeBin: string; argv: string[]; cwd: string; hqDir: string; outDir: string | null; prompt: string; sessionId: string; spec: object; sandbox: SandboxOpts }): Promise<Launched> {
+  mkdirSync(o.hqDir, { recursive: true })
+  if (o.outDir) mkdirSync(o.outDir, { recursive: true })
+  atomicWrite(join(o.hqDir, 'prompt.md'), o.prompt)
+  const profile = join(o.hqDir, 'sandbox.sb')
+  atomicWrite(profile, sandboxProfile(o.sandbox))
+  const argv = wrap([o.claudeBin, ...o.argv], profile)
+  atomicJson(join(o.hqDir, 'spec.json'), { argv: argv.map((a) => (a.length > 2000 ? a.slice(0, 2000) + '…' : a)), cwd: o.cwd, ...o.spec })
+  const env = childEnv(o.outDir ? { HQ_ATTEMPT_OUT: o.outDir } : {})
+  const fin = openSync(join(o.hqDir, 'prompt.md'), 'r')
+  const fout = openSync(join(o.hqDir, 'stream.jsonl'), 'a')
+  const ferr = openSync(join(o.hqDir, 'stderr.log'), 'a')
   let child: ChildProcess
-  try {
-    child = spawn(o.claudeBin, o.argv, { cwd: o.cwd, env, detached: true, stdio: [fin, fout, ferr] })
-  } finally { closeSync(fin); closeSync(fout); closeSync(ferr) }
+  try { child = spawn(argv[0], argv.slice(1), { cwd: o.cwd, env, detached: true, stdio: [fin, fout, ferr] }) } finally { closeSync(fin); closeSync(fout); closeSync(ferr) }
   const pid = await new Promise<number>((resolve, reject) => {
     if (child.pid) { child.once('error', () => {}); return resolve(child.pid) }
     child.once('error', reject)
   })
   child.unref()
   const info: ProcessInfo = { pid, startedAt: new Date().toISOString(), sessionId: o.sessionId, lstart: await psLstart(pid) }
-  atomicJson(join(o.dir, 'process.json'), info)
+  atomicJson(join(o.hqDir, 'process.json'), info)
   return { info, child }
 }
 
-export const readProcessInfo = (dir: string) => readJson<ProcessInfo>(join(dir, 'process.json'))
-
-// ----- stream.jsonl → activity.jsonl (§13) -----
-
-export interface Activity { at: string; kind: 'message' | 'tool' | 'error' | 'usage'; text: string }
-export interface StreamSignals {
-  sessionId?: string
-  rateLimit?: Record<string, unknown>
-  result?: Record<string, unknown>
-}
-
-const clip = (s: unknown, n: number) => { const t = String(s ?? '').replace(/\s+/g, ' ').trim(); return t.length > n ? t.slice(0, n) + '…' : t }
-
-function toolTarget(name: string, input: Record<string, unknown>): string {
-  if (name === 'Bash') return clip(input.command, 120)
-  for (const k of ['file_path', 'notebook_path', 'path', 'pattern', 'url', 'query']) if (typeof input[k] === 'string') return clip(input[k], 120)
-  return ''
-}
-
-/** Converts one stream-json line into activity entries. */
-export function toActivities(line: Record<string, unknown>, at = new Date().toISOString()): Activity[] {
-  const out: Activity[] = []
-  const content = ((line.message as Record<string, unknown> | undefined)?.content ?? []) as Record<string, unknown>[]
-  if (line.type === 'assistant' && Array.isArray(content)) {
-    for (const c of content) {
-      if (c.type === 'text' && String(c.text ?? '').trim()) out.push({ at, kind: 'message', text: clip(c.text, 200) })
-      else if (c.type === 'tool_use') { const name = String(c.name ?? '?'); const t = toolTarget(name, (c.input ?? {}) as Record<string, unknown>); out.push({ at, kind: 'tool', text: t ? `${name} ${t}` : name }) }
-    }
-  } else if (line.type === 'user' && Array.isArray(content)) {
-    for (const c of content) if (c.type === 'tool_result' && c.is_error === true) {
-      const body = Array.isArray(c.content) ? (c.content as Record<string, unknown>[]).map((x) => x.text ?? '').join(' ') : c.content
-      out.push({ at, kind: 'error', text: clip(body, 200) })
-    }
-  } else if (line.type === 'result') {
-    const u = (line.usage ?? {}) as Record<string, unknown>
-    const cost = typeof line.total_cost_usd === 'number' ? ` · $${line.total_cost_usd.toFixed(4)}` : ''
-    out.push({ at, kind: 'usage', text: `입력 ${Number(u.input_tokens ?? 0)} · 출력 ${Number(u.output_tokens ?? 0)} 토큰${cost}${line.is_error ? ' (오류)' : ''}` })
-  }
-  return out
-}
-
-/** Whether a user line carries a successful tool_result (resets the repeated-error counter). */
-function hasOkToolResult(line: Record<string, unknown>): boolean {
-  const content = ((line.message as Record<string, unknown> | undefined)?.content ?? []) as Record<string, unknown>[]
-  return line.type === 'user' && Array.isArray(content) && content.some((c) => c.type === 'tool_result' && c.is_error !== true)
-}
-
-/**
- * Follows stream.jsonl from a persisted byte offset (tail.json), appends activity.jsonl,
- * and tracks the signals the runner needs (session id, rate limits, final result, repeated errors).
- */
-export class StreamTail {
-  readonly dir: string
-  offset = 0
-  lastActivity: string | null = null
-  sameErrorCount = 0
-  private lastError = ''
-  rejectedSeen = false
-  result: Record<string, unknown> | null = null
-
-  constructor(dir: string) {
-    this.dir = dir
-    const t = readJson<{ offset: number; lastError?: string; sameErrorCount?: number; rejectedSeen?: boolean }>(join(dir, 'tail.json'))
-    if (t) { this.offset = t.offset; this.lastError = t.lastError ?? ''; this.sameErrorCount = t.sameErrorCount ?? 0; this.rejectedSeen = !!t.rejectedSeen }
-  }
-
-  /** Reads everything new; calls onLine for each complete JSON line. */
-  poll(onLine: (line: Record<string, unknown>, s: StreamSignals) => void = () => {}): void {
-    let fd: number
-    try { fd = openSync(join(this.dir, 'stream.jsonl'), 'r') } catch { return }
-    let chunk = ''
-    try {
-      const size = fstatSync(fd).size
-      if (size <= this.offset) return
-      const buf = Buffer.alloc(Math.min(size - this.offset, 8 * 1024 * 1024))
-      const n = readSync(fd, buf, 0, buf.length, this.offset)
-      chunk = buf.subarray(0, n).toString('utf8')
-      // Only advance past complete lines, so a half-written line is re-read next time.
-      const cut = chunk.lastIndexOf('\n')
-      if (cut < 0) { if (n === buf.length && n >= 8 * 1024 * 1024) this.offset += n; return } // skip a pathological giant line
-      this.offset += Buffer.byteLength(chunk.slice(0, cut + 1))
-      chunk = chunk.slice(0, cut + 1)
-    } finally { closeSync(fd) }
-    const acts: Activity[] = []
-    for (const raw of chunk.split('\n')) {
-      if (!raw.trim()) continue
-      let line: Record<string, unknown>
-      try { line = JSON.parse(raw) } catch { continue }
-      const s: StreamSignals = {}
-      if (typeof line.session_id === 'string') s.sessionId = line.session_id
-      if (line.type === 'rate_limit_event') {
-        s.rateLimit = line
-        if ((line.rate_limit_info as Record<string, unknown> | undefined)?.status === 'rejected') this.rejectedSeen = true
-      }
-      if (line.type === 'result') { this.result = line; s.result = line }
-      for (const a of toActivities(line)) {
-        acts.push(a)
-        if (a.kind === 'error') { if (a.text === this.lastError) this.sameErrorCount++; else { this.lastError = a.text; this.sameErrorCount = 1 } }
-      }
-      if (hasOkToolResult(line)) { this.lastError = ''; this.sameErrorCount = 0 }
-      onLine(line, s)
-    }
-    if (acts.length) {
-      appendFileSync(join(this.dir, 'activity.jsonl'), acts.map((a) => JSON.stringify(a)).join('\n') + '\n')
-      this.lastActivity = acts[acts.length - 1].text
-    }
-    atomicJson(join(this.dir, 'tail.json'), { offset: this.offset, lastError: this.lastError, sameErrorCount: this.sameErrorCount, rejectedSeen: this.rejectedSeen })
-  }
-
-  /** The final result line, scanning the whole stream if it was consumed before a restart. */
-  finalResult(): Record<string, unknown> | null {
-    if (this.result) return this.result
-    const text = readText(join(this.dir, 'stream.jsonl'), 64 * 1024 * 1024) ?? ''
-    for (const raw of text.split('\n').reverse()) {
-      if (!raw.includes('"result"')) continue
-      try { const l = JSON.parse(raw); if (l.type === 'result') return (this.result = l) } catch { /* skip */ }
-    }
-    return null
-  }
-}
+export const readProcessInfo = (hqDir: string) => readJson<ProcessInfo>(join(hqDir, 'process.json'))

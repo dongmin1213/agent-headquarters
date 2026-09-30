@@ -84,3 +84,65 @@ export async function removeWorktree(repo: string, path: string): Promise<void> 
   if (existsSync(path)) rmSync(path, { recursive: true, force: true })
   await git(repo, ['worktree', 'prune'])
 }
+
+// ----- v2 additions -----
+
+const locks = new Map<string, Promise<unknown>>()
+/** Serializes git writes per repository (execution.md §7.5). */
+export function withRepo<T>(repo: string, fn: () => Promise<T>): Promise<T> {
+  let key = repo
+  try { key = realpathSync(repo) } catch { /* keep as is */ }
+  const prev = locks.get(key) ?? Promise.resolve()
+  const run = prev.then(fn, fn)
+  const tail = run.catch(() => {})
+  locks.set(key, tail)
+  void tail.then(() => { if (locks.get(key) === tail) locks.delete(key) })
+  return run
+}
+
+/** Identity for commits hq itself creates (dependency bases, integration merges). */
+export const HQ_IDENT = ['-c', 'user.name=hq', '-c', 'user.email=hq@localhost']
+
+export async function gitCommonDir(cwd: string): Promise<string | null> {
+  const r = await git(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
+  return r.code === 0 ? r.stdout.trim() : null
+}
+
+/** Merges the given commits into the worktree's HEAD with --no-ff; aborts and reports conflicting files on failure. */
+export async function mergeHeads(worktree: string, shas: string[], message: string): Promise<{ ok: true; sha: string } | { ok: false; files: string[]; error: string }> {
+  for (const sha of shas) {
+    const r = await git(worktree, [...HQ_IDENT, 'merge', '--no-ff', '--no-edit', '-m', message, sha])
+    if (r.code !== 0) {
+      const u = await git(worktree, ['diff', '--name-only', '--diff-filter=U'])
+      await git(worktree, ['merge', '--abort'])
+      return { ok: false, files: u.stdout.split('\n').filter(Boolean), error: (r.stderr || r.stdout).trim().slice(0, 500) }
+    }
+  }
+  return { ok: true, sha: (await revParse(worktree))! }
+}
+
+export async function commitsBetween(cwd: string, base: string, head: string): Promise<string[]> {
+  return (await gitOk(cwd, ['rev-list', `${base}..${head}`])).split('\n').filter(Boolean)
+}
+
+export async function hasMergeCommits(cwd: string, base: string, head: string): Promise<boolean> {
+  return (await gitOk(cwd, ['rev-list', '--merges', `${base}..${head}`])).length > 0
+}
+
+/** Saves uncommitted work before a reset (§7.6): tracked diff plus the untracked file list. Empty string when clean. */
+export async function worktreeDirtySnapshot(wt: string): Promise<string> {
+  const status = await statusPorcelain(wt)
+  if (!status) return ''
+  const diff = await git(wt, ['diff', '--no-color', '--no-ext-diff', 'HEAD'])
+  const untracked = await git(wt, ['ls-files', '--others', '--exclude-standard'])
+  return `# git status --porcelain\n${status}\n\n# untracked\n${untracked.stdout}\n# git diff HEAD\n${diff.stdout}`
+}
+
+export async function resetClean(wt: string): Promise<void> {
+  await gitOk(wt, ['reset', '--hard', 'HEAD'])
+  await gitOk(wt, ['clean', '-fd'])
+}
+
+export async function branchExists(repo: string, branch: string): Promise<boolean> {
+  return (await git(repo, ['show-ref', '--verify', '-q', `refs/heads/${branch}`])).code === 0
+}
