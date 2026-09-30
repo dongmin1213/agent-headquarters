@@ -1,6 +1,5 @@
 // LaunchAgent plist generation. Every string value is XML-escaped.
 import { dirname } from 'node:path'
-import { DAEMON_LABEL, PET_LABEL } from './ctx.ts'
 
 export type PlistValue = string | number | boolean | PlistValue[] | { [k: string]: PlistValue }
 
@@ -33,13 +32,13 @@ export function launchPath(toolPaths: (string | null)[]): string {
   return [...new Set(dirs)].join(':')
 }
 
-export interface DaemonPlistOpts { nodePath: string; root: string; home: string; port: number; path: string; logFile: string; tokenFile?: string }
+export interface DaemonPlistOpts { label: string; nodePath: string; root: string; home: string; port: number; path: string; logFile: string; tokenFile?: string }
 
 export function daemonPlist(o: DaemonPlistOpts): string {
   const env: Record<string, string> = { PATH: o.path, HQ_HOME: o.home, HQ_PORT: String(o.port) }
   if (o.tokenFile) env.HQ_TOKEN_FILE = o.tokenFile
   return renderPlist({
-    Label: DAEMON_LABEL,
+    Label: o.label,
     ProgramArguments: [o.nodePath, `${o.root}/src/main.ts`],
     WorkingDirectory: o.root,
     RunAtLoad: true,
@@ -52,9 +51,9 @@ export function daemonPlist(o: DaemonPlistOpts): string {
   })
 }
 
-export function petPlist(o: { appBinary: string; logFile: string }): string {
+export function petPlist(o: { label: string; appBinary: string; logFile: string }): string {
   return renderPlist({
-    Label: PET_LABEL,
+    Label: o.label,
     ProgramArguments: [o.appBinary],
     RunAtLoad: true,
     ProcessType: 'Interactive',

@@ -7,7 +7,7 @@ import { pidCommand, readLockPid } from './daemon.ts'
 import { sandboxSmoke, type SmokeResult } from './sandbox.ts'
 import { hqReadPaths, protectedFolders, tccLabels, tccPathList } from './tcc.ts'
 import {
-  DAEMON_LABEL, PET_LABEL, expandHome, findBin, lockFile, petApp, plistPath, projectsFile, runCmd, type Ctx, type ExecResult,
+  daemonLabel, expandHome, launchdJob, petLabel, findBin, lockFile, petApp, plistPath, projectsFile, runCmd, type Ctx, type ExecResult,
 } from './ctx.ts'
 
 export type Status = 'ok' | 'warn' | 'fail'
@@ -40,7 +40,8 @@ export function realProbes(ctx: Ctx): Probes {
     run: (cmd, args) => runCmd(cmd, args, { timeoutMs: 20_000 }),
     hq: () => probeHq(ctx),
     pgrep: async (pattern) => (await runCmd('pgrep', ['-f', pattern], { timeoutMs: 5000 })).code === 0,
-    launchctlLoaded: async (label) => (await runCmd('launchctl', ['print', `gui/${ctx.uid}/${label}`], { timeoutMs: 5000 })).code === 0,
+    // Loaded *and* this installation's plist (a same-named job from another installation does not count).
+    launchctlLoaded: async (label) => (await launchdJob({ ...ctx, run: runCmd }, label)) === 'ours',
     sandboxSmoke: (bin) => sandboxSmoke(bin),
     pidCommand: (pid) => pidCommand(pid),
   }
@@ -220,10 +221,10 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
 
   // LaunchAgents
   let daemonAgentLoaded = false
-  for (const [label, name] of [[DAEMON_LABEL, '자동 시작: 데몬'], [PET_LABEL, '자동 시작: 펫']] as const) {
+  for (const [label, name] of [[daemonLabel(ctx), '자동 시작: 데몬'], [petLabel(ctx), '자동 시작: 펫']] as const) {
     const installed = existsSync(plistPath(ctx, label))
     const loaded = installed && await p.launchctlLoaded(label)
-    if (label === DAEMON_LABEL) daemonAgentLoaded = loaded
+    if (label === daemonLabel(ctx)) daemonAgentLoaded = loaded
     if (installed && loaded) add(`launchd:${label}`, name, 'ok', '설치·로드됨')
     else add(`launchd:${label}`, name, 'warn', installed ? `${plistPath(ctx, label)} 있으나 로드 안 됨` : 'LaunchAgent 미설치', 'hq install')
   }

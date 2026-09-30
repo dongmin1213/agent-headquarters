@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { daemonPlist, launchPath, petPlist, renderPlist, xmlEscape } from '../../src/cli/plist.ts'
 
-const opts = { nodePath: '/opt/node/bin/node', root: '/Users/me/src/hq', home: '/Users/me/.hq', port: 7777, path: '/opt/node/bin:/usr/bin', logFile: '/Users/me/.hq/logs/daemon.log' }
+const opts = { label: 'com.agent-headquarters.daemon', nodePath: '/opt/node/bin/node', root: '/Users/me/src/hq', home: '/Users/me/.hq', port: 7777, path: '/opt/node/bin:/usr/bin', logFile: '/Users/me/.hq/logs/daemon.log' }
 
 test('daemon plist has the required launchd keys', () => {
   const x = daemonPlist(opts)
@@ -29,7 +29,7 @@ test('values are XML-escaped', () => {
 })
 
 test('pet plist runs the app binary at load', () => {
-  const x = petPlist({ appBinary: '/r/pet/HQPet.app/Contents/MacOS/hqpet', logFile: '/h/logs/pet.log' })
+  const x = petPlist({ label: 'com.agent-headquarters.pet', appBinary: '/r/pet/HQPet.app/Contents/MacOS/hqpet', logFile: '/h/logs/pet.log' })
   assert.match(x, /<string>com\.agent-headquarters\.pet<\/string>/)
   assert.match(x, /<key>ProgramArguments<\/key>\s*<array>\s*<string>\/r\/pet\/HQPet\.app\/Contents\/MacOS\/hqpet<\/string>/)
   assert.match(x, /<key>RunAtLoad<\/key>\s*<true\/>/)

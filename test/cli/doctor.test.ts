@@ -4,7 +4,7 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Probes } from '../../src/cli/doctor.ts'
 import { doctorCommand, runDoctor } from '../../src/cli/doctor.ts'
-import { DAEMON_LABEL, PET_LABEL, plistPath } from '../../src/cli/ctx.ts'
+import { daemonLabel, petLabel, plistPath } from '../../src/cli/ctx.ts'
 import { testCtx, writeToken, type TestCtx } from './helpers.ts'
 
 const SECRET_EMAIL = 'secret-person@example.com'
@@ -43,7 +43,7 @@ function healthy(): TestCtx {
   writeToken(ctx)
   mkdirSync(ctx.home, { recursive: true })
   mkdirSync(ctx.agentsDir, { recursive: true })
-  for (const l of [DAEMON_LABEL, PET_LABEL]) writeFileSync(plistPath(ctx, l), '<plist/>')
+  for (const l of [daemonLabel(ctx), petLabel(ctx)]) writeFileSync(plistPath(ctx, l), '<plist/>')
   for (const k of ['pokemon', 'digimon']) { mkdirSync(join(ctx.root, 'pet/packs', k, 'pool'), { recursive: true }); writeFileSync(join(ctx.root, 'pet/packs', k, 'pool', 'a.gif'), '') }
   return ctx
 }
