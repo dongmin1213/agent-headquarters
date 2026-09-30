@@ -51,13 +51,16 @@ function diagnosed(raw: string | null, options: string[], fallback: Explain): Ex
   } catch { return fallback }
 }
 
+/** "수익자동화" → "수익자동화 팀"; a name already ending in 팀 is kept as is. */
+export const teamLabel = (name: string): string => (/팀$/.test(name) ? name : `${name} 팀`)
+
 export function decisionItems(store: Store, now = Date.now(), teamNames: Record<string, string> = {}): DecisionItem[] {
   const items: DecisionItem[] = []
   for (const a of store.openApprovals(now)) {
     if (a.kind === 'team') {
       const name = teamNames[a.teamId] ?? a.teamId
       items.push({ kind: 'team', teamId: a.teamId, id: a.id, revision: a.revision, requestId: '', taskId: null, title: `${name} · ${a.title}`, detail: a.body,
-        situation: `${/팀$/.test(name) ? name : `${name} 팀`}이 회장님 결정을 기다려요`, cause: null, causeConfirmed: false, recommendation: null,
+        situation: `${teamLabel(name)}이 회장님 결정을 기다려요`, cause: null, causeConfirmed: false, recommendation: null,
         optionHelp: Object.fromEntries(a.options.map((o) => [o, teamOptionHelp(o)])), detailPath: null, options: a.options, subjectHash: a.subjectHash, createdAt: a.createdAt })
       continue
     }
@@ -168,6 +171,8 @@ export interface HeadlineInput {
   recentMerged: string | null
   /** For a verify worker: whether an LLM review follows. */
   reviewFollows?: (taskId: string) => boolean
+  /** Recurring teams (scheduler views). */
+  teams?: { name: string; state: string; bubble: string }[]
 }
 
 export function buildHeadline(h: HeadlineInput): Headline {
@@ -182,6 +187,11 @@ export function buildHeadline(h: HeadlineInput): Headline {
     return { text: `${w.title} ${verb} 중 · ${w.model} · 다음: ${next}${active.length > 1 ? ` 외 ${active.length - 1}명` : ''}`, needsYou }
   }
   if (h.ceoThinking) return { text: '사장이 계획 중이에요', needsYou }
+  const teams = h.teams ?? []
+  const failed = teams.find((t) => t.state === 'error')
+  if (failed) return { text: `${teamLabel(failed.name)} 오류: ${failed.bubble.slice(0, 80)}`, needsYou }
+  const working = teams.filter((t) => t.state === 'working')
+  if (working.length) return { text: `${working[0].name}: ${working[0].bubble}${working.length > 1 ? ` 외 ${working.length - 1}팀` : ''}`, needsYou }
   const held = h.workers.some((w) => w.state === 'held')
   if (h.quota.mode === 'hold' && (h.waiting > 0 || held) && h.quota.until) {
     const pct = Math.round((h.quota.pct ?? 1) * 100)

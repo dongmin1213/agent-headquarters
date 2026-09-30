@@ -14,7 +14,7 @@ import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../sto
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
 import { baseline, checksProfile, envFailure, runChecks, runSandboxed, type BaseResult, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
 import { DONE_MAX, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
-import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, outDirOf, workerViews } from './decisions.ts'
+import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, outDirOf, workerViews, type HeadlineInput } from './decisions.ts'
 import { runDiagnoseTurn } from './diagnose.ts'
 import { atomicJson, atomicWrite, readJson, readText, sha256 } from './fsx.ts'
 import { currentBranch, isRepo, revParse, withRepo } from './git.ts'
@@ -1533,7 +1533,7 @@ export class Runner {
   }
 
   // ----- screen data -----
-  views(): { workers: WorkerView[]; headline: Headline; quota: QuotaView | null; decisions: DecisionItem[] } {
+  views(teams?: HeadlineInput['teams']): { workers: WorkerView[]; headline: Headline; quota: QuotaView | null; decisions: DecisionItem[] } {
     const decisions = decisionItems(this.store, this.now(), this.teamNames)
     const q = this.quota()
     const workers = workerViews(this.store, (a) => this.live.get(a.id)?.tail.lastActivity ?? lastActivityOf(hqDirOf(a)), q.mode === 'hold' ? q.until : null)
@@ -1541,7 +1541,7 @@ export class Runner {
     const merged = this.store.requestsByStatus(['merged']).filter((r) => this.now() - Date.parse(r.updated_at) < 10 * 60_000).at(-1)
     const waiting = this.readyTasks().length + this.store.tasksByStatus(['reviewing']).filter((t) => !this.store.liveAttempts().some((a) => a.task_id === t.id)).length
     const headline = buildHeadline({ decisions, failures, workers, ceoThinking: this.store.requestsByStatus(['thinking']).length > 0, waiting, quota: q,
-      recentMerged: merged ? merged.text.replace(/\s+/g, ' ').slice(0, 40) : null, reviewFollows: (id) => this.store.task(id)?.review_model !== 'none' })
+      recentMerged: merged ? merged.text.replace(/\s+/g, ' ').slice(0, 40) : null, reviewFollows: (id) => this.store.task(id)?.review_model !== 'none', teams })
     return { workers, headline, quota: this.quotaView(), decisions }
   }
 
