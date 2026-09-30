@@ -316,7 +316,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
     const url = new URL(req.url ?? '/', 'http://127.0.0.1')
     const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent)
     const b = raw ? JSON.parse(raw) : {}
-    if (req.headers.authorization !== 'Bearer mock-token' && req.headers.authorization !== `Bearer ${process.env.HQ_MOCK_TOKEN ?? 'mock-token'}`) return send(res, 401, { error: 'unauthorized' })
+    if (req.headers.authorization !== 'Bearer mock-token' && req.headers.authorization !== `Bearer ${process.env.HQ_MOCK_TOKEN ?? 'mock-token'}`) return send(res, 401, { error: '인증이 필요해요' })
     if (req.method === 'GET') {
       if (url.pathname === '/api/state') return send(res, 200, snapshot())
       if (url.pathname === '/api/events') {
@@ -328,14 +328,14 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
       }
       if (parts[1] === 'requests' && parts.length === 3) {
         const r = requests.find((x) => x.id === parts[2])
-        if (!r) return send(res, 404, { error: 'not found' })
+        if (!r) return send(res, 404, { error: '찾을 수 없어요' })
         const detail: RequestDetail = { request: r, tasks: details.get(r.id) ?? [] }
         return send(res, 200, detail)
       }
       if (parts[1] === 'requests' && parts[3] === 'diff') {
         const key = url.searchParams.get('task')
         const t = (details.get(parts[2]) ?? []).find((x) => x.key === key)
-        if (!t) return send(res, 404, { error: 'not found' })
+        if (!t) return send(res, 404, { error: '찾을 수 없어요' })
         if (!t.headSha) return send(res, 200, { files: [], diff: '', truncated: false })
         return send(res, 200, { files: [{ path: 'src/exec/runner.ts', added: 14, removed: 0 }, { path: 'src/store.ts', added: 4, removed: 3 }, { path: 'docs/logo.png', added: 0, removed: 0 },
           { path: `src/huge-generated-${'x'.repeat(40)}.ts`, added: 20480, removed: 0 }], diff, truncated: true })
@@ -349,13 +349,13 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
       if (parts[1] === 'attempts' && parts[3] === 'files') {
         const id = parts[2], name = parts[4]
         const a = [...attempts.values()].flat().find((x) => x.id === id)
-        if (!a || a.status === 'running' || a.status === 'starting') return send(res, 404, { error: 'not found' })
+        if (!a || a.status === 'running' || a.status === 'starting') return send(res, 404, { error: '찾을 수 없어요' })
         // Evidence files are served as text/plain + nosniff (execution.md §15).
         const plain = (body: string) => { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'x-content-type-options': 'nosniff' }); res.end(body) }
         if (name === 'report.md' && a.kind === 'work') return plain(report)
         if (name === 'checks.json' && a.kind === 'work') return plain(JSON.stringify(a.status === 'succeeded' ? { ...checks, checks: checks.checks.slice(0, 2), pass: true } : checks))
         if (name === 'verdict.json' && a.kind === 'review') return plain(JSON.stringify(a.status === 'succeeded' ? { ...verdict, pass: true, blocking: [], criteria: verdict.criteria.slice(0, 3) } : verdict))
-        return send(res, 404, { error: 'not found' })
+        return send(res, 404, { error: '찾을 수 없어요' })
       }
       if (url.pathname === '/api/quota') return send(res, 200, snapshot().quota)
     }
@@ -378,7 +378,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
       }
       if (parts[1] === 'requests' && parts[3] === 'reject') {
         const r = requests.find((x) => x.id === parts[2])
-        if (!r || typeof b.reason !== 'string' || !b.reason.trim()) return send(res, 400, { error: 'reason is required' })
+        if (!r || typeof b.reason !== 'string' || !b.reason.trim()) return send(res, 400, { error: '반려 사유가 필요해요' })
         r.status = 'executing'
         const a = approvals.find((x) => x.id === `accept:${r.id}`); if (a) { a.decision = '반려'; a.decidedAt = new Date().toISOString() }
         const only: string[] | null = Array.isArray(b.tasks) && b.tasks.length ? b.tasks : null
@@ -387,20 +387,20 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
         return send(res, 200, { ok: true })
       }
       if (parts[1] === 'requests' && parts[3] === 'cancel') {
-        const r = requests.find((x) => x.id === parts[2]); if (!r) return send(res, 404, { error: 'not found' })
+        const r = requests.find((x) => x.id === parts[2]); if (!r) return send(res, 404, { error: '찾을 수 없어요' })
         r.status = 'cancelled'; emit({ kind: 'request', text: '요청 중단', data: { id: r.id } }); return send(res, 200, { ok: true })
       }
       if (parts[1] === 'requests' && parts[3] === 'merge') {
-        const r = requests.find((x) => x.id === parts[2]); if (!r) return send(res, 404, { error: 'not found' })
+        const r = requests.find((x) => x.id === parts[2]); if (!r) return send(res, 404, { error: '찾을 수 없어요' })
         return send(res, 409, { error: '다시 제시할 보류된 병합이 없어요' })
       }
       if (parts[1] === 'requests' && parts.length === 2) {
-        if (typeof b.text !== 'string' || !b.text) return send(res, 400, { error: 'text is required' })
+        if (typeof b.text !== 'string' || !b.text) return send(res, 400, { error: '요청 내용이 필요해요' })
         return send(res, 201, { id: 'req-new00001' })
       }
       if (parts[1] === 'tasks' && (parts[3] === 'answer' || parts[3] === 'decide')) {
         const t = allTasks().find((x) => x.id === parts[2])
-        if (!t) return send(res, 404, { error: 'not found' })
+        if (!t) return send(res, 404, { error: '찾을 수 없어요' })
         if (b.revision !== t.revision) return send(res, 409, { error: `지시서가 바뀌었어요 (리비전 ${t.revision}). 새 내용을 확인해 주세요` })
         if (parts[3] === 'answer') {
           const qi = t.questions.findIndex((q) => q.id === b.questionId)
@@ -418,7 +418,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
         return send(res, 200, { ok: true })
       }
     }
-    send(res, 404, { error: 'not found' })
+    send(res, 404, { error: '찾을 수 없어요' })
   }
 
   return {

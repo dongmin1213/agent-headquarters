@@ -92,7 +92,7 @@ export function createWebUi(opts: { port: number; token: string; routeApi: ApiRo
       const path = url.pathname
 
       if (path === '/ui' || path === '/ui/') {
-        if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'method not allowed' })
+        if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: '허용되지 않은 방식이에요' })
         res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
         return void res.end(shell)
       }
@@ -100,13 +100,13 @@ export function createWebUi(opts: { port: number; token: string; routeApi: ApiRo
       if (path.startsWith('/ui/assets/')) {
         const name = path.slice('/ui/assets/'.length)
         const body = assets.get(name)
-        if (!body || req.method !== 'GET') return json(res, 404, { error: 'not found' })
+        if (!body || req.method !== 'GET') return json(res, 404, { error: '찾을 수 없어요' })
         res.writeHead(200, { 'content-type': ASSET_TYPES[name] })
         return void res.end(body)
       }
 
       if (path === '/ui-api/session') {
-        if (req.method !== 'POST') return json(res, 404, { error: 'not found' })
+        if (req.method !== 'POST') return json(res, 404, { error: '찾을 수 없어요' })
         let code = ''
         try { const b = JSON.parse(await readBody(req, 4096)); code = typeof b?.code === 'string' ? b.code : '' } catch { return json(res, 400, { error: '잘못된 요청이에요' }) }
         prune()
@@ -122,7 +122,7 @@ export function createWebUi(opts: { port: number; token: string; routeApi: ApiRo
       if (path.startsWith('/ui-api/')) {
         const rest = path.slice('/ui-api/'.length)
         const segments = rest.split('/')
-        if (!isAllowed(req.method ?? '', segments)) return json(res, 404, { error: 'not found' })
+        if (!isAllowed(req.method ?? '', segments)) return json(res, 404, { error: '찾을 수 없어요' })
         const isEvents = req.method === 'GET' && rest === 'events'
         const bearer = /^Bearer (.+)$/.exec(String(req.headers.authorization ?? ''))?.[1] ?? ''
         // EventSource cannot send headers, so the events stream (and only it) takes ?t=<token>.
@@ -136,7 +136,7 @@ export function createWebUi(opts: { port: number; token: string; routeApi: ApiRo
         return opts.routeApi(req, res)
       }
 
-      return json(res, 404, { error: 'not found' })
+      return json(res, 404, { error: '찾을 수 없어요' })
     },
   }
 }
@@ -157,6 +157,7 @@ function enforceHeaders(res: ServerResponse): void {
   }) as ServerResponse['writeHead']
 }
 
+/** Every error body is {error: <Korean reason>} (execution.md §15). */
 async function readBody(req: IncomingMessage, max: number): Promise<string> {
   let raw = ''
   for await (const chunk of req) { raw += chunk; if (raw.length > max) throw new Error('body too large') }

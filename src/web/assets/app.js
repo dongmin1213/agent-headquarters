@@ -128,11 +128,13 @@ const enc = encodeURIComponent
 
 function errorText(e) {
   if (!(e instanceof ApiError)) return '알 수 없는 오류가 났어요'
+  // Every error body is {error: <Korean reason>} (execution.md §15); fall back only when a proxy or network layer answered.
+  if (e.status !== 0 && !e.message.startsWith('HTTP ')) return e.message
   if (e.status === 0) return e.message
-  if (e.status === 409) return e.message.startsWith('HTTP') ? '처리할 수 없는 상태예요. 최신 내용을 다시 불러왔어요.' : e.message // the daemon's Korean reason
+  if (e.status === 409) return '처리할 수 없는 상태예요. 최신 내용을 다시 불러왔어요.'
   if (e.status === 404) return '대상을 찾을 수 없어요'
   if (e.status === 413) return '내용이 너무 커요'
-  return `요청 실패: ${e.message}`
+  return `요청 실패 (${e.status})`
 }
 
 // ---------- data loading ----------
