@@ -68,3 +68,21 @@ test('open refuses a non-local url', async (t) => {
   assert.equal(await openUi(ctx), 1)
   assert.doesNotMatch(ctx.text(), /\[dry-run\] open/)
 })
+
+test('open accepts the v2 fragment URL /ui/#code=...', async (t) => {
+  let port = 0
+  const d = await fakeDaemon(TOKEN, newSnap, (p) => (p === '/api/ui-code' ? { status: 200, body: { url: `http://127.0.0.1:${port}/ui/#code=deadbeef` } } : null))
+  port = d.port; t.after(() => d.server.close())
+  const ctx = testCtx({ port }); writeToken(ctx, TOKEN)
+  assert.equal(await openUi(ctx), 0, ctx.text())
+  assert.ok(ctx.lines.includes(`[dry-run] open 'http://127.0.0.1:${port}/ui/#code=deadbeef'`), ctx.text())
+})
+
+test('isLocalUiUrl refuses every other origin', async () => {
+  const { isLocalUiUrl } = await import('../../src/cli/daemon.ts')
+  assert.equal(isLocalUiUrl('http://127.0.0.1:7777/ui/#code=x', 7777), true)
+  assert.equal(isLocalUiUrl('http://127.0.0.1:7777/ui/open?code=x', 7777), true)
+  for (const u of ['https://127.0.0.1:7777/ui/#code=x', 'http://localhost:7777/ui/#code=x', 'http://127.0.0.1:7778/ui/#code=x',
+    'http://127.0.0.1:7777@evil.example/ui/#code=x', 'http://user:pw@127.0.0.1:7777/ui/', 'http://127.0.0.1.evil.example:7777/ui/', 'javascript:alert(1)', 'not a url'])
+    assert.equal(isLocalUiUrl(u, 7777), false, u)
+})

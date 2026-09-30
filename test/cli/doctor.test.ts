@@ -19,7 +19,9 @@ function probes(over: Partial<Probes> = {}): Probes {
       if (cmd.endsWith('claude') && args[0] === '--version') return { code: 0, stdout: '2.1.285 (Claude Code)\n', stderr: '' }
       if (cmd.endsWith('claude') && args[0] === 'auth') return { code: 0, stdout: JSON.stringify({ loggedIn: true, email: SECRET_EMAIL, orgId: 'org-1' }), stderr: '' }
       if (cmd.endsWith('git') && args[0] === '--version') return { code: 0, stdout: 'git version 2.50.1\n', stderr: '' }
-      if (cmd.endsWith('git') && args.includes('rev-parse')) return { code: 0, stdout: 'true\n', stderr: '' }
+      if (cmd.endsWith('git') && args.includes('--is-inside-work-tree')) return { code: 0, stdout: 'true\n', stderr: '' }
+      if (cmd.endsWith('git') && args.includes('--verify')) return { code: 0, stdout: 'abc123\n', stderr: '' }
+      if (cmd.endsWith('git') && args.includes('status')) return { code: 0, stdout: '', stderr: '' }
       if (cmd === 'xcode-select') return { code: 0, stdout: '/Library/Developer/CommandLineTools\n', stderr: '' }
       if (cmd === 'swiftc') return { code: 0, stdout: 'Apple Swift version 6.3.3\n', stderr: '' }
       return { code: 127, stdout: '', stderr: 'unexpected' }
@@ -27,6 +29,8 @@ function probes(over: Partial<Probes> = {}): Probes {
     hq: async () => ({ kind: 'hq', snapshot: {} }),
     pgrep: async () => true,
     launchctlLoaded: async () => true,
+    sandboxSmoke: async () => ({ ok: true, detail: 'ok' }),
+    pidCommand: async () => null,
     ...over,
   }
 }
@@ -54,18 +58,18 @@ test('all checks pass → exit 0, no fix lines, secrets never printed', async ()
   assert.doesNotMatch(ctx.text(), /test-token-abc/)
 })
 
-test('warnings only → exit 6 with fix lines (daemon down, pet not running, not git, no sprites)', async () => {
+test('warnings only → exit 6 with fix lines (daemon down, pet not running, dirty tree)', async () => {
   const ctx = healthy()
   const p = probes({
     hq: async () => ({ kind: 'down' }), pgrep: async () => false,
-    run: async (cmd, args) => cmd.endsWith('git') && args.includes('rev-parse') ? { code: 128, stdout: '', stderr: 'not a git repo' } : probes().run(cmd, args),
+    run: async (cmd, args) => cmd.endsWith('git') && args.includes('status') ? { code: 0, stdout: ' M a.ts\n?? b.ts\n', stderr: '' } : probes().run(cmd, args),
   })
   const code = await doctorCommand(ctx, { json: false, probes: p })
   assert.equal(code, 6)
   const t = ctx.text()
   assert.match(t, /\[경고\] 데몬: 실행 중이 아님\n\s+해결: hq start/)
   assert.match(t, /\[경고\] 데스크 펫/)
-  assert.match(t, /실행 단계에는 git 필요/)
+  assert.match(t, /\[경고\] 작업 트리 proj: 변경 2건 — 병합은 깨끗한 작업 트리에서만 가능/)
   assert.match(t, /\[정상\] 포트/)
 })
 
@@ -118,4 +122,63 @@ test('missing projects.json and token are warnings, not failures', async () => {
   assert.equal(checks.find((c) => c.id === 'projects')!.status, 'warn')
   assert.equal(checks.find((c) => c.id === 'token')!.status, 'warn')
   assert.equal(checks.filter((c) => c.status === 'fail').length, 0)
+})
+
+const gitRun = (over: (args: string[]) => { code: number; stdout: string } | null) => async (cmd: string, args: string[]) => {
+  const x = cmd.endsWith('git') ? over(args) : null
+  return x ? { ...x, stderr: '' } : probes().run(cmd, args)
+}
+
+test('project that is not a git repo fails (execution phase needs git)', async () => {
+  const ctx = healthy()
+  const checks = await runDoctor(ctx, probes({ run: gitRun((a) => (a.includes('--is-inside-work-tree') ? { code: 128, stdout: '' } : null)) }))
+  const c = checks.find((x) => x.id === 'project:proj')!
+  assert.equal(c.status, 'fail'); assert.match(c.detail, /실행 단계에는 git 필요/); assert.match(c.fix!, /git init/)
+})
+
+test('project repo without commits fails', async () => {
+  const ctx = healthy()
+  const checks = await runDoctor(ctx, probes({ run: gitRun((a) => (a.includes('--verify') ? { code: 1, stdout: '' } : null)) }))
+  const c = checks.find((x) => x.id === 'project:proj')!
+  assert.equal(c.status, 'fail'); assert.match(c.detail, /커밋이 없음/)
+  assert.equal(checks.find((x) => x.id === 'project-tree:proj'), undefined)
+})
+
+test('sandbox-exec missing or smoke test failing → fail with the sandbox fix line', async () => {
+  const FIX = 'macOS 샌드박스가 동작하지 않아 작업자를 격리할 수 없음'
+  const a = await runDoctor(healthy(), probes({ findBin: (n) => (n.includes('sandbox-exec') ? null : `/fake/bin/${n}`) }))
+  assert.equal(a.find((c) => c.id === 'sandbox-exec')!.status, 'fail')
+  assert.equal(a.find((c) => c.id === 'sandbox')!.fix, FIX)
+  const b = await runDoctor(healthy(), probes({ sandboxSmoke: async () => ({ ok: false, detail: '허용 밖 쓰기가 막히지 않음' }) }))
+  const s = b.find((c) => c.id === 'sandbox')!
+  assert.equal(s.status, 'fail'); assert.equal(s.fix, FIX); assert.match(s.detail, /허용 밖 쓰기/)
+  assert.equal(b.find((c) => c.id === 'sandbox-exec')!.status, 'ok')
+})
+
+test('daemon lock: absent ok, live hq ok, stale warn, reused pid warn', async () => {
+  const { lockFile } = await import('../../src/cli/ctx.ts')
+  const lock = async (content: string | null, cmd: string | null) => {
+    const ctx = healthy()
+    if (content !== null) writeFileSync(lockFile(ctx), content)
+    const checks = await runDoctor(ctx, probes({ pidCommand: async () => cmd }))
+    return checks.find((c) => c.id === 'lock')!
+  }
+  assert.equal((await lock(null, null)).status, 'ok')
+  const live = await lock('4242\n', '/usr/local/bin/node /repo/src/main.ts')
+  assert.equal(live.status, 'ok'); assert.match(live.detail, /pid 4242 실행 중/)
+  const stale = await lock('4242', null)
+  assert.equal(stale.status, 'warn'); assert.match(stale.detail, /오래된 잠금/); assert.ok(stale.fix)
+  const reused = await lock('{"pid":4242}', '/Applications/Safari.app/Contents/MacOS/Safari')
+  assert.equal(reused.status, 'warn'); assert.match(reused.detail, /pid 재사용/)
+})
+
+test('config error from loadConfig is surfaced verbatim (e.g. unknown key)', async () => {
+  const { loadConfig } = await import('../../src/config.ts')
+  const ctx = healthy()
+  writeFileSync(join(ctx.root, 'config/hq.json'), JSON.stringify({ reviewOnlyAt: 0.9 }))
+  let msg = ''
+  try { loadConfig(ctx.root, ctx.env) } catch (e) { msg = (e as Error).message }
+  assert.ok(msg)
+  const c = (await runDoctor(ctx, probes())).find((x) => x.id === 'config')!
+  assert.equal(c.status, 'fail'); assert.equal(c.detail, msg)
 })

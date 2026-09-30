@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { apiRequest, probeHq, readToken, waitFor, type HqProbe } from './api.ts'
-import { DAEMON_LABEL, daemonLog, logsDir, pidFile, plistPath, runCmd, showCmd, type Ctx } from './ctx.ts'
+import { DAEMON_LABEL, daemonLog, lockFile, logsDir, pidFile, plistPath, runCmd, showCmd, type Ctx } from './ctx.ts'
 
 export const LOG_MAX_BYTES = 10 * 1024 * 1024
 export const LOG_KEEP = 3
@@ -29,12 +29,53 @@ export function readPid(ctx: Ctx): number | null {
 export function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM' }
 }
-/** The pidfile's process, only if it is still alive and is an hq daemon (guards against pid reuse). */
-export async function ownDaemonPid(ctx: Ctx): Promise<number | null> {
-  const pid = readPid(ctx)
-  if (!pid || !alive(pid)) return null
+/** Command line of a live pid, or null when the process is gone. */
+export async function pidCommand(pid: number): Promise<string | null> {
+  if (!alive(pid)) return null
   const r = await runCmd('ps', ['-p', String(pid), '-o', 'command='], { timeoutMs: 5000 })
-  return r.code === 0 && r.stdout.includes('src/main.ts') ? pid : null
+  return r.code === 0 ? r.stdout.trim() : null
+}
+
+/** First integer in $HQ_HOME/daemon.lock (plain "123" or JSON like {"pid":123}); null if absent or unreadable. */
+export function readLockPid(ctx: Ctx): number | null {
+  try {
+    const m = /\d+/.exec(readFileSync(lockFile(ctx), 'utf8'))
+    const n = m ? Number(m[0]) : 0
+    return n > 0 ? n : null
+  } catch { return null }
+}
+
+export type KillTarget = { pid: number; source: 'lock' | 'pidfile' } | { refuse: string } | null
+
+/**
+ * The only process `stop` may signal. With a daemon lock present that is the lock's pid and nothing else;
+ * without one (older daemon) the CLI's own pidfile. Either way the command line must contain src/main.ts.
+ */
+export async function killTarget(ctx: Ctx): Promise<KillTarget> {
+  if (existsSync(lockFile(ctx))) {
+    const pid = readLockPid(ctx)
+    if (!pid) return null
+    const cmd = await pidCommand(pid)
+    if (cmd === null) return null // stale lock
+    if (!cmd.includes('src/main.ts')) return { refuse: `잠금 파일 ${lockFile(ctx)}의 pid ${pid}는 hq 데몬이 아닙니다 (${cmd.slice(0, 80)}). 종료하지 않습니다. 오래된 잠금이면: rm ${lockFile(ctx)}` }
+    return { pid, source: 'lock' }
+  }
+  const pid = readPid(ctx)
+  if (!pid) return null
+  const cmd = await pidCommand(pid)
+  return cmd !== null && cmd.includes('src/main.ts') ? { pid, source: 'pidfile' } : null
+}
+
+/** Signals the kill target and waits; returns the pid it stopped, null if none, or an error message. */
+export async function stopTarget(ctx: Ctx): Promise<{ pid: number } | { error: string } | null> {
+  const t = await killTarget(ctx)
+  if (!t) return null
+  if ('refuse' in t) return { error: t.refuse }
+  if (ctx.dryRun) ctx.out(`[dry-run] kill -TERM ${t.pid}`)
+  else process.kill(t.pid, 'SIGTERM')
+  if (!ctx.dryRun && !(await waitFor(async () => !alive(t.pid), START_WAIT_MS))) return { error: `pid ${t.pid}가 종료되지 않았습니다. 강제 종료: kill -9 ${t.pid}` }
+  if (!ctx.dryRun) rmSync(pidFile(ctx), { force: true })
+  return { pid: t.pid }
 }
 
 function busyMessage(ctx: Ctx, p: HqProbe): string | null {
@@ -62,6 +103,11 @@ function failStart(ctx: Ctx): number {
 export async function start(ctx: Ctx): Promise<number> {
   const busy = busyMessage(ctx, await probeHq(ctx))
   if (busy) { ctx.err(busy); return 1 }
+  const lockPid = readLockPid(ctx)
+  if (lockPid && alive(lockPid)) {
+    ctx.err(`데몬 잠금 ${lockFile(ctx)}의 pid ${lockPid}가 살아 있어 시작하지 않습니다 (중복 실행 거부). 상태: hq status · 중지: hq stop`)
+    return 1
+  }
   mkdirSync(logsDir(ctx), { recursive: true })
   rotateLog(daemonLog(ctx))
   if (launchdInstalled(ctx)) {
@@ -70,8 +116,8 @@ export async function start(ctx: Ctx): Promise<number> {
       : await ctx.act('launchctl', ['bootstrap', `gui/${ctx.uid}`, plistPath(ctx, DAEMON_LABEL)])
     if (r.code !== 0) { ctx.err(`launchctl 실패: ${r.stderr.trim()}`); return 1 }
   } else {
-    const own = await ownDaemonPid(ctx)
-    if (own) { ctx.err(`pid ${own}의 hq가 이미 떠 있지만 아직 응답하지 않습니다. 잠시 후 hq status, 안 되면 hq restart`); return 1 }
+    const own = await killTarget(ctx)
+    if (own && 'pid' in own) { ctx.err(`pid ${own.pid}의 hq가 이미 떠 있지만 아직 응답하지 않습니다. 잠시 후 hq status, 안 되면 hq restart`); return 1 }
     const args = [join(ctx.root, 'src/main.ts')]
     if (ctx.dryRun) ctx.out(`[dry-run] ${showCmd(process.execPath, args)} (백그라운드, 로그 ${daemonLog(ctx)})`)
     else {
@@ -99,13 +145,11 @@ export async function stop(ctx: Ctx): Promise<number> {
     ctx.out('hq 중지됨 (launchd 작업은 로드된 채 유지: 다음 로그인 또는 hq start 때 다시 시작)')
     return 0
   }
-  const pid = await ownDaemonPid(ctx)
-  if (pid) {
-    if (ctx.dryRun) ctx.out(`[dry-run] kill -TERM ${pid}`)
-    else process.kill(pid, 'SIGTERM')
-    if (!(await waitDown(ctx, pid))) { ctx.err(`pid ${pid}가 종료되지 않았습니다. 강제 종료: kill -9 ${pid}`); return 1 }
-    if (!ctx.dryRun) rmSync(pidFile(ctx), { force: true })
-    ctx.out(`hq 중지됨 (pid ${pid})`)
+  const r = await stopTarget(ctx)
+  if (r && 'error' in r) { ctx.err(r.error); return 1 }
+  if (r) {
+    if (!(await waitDown(ctx))) { ctx.err('데몬 프로세스는 끝났지만 포트가 아직 응답합니다. hq status 확인'); return 1 }
+    ctx.out(`hq 중지됨 (pid ${r.pid})`)
     return 0
   }
   if (!ctx.dryRun) rmSync(pidFile(ctx), { force: true })
@@ -195,6 +239,14 @@ export async function status(ctx: Ctx, opts: { json: boolean }): Promise<number>
 
 // ---- open ----
 
+/** Only http://127.0.0.1:<port>/... (e.g. /ui/#code=... from contract v2, or the older /ui/open?code=...). */
+export function isLocalUiUrl(url: string, port: number): boolean {
+  let u: URL
+  try { u = new URL(url) } catch { return false }
+  return u.protocol === 'http:' && u.hostname === '127.0.0.1' && u.port === String(port) && !u.username && !u.password
+    && url.startsWith(`http://127.0.0.1:${port}/`)
+}
+
 export async function openUi(ctx: Ctx): Promise<number> {
   let r
   try { r = await apiRequest(ctx.port, readToken(ctx), 'POST', '/api/ui-code', {}) } catch {
@@ -202,10 +254,10 @@ export async function openUi(ctx: Ctx): Promise<number> {
   }
   if (r.status !== 200 || typeof r.body?.url !== 'string') { ctx.err(`웹 화면 코드 발급 실패 (HTTP ${r.status}). 진단: hq doctor`); return 1 }
   const url: string = r.body.url
-  if (!url.startsWith(`http://127.0.0.1:${ctx.port}/`)) { ctx.err('데몬이 로컬이 아닌 주소를 돌려줘 열지 않았습니다'); return 1 }
+  if (!isLocalUiUrl(url, ctx.port)) { ctx.err('데몬이 로컬이 아닌 주소를 돌려줘 열지 않았습니다'); return 1 }
   const o = await ctx.act('open', [url])
   if (o.code !== 0) { ctx.err(`브라우저를 열지 못함: ${o.stderr.trim()}`); return 1 }
-  ctx.out('웹 화면을 열었습니다 (일회용 링크, 60초 유효)')
+  ctx.out('웹 화면을 열었습니다 (일회용 링크, 60초 유효 · 세션은 그 브라우저 탭에만 유지)')
   return 0
 }
 

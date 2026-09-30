@@ -108,6 +108,8 @@ export const logsDir = (ctx: Ctx) => join(ctx.home, 'logs')
 export const daemonLog = (ctx: Ctx) => join(logsDir(ctx), 'daemon.log')
 export const petLog = (ctx: Ctx) => join(logsDir(ctx), 'pet.log')
 export const pidFile = (ctx: Ctx) => join(ctx.home, 'daemon.pid')
+/** Written by the daemon itself (single-instance lock, exec-engine-spec §134). */
+export const lockFile = (ctx: Ctx) => join(ctx.home, 'daemon.lock')
 export const plistPath = (ctx: Ctx, label: string) => join(ctx.agentsDir, `${label}.plist`)
 export const petApp = (ctx: Ctx) => join(ctx.root, 'pet/HQPet.app')
 export const petBinary = (ctx: Ctx) => join(petApp(ctx), 'Contents/MacOS/hqpet')

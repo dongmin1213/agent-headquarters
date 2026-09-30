@@ -3,7 +3,8 @@ import { existsSync, readFileSync, statSync } from 'node:fs'
 import { basename, resolve } from 'node:path'
 import { expandHome, projectsFile, shortenHome, writeAtomic, type Ctx } from './ctx.ts'
 
-export interface ProjectEntry { id: string; name: string; path: string }
+/** `setup` (optional) runs inside the sandbox right after worktree creation (execution.md §2). */
+export interface ProjectEntry { id: string; name: string; path: string; setup?: string }
 
 export const ID_RE = /^[a-z0-9-]+$/
 
@@ -39,24 +40,27 @@ export async function projectsList(ctx: Ctx): Promise<number> {
     const abs = expandHome(p.path, ctx.userHome)
     const note = !existsSync(abs) ? '  [경로 없음]' : !(await isGit(ctx, abs)) ? '  [git 아님]' : ''
     ctx.out(`${p.id}\t${p.name}\t${p.path}${note}`)
+    if (p.setup) ctx.out(`\tsetup: ${p.setup}`)
   }
   return 0
 }
 
-export async function projectsAdd(ctx: Ctx, path: string, opts: { id?: string; name?: string }): Promise<number> {
+export async function projectsAdd(ctx: Ctx, path: string, opts: { id?: string; name?: string; setup?: string }): Promise<number> {
   const abs = resolve(expandHome(path, ctx.userHome))
   if (!existsSync(abs) || !statSync(abs).isDirectory()) { ctx.err(`폴더가 없습니다: ${abs}`); return 1 }
   const id = opts.id ?? slugify(basename(abs))
   if (!ID_RE.test(id)) { ctx.err(`id는 소문자·숫자·하이픈만 가능합니다 ([a-z0-9-]+): "${id}"${opts.id ? '' : ' → --id로 지정하세요'}`); return 1 }
+  if (opts.setup !== undefined && !opts.setup.trim()) { ctx.err('--setup에는 명령 문자열이 필요합니다'); return 1 }
   const list = load(ctx)
   if (typeof list === 'number') return list
   if (list.some((p) => p.id === id)) { ctx.err(`이미 있는 id입니다: ${id} (--id로 다른 값을 주세요)`); return 1 }
   const stored = shortenHome(abs, ctx.userHome)
   const dup = list.find((p) => resolve(expandHome(p.path, ctx.userHome)) === abs)
   if (dup) { ctx.err(`이미 등록된 경로입니다: ${stored} (id ${dup.id})`); return 1 }
-  list.push({ id, name: opts.name ?? basename(abs), path: stored })
+  list.push({ id, name: opts.name ?? basename(abs), path: stored, ...(opts.setup ? { setup: opts.setup.trim() } : {}) })
   save(ctx, list)
   ctx.out(`추가됨: ${id} → ${stored}`)
+  if (opts.setup) ctx.out(`setup (worktree 생성 직후 샌드박스 안에서 실행): ${opts.setup.trim()}`)
   if (!(await isGit(ctx, abs))) ctx.out(`경고: ${stored}는 git 저장소가 아닙니다 — 실행 단계에는 git 필요 (git init)`)
   ctx.out('데몬에 반영하려면: hq restart')
   return 0

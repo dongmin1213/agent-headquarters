@@ -3,8 +3,8 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, sy
 import { delimiter, join, resolve } from 'node:path'
 import { loadConfig } from '../config.ts'
 import { probeHq, waitFor } from './api.ts'
-import { DAEMON_LABEL, PET_LABEL, daemonLog, findBin, logsDir, petApp, petBinary, petLog, pidFile, plistPath, type Ctx, writeAtomic } from './ctx.ts'
-import { alive, ownDaemonPid } from './daemon.ts'
+import { DAEMON_LABEL, PET_LABEL, daemonLog, findBin, logsDir, petApp, petBinary, petLog, plistPath, type Ctx, writeAtomic } from './ctx.ts'
+import { stopTarget } from './daemon.ts'
 import { printDoctor, realProbes, runDoctor, type Probes } from './doctor.ts'
 import { daemonPlist, launchPath, petPlist } from './plist.ts'
 
@@ -76,15 +76,10 @@ export async function install(ctx: Ctx, opts: { sprites: boolean; probes?: Probe
   ctx.out(`  ${petApp(ctx)}`)
 
   ctx.out('4/6 기존 데몬 정리')
-  const pid = await ownDaemonPid(ctx)
-  if (pid) {
-    ctx.out(`  백그라운드 데몬(pid ${pid})을 멈추고 launchd로 옮깁니다`)
-    if (ctx.dryRun) ctx.out(`[dry-run] kill -TERM ${pid}`)
-    else {
-      process.kill(pid, 'SIGTERM')
-      await waitFor(async () => !alive(pid), 10_000)
-      rmSync(pidFile(ctx), { force: true })
-    }
+  const moved = await stopTarget(ctx)
+  if (moved && 'error' in moved) { ctx.err(moved.error); return 1 }
+  if (moved) {
+    ctx.out(`  백그라운드 데몬(pid ${moved.pid})을 멈추고 launchd로 옮깁니다`)
   } else {
     const p = await probeHq(ctx)
     const ours = (await ctx.run('launchctl', ['print', `gui/${ctx.uid}/${DAEMON_LABEL}`], { timeoutMs: 5000 })).code === 0
@@ -133,12 +128,9 @@ export async function uninstall(ctx: Ctx, opts: { purge: boolean; yes: boolean }
       ctx.out(`삭제: ${f}`)
     }
   }
-  const pid = await ownDaemonPid(ctx)
-  if (pid) {
-    if (ctx.dryRun) ctx.out(`[dry-run] kill -TERM ${pid}`)
-    else { process.kill(pid, 'SIGTERM'); await waitFor(async () => !alive(pid), 10_000); rmSync(pidFile(ctx), { force: true }) }
-    ctx.out(`백그라운드 데몬 중지 (pid ${pid})`)
-  }
+  const stopped = await stopTarget(ctx)
+  if (stopped && 'error' in stopped) ctx.err(`경고: ${stopped.error}`)
+  else if (stopped) ctx.out(`백그라운드 데몬 중지 (pid ${stopped.pid})`)
   const link = join(ctx.binDir, 'hq')
   try {
     if (lstatSync(link).isSymbolicLink() && readlinkSync(link) === join(ctx.root, 'bin/hq')) {

@@ -74,3 +74,24 @@ test('slugify', () => {
   assert.equal(slugify('My Cool_App!!'), 'my-cool-app')
   assert.equal(slugify('한글'), '')
 })
+
+test('add --setup stores the command and list shows it', async () => {
+  const ctx = testCtx()
+  mkdirSync(join(ctx.userHome, 'web'))
+  assert.equal(await projectsAdd(ctx, join(ctx.userHome, 'web'), { setup: 'npm ci --prefer-offline' }), 0)
+  assert.deepEqual(read(ctx), [{ id: 'web', name: 'web', path: '~/web', setup: 'npm ci --prefer-offline' }])
+  ctx.lines.length = 0
+  assert.equal(await projectsList(ctx), 0)
+  assert.ok(ctx.lines.includes('\tsetup: npm ci --prefer-offline'), ctx.text())
+  mkdirSync(join(ctx.userHome, 'w2'))
+  assert.equal(await projectsAdd(ctx, join(ctx.userHome, 'w2'), { setup: '  ' }), 1)
+})
+
+test('cli: projects add --setup via main()', async () => {
+  const { main } = await import('../../src/cli/main.ts')
+  const ctx = testCtx()
+  mkdirSync(join(ctx.userHome, 'svc'))
+  assert.equal(await main(['projects', 'add', join(ctx.userHome, 'svc'), '--setup', 'pnpm i --frozen-lockfile'], ctx), 0, ctx.text())
+  assert.equal(read(ctx)[0].setup, 'pnpm i --frozen-lockfile')
+  assert.equal(await main(['projects', 'list', '--setup', 'x'], ctx), 2)
+})

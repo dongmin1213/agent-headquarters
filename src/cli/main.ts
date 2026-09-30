@@ -19,7 +19,7 @@ export const HELP = `hq — agent-headquarters 운영 명령
   open                          웹 화면 열기 (일회용 링크)
   logs [-f] [-n <줄>]           데몬 로그 (-f: 계속 보기)
   projects list                 관리 프로젝트 목록
-  projects add <경로> [--id x] [--name y]
+  projects add <경로> [--id x] [--name y] [--setup "<명령>"]
   projects remove <id>
   version | help
 
@@ -28,7 +28,7 @@ export const HELP = `hq — agent-headquarters 운영 명령
 
 interface Parsed { pos: string[]; flags: Map<string, string | true> }
 
-const VALUE_FLAGS = new Set(['--id', '--name', '-n'])
+const VALUE_FLAGS = new Set(['--id', '--name', '--setup', '-n'])
 
 export function parseArgs(argv: string[]): Parsed | string {
   const pos: string[] = []
@@ -52,7 +52,7 @@ export function parseArgs(argv: string[]): Parsed | string {
 /** Allowed flags per command; anything else is a usage error. */
 const ALLOWED: Record<string, string[]> = {
   install: ['--no-sprites'], uninstall: ['--purge', '--yes'], doctor: ['--json'], status: ['--json'],
-  start: [], stop: [], restart: [], open: [], logs: ['-f', '--follow', '-n'], projects: ['--id', '--name'],
+  start: [], stop: [], restart: [], open: [], logs: ['-f', '--follow', '-n'], projects: ['--id', '--name', '--setup'],
   version: [], help: [],
 }
 
@@ -100,12 +100,13 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
     case 'uninstall': return uninstall(ctx, { purge: flags.has('--purge'), yes: flags.has('--yes') })
     case 'projects': {
       const sub = pos.shift() ?? 'list'
-      const id = flags.get('--id'), name = flags.get('--name')
-      if (sub !== 'add' && (id || name)) return usage(ctx, '--id/--name은 projects add에서만 씁니다')
+      const id = flags.get('--id'), name = flags.get('--name'), setup = flags.get('--setup')
+      if (sub !== 'add' && (id || name || setup)) return usage(ctx, '--id/--name/--setup은 projects add에서만 씁니다')
       if (sub === 'list') return pos.length ? usage(ctx, 'projects list는 인자를 받지 않습니다') : projectsList(ctx)
       if (sub === 'add') {
-        if (pos.length !== 1) return usage(ctx, 'hq projects add <경로> [--id x] [--name y]')
-        return projectsAdd(ctx, pos[0], { id: typeof id === 'string' ? id : undefined, name: typeof name === 'string' ? name : undefined })
+        if (pos.length !== 1) return usage(ctx, 'hq projects add <경로> [--id x] [--name y] [--setup "<명령>"]')
+        const v = (x: string | true | undefined) => (typeof x === 'string' ? x : undefined)
+        return projectsAdd(ctx, pos[0], { id: v(id), name: v(name), setup: v(setup) })
       }
       if (sub === 'remove' || sub === 'rm') return pos.length !== 1 ? usage(ctx, 'hq projects remove <id>') : projectsRemove(ctx, pos[0])
       return usage(ctx, `알 수 없는 projects 하위 명령 "${sub}" (list|add|remove)`)

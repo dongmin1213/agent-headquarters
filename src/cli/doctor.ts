@@ -3,8 +3,10 @@ import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync 
 import { dirname, join } from 'node:path'
 import { loadConfig } from '../config.ts'
 import { probeHq, type HqProbe } from './api.ts'
+import { pidCommand, readLockPid } from './daemon.ts'
+import { sandboxSmoke, type SmokeResult } from './sandbox.ts'
 import {
-  DAEMON_LABEL, PET_LABEL, expandHome, findBin, petApp, plistPath, projectsFile, runCmd, type Ctx, type ExecResult,
+  DAEMON_LABEL, PET_LABEL, expandHome, findBin, lockFile, petApp, plistPath, projectsFile, runCmd, type Ctx, type ExecResult,
 } from './ctx.ts'
 
 export type Status = 'ok' | 'warn' | 'fail'
@@ -19,6 +21,10 @@ export interface Probes {
   hq(): Promise<HqProbe>
   pgrep(pattern: string): Promise<boolean>
   launchctlLoaded(label: string): Promise<boolean>
+  /** Runs the Seatbelt smoke test (src/cli/sandbox.ts) with the given sandbox-exec. */
+  sandboxSmoke(sandboxExec: string): Promise<SmokeResult>
+  /** Command line of a live pid, null when it is gone. */
+  pidCommand(pid: number): Promise<string | null>
 }
 
 export function realProbes(ctx: Ctx): Probes {
@@ -34,6 +40,8 @@ export function realProbes(ctx: Ctx): Probes {
     hq: () => probeHq(ctx),
     pgrep: async (pattern) => (await runCmd('pgrep', ['-f', pattern], { timeoutMs: 5000 })).code === 0,
     launchctlLoaded: async (label) => (await runCmd('launchctl', ['print', `gui/${ctx.uid}/${label}`], { timeoutMs: 5000 })).code === 0,
+    sandboxSmoke: (bin) => sandboxSmoke(bin),
+    pidCommand: (pid) => pidCommand(pid),
   }
 }
 
@@ -108,6 +116,19 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
   if (sv && sv.code === 0) add('swiftc', 'swiftc (펫 빌드)', 'ok', firstLine(sv.stdout || sv.stderr))
   else add('swiftc', 'swiftc (펫 빌드)', 'fail', xs.code !== 0 ? 'Xcode Command Line Tools 없음' : 'swiftc 실행 실패', 'xcode-select --install 실행 후 다시 시도하세요')
 
+  // Worker sandbox (execution.md §6)
+  const SANDBOX_FIX = 'macOS 샌드박스가 동작하지 않아 작업자를 격리할 수 없음'
+  const sbx = p.findBin('sandbox-exec') ?? p.findBin('/usr/bin/sandbox-exec')
+  if (!sbx) {
+    add('sandbox-exec', 'sandbox-exec', 'fail', 'sandbox-exec 없음', SANDBOX_FIX)
+    add('sandbox', '샌드박스 시험', 'fail', 'sandbox-exec가 없어 시험하지 못함', SANDBOX_FIX)
+  } else {
+    add('sandbox-exec', 'sandbox-exec', 'ok', sbx)
+    let smoke: SmokeResult
+    try { smoke = await p.sandboxSmoke(sbx) } catch (e) { smoke = { ok: false, detail: (e as Error).message } }
+    add('sandbox', '샌드박스 시험', smoke.ok ? 'ok' : 'fail', smoke.detail, SANDBOX_FIX)
+  }
+
   // Projects
   const pf = projectsFile(ctx)
   if (!existsSync(pf)) {
@@ -129,9 +150,23 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
           add(`project:${id}`, `프로젝트 ${id}`, 'fail', `경로 없음: ${String(pr.path)}`, `hq projects remove ${id} 후 올바른 경로로 hq projects add`)
           continue
         }
+        // The execution phase needs git with at least one commit (worktrees branch from HEAD): fail, not warn.
         const g = git ? await p.run(git, ['-C', path, 'rev-parse', '--is-inside-work-tree']) : null
-        if (g && g.code === 0 && g.stdout.trim() === 'true') add(`project:${id}`, `프로젝트 ${id}`, 'ok', `${String(pr.path)} (git)`)
-        else add(`project:${id}`, `프로젝트 ${id}`, 'warn', `${String(pr.path)}는 git 저장소가 아님 — 실행 단계에는 git 필요`, `cd ${path} && git init && git add -A && git commit -m init`)
+        if (!(g && g.code === 0 && g.stdout.trim() === 'true')) {
+          add(`project:${id}`, `프로젝트 ${id}`, 'fail', `${String(pr.path)}는 git 저장소가 아님 — 실행 단계에는 git 필요`, `cd ${path} && git init && git add -A && git commit -m init`)
+          continue
+        }
+        const head = await p.run(git!, ['-C', path, 'rev-parse', '--verify', '--quiet', 'HEAD'])
+        if (head.code !== 0) {
+          add(`project:${id}`, `프로젝트 ${id}`, 'fail', `${String(pr.path)}에 커밋이 없음 — 실행 단계에는 커밋이 하나 이상 필요`, `cd ${path} && git add -A && git commit -m init`)
+          continue
+        }
+        add(`project:${id}`, `프로젝트 ${id}`, 'ok', `${String(pr.path)} (git, 커밋 있음)`)
+        const st = await p.run(git!, ['-C', path, 'status', '--porcelain'])
+        if (st.code === 0 && !st.stdout.trim()) add(`project-tree:${id}`, `작업 트리 ${id}`, 'ok', '깨끗함')
+        else add(`project-tree:${id}`, `작업 트리 ${id}`, 'warn',
+          st.code === 0 ? `변경 ${st.stdout.trim().split('\n').length}건 — 병합은 깨끗한 작업 트리에서만 가능` : 'git status 실패 — 병합은 깨끗한 작업 트리에서만 가능',
+          `cd ${path} && git status (커밋하거나 stash 후 병합)`)
       }
     }
   }
@@ -162,6 +197,18 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
     `사용 중인 프로세스 확인: lsof -nP -iTCP:${ctx.port} -sTCP:LISTEN (또는 HQ_PORT로 다른 포트)`)
   if (hq.kind === 'hq') add('daemon', '데몬', 'ok', `실행 중 (127.0.0.1:${ctx.port})`)
   else add('daemon', '데몬', 'warn', '실행 중이 아님', 'hq start (자동 시작까지: hq install)')
+
+  // Daemon single-instance lock
+  const lf = lockFile(ctx)
+  if (!existsSync(lf)) add('lock', '데몬 잠금', 'ok', '없음')
+  else {
+    const pid = readLockPid(ctx)
+    const cmd = pid ? await p.pidCommand(pid) : null
+    if (!pid) add('lock', '데몬 잠금', 'warn', `${lf}에서 pid를 읽지 못함`, `데몬이 꺼져 있다면 rm ${lf}`)
+    else if (cmd === null) add('lock', '데몬 잠금', 'warn', `오래된 잠금 (pid ${pid} 종료됨)`, `hq start (데몬이 넘겨받음). 안 되면 rm ${lf}`)
+    else if (!cmd.includes('src/main.ts')) add('lock', '데몬 잠금', 'warn', `pid ${pid}가 hq가 아닌 프로세스 (pid 재사용: 오래된 잠금)`, `rm ${lf} 후 hq start`)
+    else add('lock', '데몬 잠금', 'ok', `pid ${pid} 실행 중`)
+  }
 
   // Pet
   const petBuilt = existsSync(petApp(ctx))

@@ -11,6 +11,7 @@ const okProbes: Probes = {
   findBin: (n) => `/fake/bin/${n}`,
   run: async (cmd, args) => ({ code: 0, stdout: cmd.endsWith('claude') && args[0] === 'auth' ? '{"loggedIn":true}' : args.includes('rev-parse') ? 'true' : 'v1', stderr: '' }),
   hq: async () => ({ kind: 'down' }), pgrep: async () => false, launchctlLoaded: async () => false,
+  sandboxSmoke: async () => ({ ok: true, detail: 'ok' }), pidCommand: async () => null,
 }
 
 test('dry-run install writes both plists into the temp dir and prints launchctl commands', async () => {
