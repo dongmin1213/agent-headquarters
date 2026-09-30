@@ -1,4 +1,5 @@
-// macOS Seatbelt boundary for workers, reviewers, setup and check commands (execution.md §6.2).
+// macOS Seatbelt boundary for workers, reviewers, setup and check commands (execution.md §6.2). Recurring teams
+// (scheduler.ts teamProfile) build theirs from the same exported rule pieces.
 // SBPL: later rules take precedence. v4 layout (allow-lists, measured on macOS 26.5 / CLI 2.1.285):
 //   signals: only processes of this same sandbox instance
 //   mach-lookup: deny, then the measured allow-list (MACH_SERVICES) — closes LaunchServices/launchd escapes
@@ -101,7 +102,7 @@ let userTemp: string[] | null = null
  * Writable temp roots: /private/tmp and this user's temp folder (/var/folders/<x>/<y>/T), not all of /var/folders —
  * its sibling C/ holds per-user caches (clang/swift module caches, app caches) that unsandboxed programs load (S4).
  */
-function tempRoots(): string[] {
+export function tempRoots(): string[] {
   if (!userTemp) {
     let darwin: string | null = null
     try { darwin = execFileSync('/usr/bin/getconf', ['DARWIN_USER_TEMP_DIR'], { encoding: 'utf8' }).trim() || null } catch { /* not macOS */ }
@@ -110,55 +111,93 @@ function tempRoots(): string[] {
   return ['/private/tmp', ...userTemp]
 }
 
+// ----- v4 rule pieces shared by the worker profile (sandboxProfile) and the recurring-team profile (scheduler.ts) -----
+
+/** F04: no signals to processes outside this sandbox instance (hq, the user's shells, other workers). */
+export const signalRules = (): string[] => ['(deny signal)', '(allow signal (target same-sandbox))']
+
+/** S1: mach-lookup allow-list (see MACH_SERVICES). */
+export const machRules = (): string[] => ['(deny mach-lookup)', ...MACH_SERVICES.map(([n, why]) => `(allow mach-lookup (global-name ${q(n)})) ; ${why}`)]
+
+/** S2: the measured ~ read allow-list (HOME_READABLE) as SBPL filters; `home` is already resolved. */
+export const homeReadFilters = (home: string): string[] =>
+  HOME_READABLE.map(([p]) => (p.endsWith('/') ? sub(join(home, p.slice(0, -1))) : lit(join(home, p))))
+
+/** Credentials under ~ that stay unreadable and unwritable even inside a re-allowed path. */
+export const homeSecretFilters = (home: string): string[] =>
+  [sub(join(home, '.ssh')), sub(join(home, '.aws')), sub(join(home, '.config/gh')), lit(join(home, '.netrc')), lit(join(home, '.docker/config.json'))]
+
+/** The process's own ~/.claude/projects/<encoded cwd>/ folder (`own`) and its memory/ (`memory`), as SBPL filters. */
+export function claudeOwnFilters(home: string, cwd: string): { claudeDir: string; own: string; memory: string } {
+  const claudeDir = join(home, '.claude')
+  const proj = claudeProjectDir(real(cwd))
+  const own = proj.truncated
+    ? rx(`^${reEsc(join(claudeDir, 'projects', proj.name))}-[^/]*(/|$)`)
+    : sub(join(claudeDir, 'projects', proj.name))
+  // Its memory/ is loaded into later sessions in the same folder: never writable (a process cannot plant instructions).
+  const memory = proj.truncated
+    ? rx(`^${reEsc(join(claudeDir, 'projects', proj.name))}-[^/]*/memory(/|$)`)
+    : sub(join(claudeDir, 'projects', proj.name, 'memory'))
+  return { claudeDir, own, memory }
+}
+
+/**
+ * ~/.claude writes: nothing outside the own projects/<cwd>/ folder, never ~/.claude.json*, the control files
+ * (settings, CLAUDE.md, skills/agents/commands/plugins/hooks) or the own memory/. Denied explicitly so the rule holds
+ * even when $HOME sits under a temp root.
+ */
+export function claudeWriteRules(home: string, c: { claudeDir: string; own: string; memory: string }): string[] {
+  const control = [rx(`^${reEsc(c.claudeDir)}/settings[^/]*\\.json$`), lit(join(c.claudeDir, 'CLAUDE.md')), ...CLAUDE_PROTECTED_DIRS.map((d) => sub(join(c.claudeDir, d)))]
+  return [
+    `(deny file-write* (require-all ${sub(c.claudeDir)} (require-not ${c.own})) ${rx(`^${reEsc(home)}/\\.claude\\.json`)})`,
+    `(deny file-write* ${[...control, c.memory].join(' ')})`,
+  ]
+}
+
+/** S1: no /usr/bin/open, osascript or launchctl, and no Apple events. */
+export const launchRules = (): string[] => [
+  '(deny process-exec (literal "/usr/bin/open") (literal "/usr/bin/osascript") (literal "/bin/launchctl"))',
+  '(deny appleevent-send)',
+]
+
+/** Workers never reach the hq API (teams do: they talk to it with their scoped token). */
+export const hqPortRule = (port: number): string => `(deny network-outbound (remote ip ${q(`localhost:${port}`)}))`
+
+/** SBPL subpath filter for a path (resolved). */
+export const subpathOf = (p: string): string => sub(real(p))
+
 export function sandboxProfile(o: SandboxOpts): string {
   const home = real(o.home ?? homedir())
   const hq = real(o.hqHome)
   const own = [o.worktree, ...(o.out ? [o.out] : [])].map(real)
   const projects = o.projects.map(real)
   const extra = o.extraWritable.map(real)
-  const claudeDir = join(home, '.claude')
-  const proj = claudeProjectDir(real(o.worktree))
-  const claudeOwn = proj.truncated
-    ? rx(`^${reEsc(join(claudeDir, 'projects', proj.name))}-[^/]*(/|$)`)
-    : sub(join(claudeDir, 'projects', proj.name))
-  // Its memory/ is loaded into later sessions in the same clone: never writable (a worker cannot plant instructions).
-  const claudeOwnMemory = proj.truncated
-    ? rx(`^${reEsc(join(claudeDir, 'projects', proj.name))}-[^/]*/memory(/|$)`)
-    : sub(join(claudeDir, 'projects', proj.name, 'memory'))
-  const homeRead = HOME_READABLE.map(([p]) => (p.endsWith('/') ? sub(join(home, p.slice(0, -1))) : lit(join(home, p))))
+  const claude = claudeOwnFilters(home, o.worktree)
   const secretContents = [
     sub(real(o.tokenDir)), rx(`^${reEsc(hq)}/hq\\.db`), sub(join(hq, 'runs')), sub(join(hq, 'logs')), sub(join(hq, 'work')),
-    sub(join(home, '.ssh')), sub(join(home, '.aws')), sub(join(home, '.config/gh')), lit(join(home, '.netrc')), lit(join(home, '.docker/config.json')),
+    ...homeSecretFilters(home),
     ...projects.map((p) => rx(`^${reEsc(p)}/(.*/)?\\.env[^/]*$`)),
   ]
   const writable = [...own, ...tempRoots(), '/dev', ...extra]
-  const claudeControl = [rx(`^${reEsc(claudeDir)}/settings[^/]*\\.json$`), lit(join(claudeDir, 'CLAUDE.md')), ...CLAUDE_PROTECTED_DIRS.map((d) => sub(join(claudeDir, d)))]
   return [
     '(version 1)',
     '(allow default)',
-    // F04: no signals to processes outside this sandbox instance (hq, the user's shells, other workers).
-    '(deny signal)',
-    '(allow signal (target same-sandbox))',
-    // S1: mach-lookup allow-list (see MACH_SERVICES).
-    '(deny mach-lookup)',
-    ...MACH_SERVICES.map(([n, why]) => `(allow mach-lookup (global-name ${q(n)})) ; ${why}`),
+    ...signalRules(),
+    ...machRules(),
     // S2: $HOME, $HQ_HOME and project checkouts are unreadable except the measured list, the mirror and own paths.
     `(deny file-read-data ${[sub(home), sub(hq), ...projects.map(sub)].join(' ')})`,
-    `(allow file-read-data ${[...homeRead, ...extra.map(sub), ...(o.mirror ? [sub(real(o.mirror))] : []), ...(o.readable ?? []).map((p) => sub(real(p))), claudeOwn].join(' ')})`,
+    `(allow file-read-data ${[...homeReadFilters(home), ...extra.map(sub), ...(o.mirror ? [sub(real(o.mirror))] : []), ...(o.readable ?? []).map((p) => sub(real(p))), claude.own].join(' ')})`,
     `(deny file-read-data file-write* ${secretContents.join(' ')})`,
     `(allow file-read-data file-write* ${own.map(sub).join(' ')})`,
     // S3/S4: writes only to own paths, temp, the worker's own ~/.claude/projects/<cwd>/ folder and extraWritable.
-    `(deny file-write* (require-not (require-any ${writable.map(sub).join(' ')} ${claudeOwn})))`,
+    `(deny file-write* (require-not (require-any ${writable.map(sub).join(' ')} ${claude.own})))`,
     // $HQ_HOME (mirrors, other worktrees, the DB) and user checkouts are never writable, even when they sit under an
     // allow-listed temp root; the process's own paths are re-allowed right after.
     `(deny file-write* ${[sub(hq), ...projects.map(sub)].join(' ')})`,
     `(allow file-write* ${own.map(sub).join(' ')})`,
-    // ~/.claude and ~/.claude.json* are denied explicitly too, so the rule holds even when $HOME sits under a temp root.
-    `(deny file-write* (require-all ${sub(claudeDir)} (require-not ${claudeOwn})) ${rx(`^${reEsc(home)}/\\.claude\\.json`)})`,
-    `(deny file-write* ${[...claudeControl, claudeOwnMemory].join(' ')})`,
-    '(deny process-exec (literal "/usr/bin/open") (literal "/usr/bin/osascript") (literal "/bin/launchctl"))',
-    '(deny appleevent-send)',
-    `(deny network-outbound (remote ip ${q(`localhost:${o.hqPort}`)}))`,
+    ...claudeWriteRules(home, claude),
+    ...launchRules(),
+    hqPortRule(o.hqPort),
     '',
   ].join('\n')
 }
