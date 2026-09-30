@@ -80,17 +80,18 @@ create table quota (id integer primary key check (id = 1), five_hour real, seven
 ## 4. 상태
 **Request.status**: `queued → thinking → asking → planned → approved → executing → awaiting_acceptance → accepted → merging → merged`, 분기 `rejected | failed | blocked`(회로 차단 등 사람 판단 필요) `| cancelled`.
 
-**TaskStatus**: `pending`(의존 대기·배정 대기) → `running` → `verifying` → `reviewing` → `passed`. 분기: `rework`(다음 시도 대기) · `question`(작업자 질문 대기) · `held`(한도 보류) · `blocked`(3회 실패 또는 확인 불가 → 사람 판단) · `cancelled`.
+**TaskStatus**: `pending`(의존 대기·배정 대기) → `running` → `verifying` → `reviewing` → `passed`. 분기: `rework`(다음 시도 대기) · `revising`(CEO 지시서 수정 중, §9a) · `question`(작업자 질문 대기) · `held`(한도 보류) · `blocked`(3회 실패 또는 확인 불가 → 사람 판단) · `cancelled`.
 `collect` 역할: `running → verifying(보고서 존재·요약 확인만) → passed`. 검토 없음.
 `verify` 역할 작업은 독립 실행하지 않는다: 의존 대상 구현 작업의 `review_brief`로 합쳐진다.
 
-**AttemptStatus**: `starting → running → ended` 후 판정 `succeeded | failed | question | limited | runaway | unverifiable | start_failed`.
+**AttemptStatus**: `starting → running → ended` 후 판정 `succeeded | failed | brief_blocked | question | limited | runaway | unverifiable | start_failed`.
 
 ## 5. 작업자 실행 계약
 - worktree: 프로젝트가 git repo가 아니면 계획 승인 시 요청을 `failed`(사유 명시). base = 승인 시점 프로젝트 `HEAD` 커밋(요청 단위 고정). 같은 프로젝트에서 의존하는 작업은 선행 작업의 `head_sha`에서 분기. 브랜치 `hq/<requestId>/<taskKey>`.
 - 실행: `claude -p --output-format stream-json --verbose --model <models[x]> --session-id <uuid> --permission-mode acceptEdits --allowedTools Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch --disallowedTools <workerDisallowedTools> --setting-sources "" --strict-mcp-config --disable-slash-commands --add-dir <증거폴더> --max-turns <maxTurns>`, cwd = worktree, stdin = `prompt.md` 파일, stdout/stderr = 증거 폴더 파일. `detached: true`로 띄워 데몬 재시작에도 살아남는다. 환경변수에서 `CLAUDECODE` 제거, `HQ_ATTEMPT_DIR` 설정.
   - `collect`: `--allowedTools Read,Glob,Grep,WebFetch,WebSearch,Write(<증거폴더>/**)`, 커밋 없음.
 - 프롬프트(`src/exec/prompt.ts`): 지시서 + owns + 수용 기준 + 아래 규칙. 재작업이면 이전 실패 증거(checks.json 실패 항목·검토 blocking·반려 사유) 요약을 붙인다.
+  0. **지시서대로만 구현한다. 설계를 새로 하지 않는다.** 지시서가 코드 현실과 다르거나 모호하면 추측하지 말고 `outcome: "blocked"`로 멈추고, 어느 지시가 무엇과 어떻게 다른지 증거(파일:줄, 명령 출력)를 report.md에 적는다. (판단은 CEO가, 실행은 작업자가 — decisions/0001)
   1. owns 밖 파일을 바꾸지 않는다. 필요하면 멈추고 `outcome: "blocked"`로 이유를 적는다.
   2. 작업을 코드 커밋으로 남긴다(여러 개 가능). 마지막에 작업 트리가 깨끗해야 한다. push 금지.
   3. `report.md`를 증거 폴더에 쓴다: 첫 절은 `## 요약`(200자 이상: 무엇을·왜·검증 결과), 그 뒤 수용 기준별 확인 결과(실행한 명령과 종료 코드).
@@ -109,7 +110,8 @@ create table quota (id integer primary key check (id = 1), five_hour real, seven
 2. 폭주로 죽였으면 → `runaway` (실패로 셈).
 3. `done.json` 없음·파싱 실패·토큰 불일치 → `unverifiable` (자동 재실행 안 함 → 작업 `blocked`, 사람 판단). 종료 코드 0이어도 같다.
 4. outcome `question` → `question`.
-5. outcome `failed|blocked` → `failed` (reason에 요약).
+5. outcome `blocked` → `brief_blocked`: 지시서 문제이므로 같은 지시서로 재시도하지 않는다(시도 수에 안 셈). task `revising` → CEO 지시서 수정 턴(§9a).
+6. outcome `failed` → `failed` (reason에 요약).
 6. `succeeded`면 검사: `head_sha` = worktree HEAD, base..HEAD 변경 파일 집합 = `files_modified`, 모두 owns glob 안, `git status --porcelain` 비어 있음, report.md 존재·`## 요약` 200자 이상, done.json 이후 HEAD 불변. 하나라도 실패 → `failed`(사유 목록).
 
 ## 7. 기계 검증 (hq가 직접)
@@ -125,6 +127,12 @@ hq 검사: `pass=true`인데 blocking 있음·fail 기준 있음·tests_run 비�
 
 ## 9. 재작업 사다리·회로 차단
 작업 실패(`failed`, `runaway`, 기계 검증 실패, 검토 blocking, 결과 반려) 시 `attempts < maxAttempts`면 다음 시도: 2번째는 같은 모델, 3번째는 `ladder`에서 한 단계 위(최상위면 그대로). 같은 worktree에서 이어서(이전 커밋 유지). `maxAttempts` 도달 → task `blocked`, request `blocked`, 사람 카드 "작업 X가 3번 실패했어요" [한 번 더(최상위 모델)] [이 작업 취소하고 계속] [요청 중단].
+
+## 9a. 지시서 수정 턴 (CEO)
+작업자가 `blocked`로 멈추면 CEO가 판단한다(작업자는 설계하지 않는다). 입력: 원 PlanTask, 작업자 report.md, 현재 worktree diff stat. 출력(JSON 스키마): `{ revised_task: PlanTask | null, questions: CeoQuestion[] }` 정확히 하나.
+- `revised_task`의 `id·project·role`은 원래와 같아야 한다. `owns`가 원래의 부분집합이고 `acceptance`의 `check` 명령 집합이 같으면 자동 적용(시도 수 초기화 없음) → task `rework`. 아니면 승인 카드 `revise:<taskId>`(옵션 `승인`,`반려`, subjectHash=수정 task JSON 해시) → 승인 시 적용, 반려 시 task `blocked`.
+- `questions` → 회장에게(요청의 CEO 질문과 같은 카드), 답 오면 수정 턴 재실행.
+- task당 수정 턴 최대 2회. 초과 → task `blocked`(회로 차단 카드).
 
 ## 10. 동시성·스케줄
 - 전역 동시 시도(작업+검토) ≤ `maxWorkers`. 요청은 접수 순서, 작업은 의존이 모두 `passed`인 것 중 계획 순서.

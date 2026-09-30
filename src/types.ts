@@ -64,8 +64,8 @@ export interface RequestView {
   updatedAt: string
 }
 
-export type TaskStatus = 'pending' | 'running' | 'verifying' | 'reviewing' | 'passed' | 'rework' | 'question' | 'held' | 'blocked' | 'cancelled'
-export type AttemptStatus = 'starting' | 'running' | 'succeeded' | 'failed' | 'question' | 'limited' | 'runaway' | 'unverifiable' | 'start_failed'
+export type TaskStatus = 'pending' | 'running' | 'verifying' | 'reviewing' | 'passed' | 'rework' | 'revising' | 'question' | 'held' | 'blocked' | 'cancelled'
+export type AttemptStatus = 'starting' | 'running' | 'succeeded' | 'failed' | 'brief_blocked' | 'question' | 'limited' | 'runaway' | 'unverifiable' | 'start_failed'
 
 export interface TaskView {
   /** "<requestId>/<taskKey>" */
