@@ -61,7 +61,7 @@ export async function projectsAdd(ctx: Ctx, path: string, opts: { id?: string; n
   save(ctx, list)
   ctx.out(`추가됨: ${id} → ${stored}`)
   if (opts.setup) ctx.out(`setup (worktree 생성 직후 샌드박스 안에서 실행): ${opts.setup.trim()}`)
-  if (!(await isGit(ctx, abs))) ctx.out(`경고: ${stored}는 git 저장소가 아닙니다 — 실행 단계에는 git 필요 (git init)`)
+  if (!(await isGit(ctx, abs))) ctx.out(`경고: 경로(${stored})는 git 저장소가 아닙니다 — 실행 단계에는 git 필요 (git init)`)
   ctx.out('데몬에 반영하려면: hq restart')
   return 0
 }

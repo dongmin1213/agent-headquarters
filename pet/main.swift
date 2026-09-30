@@ -49,6 +49,8 @@ struct DecisionItem: Decodable {
     var title: String? = nil; var detail: String? = nil; var options: [String]? = nil; var subjectHash: String? = nil
     var situation: String? = nil; var cause: String? = nil; var causeConfirmed: Bool? = nil
     var recommendation: Recommendation? = nil; var optionHelp: [String: String]? = nil; var detailPath: String? = nil
+    /// Irreversible options → inline confirm question; sent only after a second click.
+    var confirm: [String: String]? = nil
     struct Recommendation: Decodable { let option: String; let reason: String }
     var key: String { "\(id)#\(revision ?? 0)" }
 }
@@ -502,7 +504,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
                 default: plateText(w.project, w.title, w.model)
             }
             if w.state == "held" { l.mood = .sleeping; l.badge = "zz" }
-            if w.state == "blocked" { l.mood = .blocked; l.bubble = "멈춤 · 사장에게 보고" }
+            if w.state == "blocked" { l.mood = .blocked; l.bubble = "막힘 · 사장에게 보고" }
             c.set(l)
         }
 
@@ -957,6 +959,10 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     var projectPicker: NSPopUpButton?
     var rejectFields: [Int: NSTextField] = [:]
     var rejectSends: [Int: NSButton] = [:]
+    /// "<card>\u{1F}<option>" → the hidden inline confirm row for an irreversible option.
+    var confirmRows: [String: NSView] = [:]
+    /// Card index → the hidden raw text behind "원문 보기".
+    var rawViews: [Int: NSView] = [:]
     var rejectRows: [Int: NSView] = [:]
     var shownDecisions: [DecisionItem] = []
     var decisionErrors: [Int: NSTextField] = [:]
@@ -1000,12 +1006,20 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         }
     }
 
+    /// Inline confirm question for an irreversible option (daemon's `confirm`; same fallback rule as the web page).
+    func confirmQuestion(_ d: DecisionItem, _ o: String) -> String? {
+        if let q = d.confirm?[o], !q.isEmpty { return q }
+        if (d.kind == "blocked" && o == "stop") || o == "요청 중단" { return "정말 중단할까요? · 되돌릴 수 없어요" }
+        if d.kind == "merge" && o == "병합" { return "대상 브랜치에 병합할까요?" }
+        return nil
+    }
+
     func optionLabel(_ d: DecisionItem, _ o: String) -> String { d.kind == "blocked" ? (Pet.blockedLabels[o] ?? o) : o }
 
     /// 내 차례: one card per DecisionItem in the daemon's order.
     func decisionsBody() -> NSStackView {
         let items = offline ? [] : (snapshot?.decisions ?? [])
-        shownDecisions = items; decisionErrors = [:]; rejectFields = [:]; rejectSends = [:]; rejectRows = [:]; cardViews = [:]
+        shownDecisions = items; decisionErrors = [:]; rejectFields = [:]; rejectSends = [:]; rejectRows = [:]; cardViews = [:]; confirmRows = [:]; rawViews = [:]
         let body = vstack(spacing: 12)
         if items.isEmpty { body.addArrangedSubview(text("지금 하실 결정은 없어요.", color: Palette.muted)); return body }
         for (i, d) in items.enumerated() {
@@ -1035,6 +1049,16 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
                 buttons.append(button(optionLabel(d, o), #selector(decisionButton(_:)), "\(i)\u{1F}\(j)", primary: d.recommendation?.option == o))
             }
             if !buttons.isEmpty { card.addArrangedSubview(buttonRows(buttons, maxWidth: Pet.cardText)) }
+            // Irreversible options: a hidden inline question with the real send button (no dialogs).
+            for (j, o) in opts.enumerated() {
+                guard let q = confirmQuestion(d, o) else { continue }
+                let yes = button(optionLabel(d, o), #selector(confirmYes(_:)), "\(i)\u{1F}\(j)")
+                yes.bezelColor = .systemRed
+                let no = button("아니요", #selector(confirmNo(_:)), "\(i)\u{1F}\(j)")
+                let r = vstack([text(q, size: 12.5, weight: .semibold, color: .systemRed, width: Pet.cardText), row([yes, no])], spacing: 6)
+                r.isHidden = true; confirmRows["\(i)\u{1F}\(j)"] = r
+                card.addArrangedSubview(r)
+            }
             if d.kind == "ceo_question" || d.kind == "worker_question" {
                 card.addArrangedSubview(freeField("직접 답하기 (엔터)", #selector(decisionFree(_:)), "\(i)"))
             }
@@ -1049,7 +1073,15 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
             }
             let err = text("", size: 12.5, weight: .medium, color: .systemRed, width: Pet.cardText); err.isHidden = true; decisionErrors[i] = err
             card.addArrangedSubview(err)
-            if d.detailPath != nil { card.addArrangedSubview(link("원문 보기 ›", #selector(openDetail(_:)), "\(i)")) }
+            // Raw text (program output, full team card body) stays folded behind 원문 보기.
+            if let raw = d.detail, !raw.isEmpty, d.situation?.isEmpty == false {
+                card.addArrangedSubview(link("원문 보기", #selector(toggleRaw(_:)), "\(i)"))
+                let rv = text(String(raw.prefix(3000)), size: 11.5, color: Palette.muted, width: Pet.cardText)
+                rv.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular)
+                rv.isHidden = true; rawViews[i] = rv
+                card.addArrangedSubview(rv)
+            }
+            if d.detailPath != nil { card.addArrangedSubview(link("웹에서 자세히 보기 ›", #selector(openDetail(_:)), "\(i)")) }
             let box = boxed(card, fill: Palette.card, stroke: Palette.border, width: Pet.innerWidth)
             cardViews[i] = box
             body.addArrangedSubview(box)
@@ -1134,7 +1166,19 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     /// Blocked-card options are the wire values retry | skip | stop; labels are fixed here.
     static let blockedLabels = ["retry": "한 번 더", "skip": "이 작업 건너뛰기", "stop": "요청 중단"]
     /// Small label above a 내 차례 card; kinds without one (and unknown kinds) render without it.
-    static let kindLabels = ["team": "팀 결정"]
+    /// Glossary copy: must match src/glossary.ts KIND_LABELS (test/unit/glossary.test.ts).
+    static let kindLabels = [
+        "system": "로그인 필요",
+        "plan": "계획 승인",
+        "ceo_question": "사장 질문",
+        "worker_question": "작업자 질문",
+        "revise": "지시서 수정안",
+        "blocked": "막힘",
+        "integration": "통합 문제",
+        "accept": "결과 수락",
+        "merge": "병합 승인",
+        "team": "팀 결정",
+    ]
 
     func decisionAt(_ v: NSView) -> (Int, DecisionItem, String?)? {
         guard !offline, let raw = v.identifier?.rawValue else { return nil }
@@ -1148,6 +1192,28 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
 
     @objc func decisionButton(_ b: NSButton) {
         guard let (i, d, o) = decisionAt(b), let o else { return }
+        if let id = b.identifier?.rawValue, let r = confirmRows[id], confirmQuestion(d, o) != nil {
+            r.isHidden = false; relayoutPopover(); return   // first click only asks
+        }
+        send(d, o, index: i)
+    }
+    @objc func confirmYes(_ b: NSButton) {
+        guard let (i, d, o) = decisionAt(b), let o, let id = b.identifier?.rawValue, confirmRows[id]?.isHidden == false else { return }
+        confirmRows[id]?.isHidden = true
+        send(d, o, index: i)
+    }
+    @objc func confirmNo(_ b: NSButton) {
+        guard let id = b.identifier?.rawValue else { return }
+        confirmRows[id]?.isHidden = true; relayoutPopover()
+    }
+    @objc func toggleRaw(_ b: NSButton) {
+        guard let (i, _, _) = decisionAt(b), let v = rawViews[i] else { return }
+        v.isHidden.toggle()
+        let title = v.isHidden ? "원문 보기" : "원문 접기"
+        b.attributedTitle = NSAttributedString(string: title, attributes: [.foregroundColor: NSColor.linkColor, .font: NSFont.systemFont(ofSize: 12.5, weight: .medium)])
+        relayoutPopover()
+    }
+    func send(_ d: DecisionItem, _ o: String, index i: Int) {
         if d.kind == "blocked" {
             post("api/tasks/\(seg(d.taskId ?? d.id))/decide", body: ["decision": o, "revision": d.revision ?? 0], decision: i)
         } else { answer(d, o, index: i) }
@@ -1246,11 +1312,11 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
                 let (data, resp) = try await URLSession.shared.data(for: req)
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
                 if code >= 400 {
+                    // Only the daemon's Korean `error` sentence is shown; the status code and raw body go to the log.
                     let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-                    let text = obj?["error"] as? String
-                        ?? String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    failure = (text?.isEmpty == false ? text! : "요청이 거절됐어요") + (code == 409 ? "" : " (HTTP \(code))")
-                    log("POST \(path) → \(code): \(failure!)")
+                    let text = (obj?["error"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    failure = text?.isEmpty == false ? text! : (code >= 500 ? "hq에서 문제가 생겼어요 · hq logs로 원문을 확인할 수 있어요" : "요청을 처리하지 못했어요")
+                    log("POST \(path) → \(code): \(String(data: data, encoding: .utf8) ?? "")")
                 }
             } catch { failure = "hq에 연결하지 못했어요" }
             if let i = decision {

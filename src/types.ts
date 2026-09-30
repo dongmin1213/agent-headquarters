@@ -138,7 +138,7 @@ export interface WorkerView {
   model: string
   /** verify = hq's own acceptance checks (model "hq"). */
   kind: 'work' | 'review' | 'verify'
-  /** blocked = stopped and waiting for a chairman decision (shown as "멈춤 · 사장에게 보고"). */
+  /** blocked = stopped and waiting for a chairman decision (shown as "막힘 · 사장에게 보고"). */
   state: 'running' | 'verifying' | 'reviewing' | 'held' | 'blocked'
   bubble: string
   startedAt: string
@@ -169,6 +169,8 @@ export interface DecisionItem {
   recommendation: { option: string; reason: string } | null
   /** One line per option: what happens if the chairman picks it (cost, reversibility). */
   optionHelp: Record<string, string>
+  /** Irreversible options: {option: inline confirm question}. Web and pet send only after a second click. */
+  confirm?: Record<string, string>
   /** Web detail link path (e.g. "/ui/#request=req-x&task=req-x.A") for "원문 보기". */
   detailPath: string | null
   /** Exact values to send (approval option, answer choice, or retry|skip|stop for blocked); see execution.md §17. */

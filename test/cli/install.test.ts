@@ -207,7 +207,7 @@ test('non-default purge deletes its home and token but keeps the shared pet app'
   assert.equal(existsSync(ctx.tokenFile), false)
   assert.equal(existsSync(plistPath(ctx, daemonLabel(ctx))), false)
   assert.ok(existsSync(petApp(ctx)), 'pet app kept')
-  assert.match(ctx.text(), /펫 앱 .*남겨 둡니다/)
+  assert.match(ctx.text(), /펫 앱.*남겨 둡니다/)
 })
 
 test('purgePlan: only the default installation removes the pet app (pure check, no network)', () => {

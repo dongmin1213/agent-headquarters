@@ -2,7 +2,7 @@
 // Security: every piece of data reaches the DOM through textContent / text nodes / setAttribute — never as HTML.
 import {
   ATTEMPT_STATUS, DECISION_KIND, QUOTA_MODE, REQUEST_STATUS, TASK_GROUPS, TASK_STATUS, BLOCKED_LABEL, formatClock, formatCost, formatDuration,
-  createSseParser, formatRelative, parseDiff, parseFragment, percent, renderMarkdown, shortSha, statusInfo, windowLabel,
+  confirmStep, confirmText, createSseParser, formatRelative, parseDiff, parseFragment, percent, renderMarkdown, shortSha, statusInfo, windowLabel,
 } from './lib.js'
 
 const $ = (id) => document.getElementById(id)
@@ -134,7 +134,8 @@ function errorText(e) {
   if (e.status === 409) return '처리할 수 없는 상태예요. 최신 내용을 다시 불러왔어요.'
   if (e.status === 404) return '대상을 찾을 수 없어요'
   if (e.status === 413) return '내용이 너무 커요'
-  return `요청 실패 (${e.status})`
+  if (e.status >= 500) return '서버에서 문제가 생겼어요 · hq logs로 원문을 확인할 수 있어요'
+  return '요청을 처리하지 못했어요'
 }
 
 // ---------- data loading ----------
@@ -390,20 +391,12 @@ function decisionCard(d) {
     opts.forEach((decision, i) => {
       const label = BLOCKED_LABEL[decision] ?? decision
       const known = decision in BLOCKED_LABEL
-      const ck = `${key}:stop`
-      if (decision === 'stop' && ui.confirm.has(ck)) {
-        actions.push(h('span', { class: 'confirm' },
-          h('button', { class: 'btn btn-danger', type: 'button', disabled: busy, 'data-fkey': `stopyes:${key}`, onclick: () => { ui.confirm.delete(ck); post(`/tasks/${enc(d.taskId ?? '')}/decide`, { decision, revision: d.revision }, '요청을 중단했어요') } }, '정말 중단'),
-          h('button', { class: 'btn', type: 'button', onclick: () => { ui.confirm.delete(ck); rerenderDecisions() } }, '아니요')))
-        return
-      }
+      const send = () => post(`/tasks/${enc(d.taskId ?? '')}/decide`, { decision, revision: d.revision }, decision === 'stop' ? '요청을 중단했어요' : `${label} — 보냈어요`)
+      if (ui.confirm.has(`${key}:${decision}`)) { actions.push(confirmRow(key, d, decision, label, busy, send)); return }
       actions.push(h('button', {
-        class: `btn ${rec?.option === decision ? 'btn-primary' : decision === 'stop' ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy || !known || !d.taskId,
+        class: `btn ${rec?.option === decision ? 'btn-primary' : confirmText(d, decision) ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy || !known || !d.taskId,
         title: known ? null : '알 수 없는 결정이라 보낼 수 없어요', 'data-fkey': `opt:${key}:${i}`,
-        onclick: () => {
-          if (decision === 'stop') { ui.confirm.add(ck); rerenderDecisions(); document.querySelector(`[data-fkey="stopyes:${CSS.escape(key)}"]`)?.focus(); return }
-          post(`/tasks/${enc(d.taskId ?? '')}/decide`, { decision, revision: d.revision }, `${label} — 보냈어요`)
-        },
+        onclick: () => pickOption(key, d, decision, send),
       }, busy ? '보내는 중…' : label))
     })
   } else if (d.kind === 'accept' && ui.rejectOpen.has(key)) {
@@ -437,11 +430,13 @@ function decisionCard(d) {
     // plan, accept, merge, revise, integration, team (and unknown kinds): approval-backed cards.
     opts.forEach((opt, i) => {
       const danger = /반려|폐기|거절|중단/.test(opt)
+      const send = () => post(`/approvals/${enc(d.id)}`, { decision: opt, subjectHash: d.subjectHash }, `${opt} — 보냈어요`)
+      if (ui.confirm.has(`${key}:${opt}`)) { actions.push(confirmRow(key, d, opt, opt, busy || !d.subjectHash, send)); return }
       actions.push(h('button', {
         class: `btn ${rec?.option === opt ? 'btn-primary' : danger ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy || !d.subjectHash, 'data-fkey': `opt:${key}:${i}`,
         onclick: () => {
           if (d.kind === 'accept' && opt === '반려') { ui.rejectOpen.add(key); ui.errors.delete(key); rerenderDecisions(); document.querySelector(`[data-fkey="reason:${CSS.escape(key)}"]`)?.focus(); return }
-          post(`/approvals/${enc(d.id)}`, { decision: opt, subjectHash: d.subjectHash }, `${opt} — 보냈어요`)
+          pickOption(key, d, opt, send)
         },
       }, busy ? '보내는 중…' : opt))
     })
@@ -457,6 +452,21 @@ function decisionCard(d) {
     h('div', { class: 'actions' }, actions),
     err ? h('p', { class: 'card-error', role: 'alert' }, err) : null,
     d.situation ? rawEl : null)
+}
+
+/** First click on an irreversible option shows the inline confirm (daemon's DecisionItem.confirm); others send at once. */
+function pickOption(key, d, option, send) {
+  if (confirmStep(ui.confirm, key, d, option) === 'send') return send()
+  rerenderDecisions()
+  document.querySelector(`[data-fkey="yes:${CSS.escape(key)}:${CSS.escape(option)}"]`)?.focus()
+}
+/** "정말 중단할까요? · 되돌릴 수 없어요" [label] [아니요] — the second click sends. */
+function confirmRow(key, d, option, label, disabled, send) {
+  return h('span', { class: 'confirm', role: 'group', 'aria-label': confirmText(d, option) ?? label },
+    h('span', { class: 'confirm-text' }, confirmText(d, option) ?? `${label} — 진행할까요?`),
+    h('button', { class: 'btn btn-danger', type: 'button', disabled, 'data-fkey': `yes:${key}:${option}`,
+      onclick: () => { if (confirmStep(ui.confirm, key, d, option, 'yes') === 'send') send(); else rerenderDecisions() } }, label),
+    h('button', { class: 'btn', type: 'button', onclick: () => { confirmStep(ui.confirm, key, d, option, 'no'); rerenderDecisions() } }, '아니요'))
 }
 
 /** §17 explanation: situation, cause (확인됨/추정), highlighted recommendation, then one consequence line per option. Text only. */

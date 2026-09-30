@@ -2,6 +2,7 @@
 // This is the user's own repository, so its hooks and settings apply as they would for the user (plain git).
 import { currentBranch, git, revParse, statusPorcelain, withRepo } from './git.ts'
 import { integrationRef } from './integration.ts'
+import { josa } from '../josa.ts'
 
 export type MergeResult = { kind: 'merged'; sha: string } | { kind: 'stale'; why: string } | { kind: 'detached' }
 
@@ -10,7 +11,7 @@ export function applyMerge(o: { repo: string; mirror: string; requestId: string;
   return withRepo(o.repo, async () => {
     const branch = await currentBranch(o.repo)
     if (!branch) return { kind: 'detached' } as const
-    if (branch !== o.target) return { kind: 'stale', why: `대상 checkout의 브랜치가 ${o.target}에서 ${branch}로 바뀜` } as const
+    if (branch !== o.target) return { kind: 'stale', why: `대상 checkout의 브랜치가 ${o.target}에서 ${josa(branch, '으로/로')} 바뀜` } as const
     const head = await revParse(o.repo)
     if (head !== o.targetSha) return { kind: 'stale', why: `${o.target}에 새 커밋이 생김 (${o.targetSha.slice(0, 10)} → ${head?.slice(0, 10) ?? '없음'})` } as const
     const status = await statusPorcelain(o.repo)

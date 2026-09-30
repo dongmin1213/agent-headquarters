@@ -2,6 +2,8 @@
 // Every error body is {"error": "<한국어 사유>"}; wrong state or stale revision → 409.
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { timingSafeEqual } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Bus } from './bus.ts'
 import type { Scheduler } from './scheduler.ts'
@@ -10,8 +12,9 @@ import type { AttemptView, RequestDetail, RequestView, Snapshot } from './types.
 import type { RequestEngine } from './engine.ts'
 import type { Project } from './ceo.ts'
 import type { Runner } from './exec/runner.ts'
-import { hqDirOf, outDirOf, taskView } from './exec/decisions.ts'
-import { git } from './exec/git.ts'
+import { hqDirOf, outDirOf, recommendMerges, taskView } from './exec/decisions.ts'
+import { hqGit, SAFE_DIFF } from './exec/repos.ts'
+import { SERVER_ERROR } from './humanize.ts'
 import { readText } from './exec/fsx.ts'
 import { lastActivityOf } from './exec/stream.ts'
 import { DONE_MAX, readOut, REPORT_MAX } from './exec/contract.ts'
@@ -79,7 +82,17 @@ export function snapshot(d: ServerDeps): Snapshot {
   return { updatedAt: new Date().toISOString(), lastEventId: d.store.lastEventId(), teams, approvals: d.store.openApprovals(),
     requests: ids.map((id) => requestView(d.store, d.runner, id)!).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
     projects: d.projects.map((p) => ({ id: p.id, name: p.name })), limit: { blockedUntil: d.runner.holdUntil() },
-    workers: v.workers, headline: v.headline, quota: v.quota, decisions: v.decisions }
+    workers: v.workers, headline: v.headline, quota: v.quota, decisions: recommendMerges(v.decisions, d.store, (project, branch) => branchSha(d.projects, project, branch)) }
+}
+
+/** The branch tip in the user's checkout right now (read-only rev-parse), or null when it cannot be read. */
+function branchSha(projects: Project[], projectId: string, branch: string): string | null {
+  const p = projects.find((x) => x.id === projectId)
+  if (!p) return null
+  try {
+    return execFileSync('git', ['rev-parse', '--verify', '-q', `refs/heads/${branch}^{commit}`], { cwd: p.path, encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' } }).trim() || null
+  } catch { return null }
 }
 
 function attemptView(a: { id: string; task_id: string; kind: string; n: number; model: string; status: string; started_at: string | null; ended_at: string | null; cost_usd: number | null; reason: string | null }): AttemptView {
@@ -116,7 +129,7 @@ export function createApi(d: ServerDeps): ApiRouter {
         const key = url.searchParams.get('task') ?? ''
         const t = store.tasks(parts[2]).find((x) => x.key === key)
         if (!t) throw new HttpError(404, '작업이 없습니다')
-        return ok(await taskDiff(t, projects))
+        return ok(await taskDiff(t, runner.mirror(t.project)))
       }
       if (is('GET', 'api', 'attempts', null, 'activity')) {
         const a = store.attempt(parts[2])
@@ -211,19 +224,36 @@ export function createApi(d: ServerDeps): ApiRouter {
     } catch (e) {
       if (e instanceof HttpError) return json(res, e.status, { error: e.message })
       console.error('[hq api]', e)
-      json(res, 500, { error: `서버 오류: ${String(e).slice(0, 200)}` })
+      json(res, 500, { error: SERVER_ERROR })
     }
   }
 }
 
-async function taskDiff(t: TaskRow, projects: Project[]): Promise<{ files: { path: string; added: number; removed: number }[]; diff: string; truncated: boolean }> {
-  const p = projects.find((x) => x.id === t.project)
-  if (!p || !t.base_sha || !t.head_sha || t.role !== 'implement') return { files: [], diff: '', truncated: false }
-  const num = await git(p.path, ['diff', '--numstat', '--no-renames', t.base_sha, t.head_sha])
-  const files = num.stdout.split('\n').filter(Boolean).map((l) => { const [a, r, ...path] = l.split('\t'); return { path: path.join('\t'), added: Number(a) || 0, removed: Number(r) || 0 } })
-  const d = await git(p.path, ['diff', '--no-color', '--no-ext-diff', t.base_sha, t.head_sha], 64 * 1024 * 1024)
-  const truncated = Buffer.byteLength(d.stdout) > DIFF_MAX
-  return { files, diff: truncated ? Buffer.from(d.stdout).subarray(0, DIFF_MAX).toString('utf8') : d.stdout, truncated }
+type DiffBody = { files: { path: string; added: number; removed: number }[]; diff: string; truncated: boolean }
+
+/**
+ * A task's change, read from hq's mirror (execution.md §6.1): before merge, worker commits exist only there,
+ * never in the user's checkout. Three outcomes: files; truly empty (base == head tree); unreadable → HttpError 409
+ * with a short Korean reason (the raw git output goes to the daemon log), so the page never shows "변경 사항이 없어요" by mistake.
+ */
+export async function taskDiff(t: TaskRow, mirror: string): Promise<DiffBody> {
+  if (t.role !== 'implement' || !t.head_sha) return { files: [], diff: '', truncated: false }
+  const fail = (why: string, raw?: string): never => {
+    if (raw) console.error(`[hq api] diff ${t.id}: ${raw.trim().slice(0, 500)}`)
+    throw new HttpError(409, `변경 내용을 읽지 못했어요: ${why}`)
+  }
+  if (!t.base_sha) fail('기준 커밋이 기록되지 않았어요')
+  if (!existsSync(join(mirror, 'HEAD'))) fail('hq 미러가 없어요')
+  const run = async (args: string[], maxBuffer?: number) => {
+    const r = await hqGit(mirror, null, [...args, ...SAFE_DIFF, t.base_sha!, t.head_sha!, '--'], { maxBuffer })
+    if (r.code !== 0) fail(/bad object|bad revision|unknown revision|Not a valid object|invalid object/i.test(r.stderr) ? '커밋이 hq 미러에 없어요' : 'git diff가 실패했어요', r.stderr || r.stdout)
+    return r.stdout
+  }
+  const num = await run(['diff', '--numstat', '--no-renames'])
+  const files = num.split('\n').filter(Boolean).map((l) => { const [a, r, ...path] = l.split('\t'); return { path: path.join('\t'), added: Number(a) || 0, removed: Number(r) || 0 } })
+  const d = await run(['diff', '--no-color', '--no-renames'], 64 * 1024 * 1024)
+  const truncated = Buffer.byteLength(d) > DIFF_MAX
+  return { files, diff: truncated ? Buffer.from(d).subarray(0, DIFF_MAX).toString('utf8') : d, truncated }
 }
 
 export function startServer(d: ServerDeps) {
@@ -241,7 +271,8 @@ export function startServer(d: ServerDeps) {
       }
       await routeApi(req, res, caller)
     } catch (e) {
-      json(res, 500, { error: `서버 오류: ${String(e).slice(0, 200)}` })
+      console.error('[hq server]', e)
+      json(res, 500, { error: SERVER_ERROR })
     }
   })
   server.listen(d.port, '127.0.0.1')

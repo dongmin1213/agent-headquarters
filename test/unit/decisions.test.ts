@@ -1,7 +1,7 @@
 // §G 18: decision item order, needsYou and headline sentences (execution.md §17 §18).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildHeadline, decisionItems, type HeadlineInput } from '../../src/exec/decisions.ts'
+import { buildHeadline, CONFIRM_STOP, decisionItems, MERGE_UNCHANGED, recommendMerges, type HeadlineInput } from '../../src/exec/decisions.ts'
 import type { DecisionItem, WorkerView } from '../../src/types.ts'
 import { harness, task } from './helpers.ts'
 import { useFakeSandboxIfNested } from '../nested.ts'
@@ -83,7 +83,7 @@ test('18. decision items: kind order plan → ceo_question → worker_question �
     const snap = h.runner.views()
     assert.equal(snap.headline.needsYou, items.length)
     assert.equal(snap.headline.text, `회장님 결정 ${items.length}건: ${items[0].title}`)
-    assert.ok(snap.workers.some((x) => x.state === 'blocked' && x.bubble === '멈춤 · 사장에게 보고'))
+    assert.ok(snap.workers.some((x) => x.state === 'blocked' && x.bubble === '막힘 · 사장에게 보고'))
   } finally { await h.close() }
 })
 
@@ -101,12 +101,12 @@ test('18. team approvals are decision items (내 차례, headline, notifications
     const rev = items.find((d) => d.teamId === 'revenue')!, other = items.find((d) => d.teamId === 'other')!
     assert.deepEqual(rev, {
       kind: 'team', teamId: 'revenue', id: 'team:revenue:topic-1', revision: rev.revision, requestId: '', taskId: null,
-      title: '수익자동화 · 다음 영상 주제를 골라 주세요', detail: '후보 3개', situation: '수익자동화 팀이 회장님 결정을 기다려요',
+      title: '수익자동화 · 다음 영상 주제를 골라 주세요', detail: '후보 3개', situation: '수익자동화 팀: 후보 3개',
       cause: null, causeConfirmed: false, recommendation: null,
       optionHelp: { A안: '이 선택으로 팀이 다음 단계를 진행해요', 보류: '지금은 고르지 않아요 · 팀이 나중에 다시 물어요', 반려: '팀이 이 항목을 진행하지 않아요' },
       detailPath: null, options: ['A안', '보류', '반려'], subjectHash: 'ht1', createdAt: rev.createdAt,
     })
-    assert.equal(other.situation, '시험 팀이 회장님 결정을 기다려요', 'a name ending in 팀 is not doubled')
+    assert.equal(other.situation, '시험 팀이 회장님 결정을 기다려요', 'a name ending in 팀 is not doubled; no body → generic sentence')
     assert.ok(decisionItems(s, h.clock.t).some((d) => d.title === 'revenue · 다음 영상 주제를 골라 주세요'), 'unknown team falls back to its id')
     const snap = h.runner.views()
     assert.equal(snap.headline.needsYou, 2)
@@ -114,5 +114,81 @@ test('18. team approvals are decision items (내 차례, headline, notifications
     assert.deepEqual(snap.decisions.map((d) => d.kind), ['team', 'team'])
     await h.runner.tick()
     assert.equal(h.notes.filter(([t]) => t === '팀 결정이 필요해요').length, 2, 'one notification per team card')
+  } finally { await h.close() }
+})
+
+test('U1/U3/U4. cards: Korean cause + raw detail, inline confirms for irreversible options, recommendations hq can state', async () => {
+  const h = harness()
+  try {
+    const s = h.store
+    const mk = (id: string, status: string) => { s.addRequest(id, 'p', id); s.updateRequest(id, { status }) }
+    // system/login: raw CLI text → Korean cause; raw kept as detail; recommendation names the real option.
+    s.putApproval({ id: 'system:login', teamId: 'hq', subjectId: '', title: 'Claude 로그인 필요', body: 'Not logged in · Please run /login', options: ['다시 확인'], subjectHash: 'l' })
+    // integration with raw git output in the merge note.
+    mk('req-integ002', 'blocked')
+    const raw = "미러 갱신 실패: Error: git fetch -q --no-tags 실패: fatal: bad object 0123456789"
+    s.putMerge('req-integ002', 'p', { state: 'failed', note: raw })
+    s.putApproval({ id: 'integration:req-integ002:p', teamId: 'hq', subjectId: 'req-integ002', title: '통합 문제: P', body: '대상 브랜치 위에 합치지 못했어요', options: ['다시 통합', '해당 작업 재작업', '요청 중단'], subjectHash: 'i' })
+    // merge card on main.
+    mk('req-merge002', 'accepted'); s.putMerge('req-merge002', 'p', { state: 'offered', target: 'main', target_sha: 'a'.repeat(40), integration_sha: 'b'.repeat(40) })
+    s.putApproval({ id: 'merge:req-merge002:p', teamId: 'hq', subjectId: 'req-merge002', title: 'merge', body: '', options: ['병합', '보류'], subjectHash: 'm' })
+    // team card with a multi-line body.
+    s.putApproval({ id: 'team:revenue:t1', teamId: 'revenue', title: '주제 고르기', body: '후보 3개를 찾았어요\n1. A\n2. B\n3. C', options: ['A', '보류'], subjectHash: 't' })
+    // blocked task.
+    const id = h.plan([task('A')])
+    await h.approve(id)
+    s.updateTask(`${id}.A`, { status: 'blocked', note: '판정 중 오류: TypeError: Cannot read properties of undefined', block_count: 1 })
+
+    const items = decisionItems(s, h.clock.t, { revenue: '수익자동화' })
+    const by = (k: string) => items.find((d) => d.kind === k)!
+    const sys = by('system')
+    assert.equal(sys.cause, 'Claude에 로그인되어 있지 않아요 · 터미널에서 claude를 실행해 로그인해 주세요')
+    assert.equal(sys.detail, 'Not logged in · Please run /login')
+    assert.deepEqual(sys.recommendation, { option: '다시 확인', reason: "터미널에서 claude를 실행해 로그인한 뒤 '다시 확인'을 눌러 주세요" })
+    assert.ok(sys.options.includes(sys.recommendation!.option))
+
+    const integ = by('integration')
+    assert.equal(integ.cause, '미러 갱신 실패 · 필요한 커밋을 저장소에서 찾지 못했어요 · 다시 통합하거나 작업을 다시 해 주세요')
+    assert.ok(integ.detail.includes(raw), 'raw git output behind 원문 보기')
+    assert.deepEqual(integ.confirm, { '요청 중단': CONFIRM_STOP })
+    assert.equal(CONFIRM_STOP, '정말 중단할까요? · 되돌릴 수 없어요')
+
+    const blocked = by('blocked')
+    assert.equal(blocked.cause, '판정 중 오류 · 원문을 확인해 주세요')
+    assert.match(blocked.detail, /TypeError/)
+    assert.deepEqual(blocked.confirm, { stop: CONFIRM_STOP })
+
+    const team = by('team')
+    assert.equal(team.situation, '수익자동화 팀: 후보 3개를 찾았어요')
+    assert.equal(team.detail, '후보 3개를 찾았어요\n1. A\n2. B\n3. C')
+    assert.equal(team.confirm, undefined)
+
+    assert.equal(by('plan'), undefined, 'plan approved already')
+    const merge = by('merge')
+    assert.deepEqual(merge.confirm, { 병합: 'main에 병합할까요?' })
+    assert.equal(merge.recommendation, null, 'decisionItems alone does not know the current target')
+    const same = recommendMerges(items, s, (project, branch) => (project === 'p' && branch === 'main' ? 'a'.repeat(40) : null))
+    assert.deepEqual(same.find((d) => d.kind === 'merge')!.recommendation, { option: '병합', reason: MERGE_UNCHANGED })
+    assert.equal(MERGE_UNCHANGED, '대상 브랜치가 검사한 뒤로 바뀌지 않았어요')
+    assert.equal(recommendMerges(items, s, () => 'c'.repeat(40)).find((d) => d.kind === 'merge')!.recommendation, null, 'target moved: no recommendation')
+    assert.equal(recommendMerges(items, s, () => null).find((d) => d.kind === 'merge')!.recommendation, null, 'unknown target: no recommendation')
+    assert.deepEqual(recommendMerges(items, s, () => 'a'.repeat(40)).filter((d) => d.kind !== 'merge'), items.filter((d) => d.kind !== 'merge'), 'other cards untouched')
+  } finally { await h.close() }
+})
+
+test('U4. snapshot recommends 병합 only while the checkout branch still points at the checked target', async () => {
+  const h = harness()
+  try {
+    const { snapshot } = await import('../../src/server.ts')
+    const { commitFile, sh } = await import('./helpers.ts')
+    const s = h.store
+    const head = sh(h.repo, 'rev-parse', 'HEAD')
+    s.addRequest('req-merge003', 'p', 'x'); s.updateRequest('req-merge003', { status: 'accepted' })
+    s.putMerge('req-merge003', 'p', { state: 'offered', target: 'main', target_sha: head, integration_sha: 'b'.repeat(40) })
+    s.putApproval({ id: 'merge:req-merge003:p', teamId: 'hq', subjectId: 'req-merge003', title: 'merge', body: '', options: ['병합', '보류'], subjectHash: 'm' })
+    const deps = { port: 1, store: s, bus: h.bus, scheduler: { views: () => [] }, token: 't', engine: h.engine, runner: h.runner, projects: h.projects } as never
+    assert.deepEqual(snapshot(deps).decisions.find((d) => d.kind === 'merge')!.recommendation, { option: '병합', reason: MERGE_UNCHANGED })
+    commitFile(h.repo, 'moved.txt', 'x')
+    assert.equal(snapshot(deps).decisions.find((d) => d.kind === 'merge')!.recommendation, null)
   } finally { await h.close() }
 })

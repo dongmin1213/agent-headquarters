@@ -9,6 +9,7 @@ import { hqReadPaths, protectedFolders, tccLabels, tccPathList } from './tcc.ts'
 import {
   daemonLabel, expandHome, launchdJob, petLabel, findBin, lockFile, petApp, plistPath, projectsFile, runCmd, type Ctx, type ExecResult,
 } from './ctx.ts'
+import { josa } from '../josa.ts'
 
 export type Status = 'ok' | 'warn' | 'fail'
 export interface Check { id: string; title: string; status: Status; detail: string; fix?: string }
@@ -155,7 +156,7 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
         // The execution phase needs git with at least one commit (worktrees branch from HEAD): fail, not warn.
         const g = git ? await p.run(git, ['-C', path, 'rev-parse', '--is-inside-work-tree']) : null
         if (!(g && g.code === 0 && g.stdout.trim() === 'true')) {
-          add(`project:${id}`, `프로젝트 ${id}`, 'fail', `${String(pr.path)}는 git 저장소가 아님 — 실행 단계에는 git 필요`, `cd ${path} && git init && git add -A && git commit -m init`)
+          add(`project:${id}`, `프로젝트 ${id}`, 'fail', `경로(${String(pr.path)})는 git 저장소가 아님 — 실행 단계에는 git 필요`, `cd ${path} && git init && git add -A && git commit -m init`)
           continue
         }
         const head = await p.run(git!, ['-C', path, 'rev-parse', '--verify', '--quiet', 'HEAD'])
@@ -210,7 +211,7 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
     if (!pid) add('lock', '데몬 잠금', 'warn', `${lf}에서 pid를 읽지 못함`, `데몬이 꺼져 있다면 rm ${lf}`)
     else if (cmd === null && pidAlive(pid)) add('lock', '데몬 잠금', 'warn', `pid ${pid}의 프로그램을 확인할 수 없음 (ps 실행 불가)`, 'ps가 동작하는 터미널에서 hq doctor를 다시 실행하세요')
     else if (cmd === null) add('lock', '데몬 잠금', 'warn', `오래된 잠금 (pid ${pid} 종료됨)`, `hq start (데몬이 넘겨받음). 안 되면 rm ${lf}`)
-    else if (!cmd.includes('src/main.ts')) add('lock', '데몬 잠금', 'warn', `pid ${pid}가 hq가 아닌 프로세스 (pid 재사용: 오래된 잠금)`, `rm ${lf} 후 hq start`)
+    else if (!cmd.includes('src/main.ts')) add('lock', '데몬 잠금', 'warn', `pid ${josa(pid, '이/가')} hq가 아닌 프로세스 (pid 재사용: 오래된 잠금)`, `rm ${lf} 후 hq start`)
     else add('lock', '데몬 잠금', 'ok', `pid ${pid} 실행 중`)
   }
 
