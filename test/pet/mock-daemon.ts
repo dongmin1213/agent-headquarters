@@ -66,6 +66,9 @@ const decisions: DecisionItem[] = [
   decision({ kind: 'team', teamId: 'revenue', id: 'team:revenue:topic-1', requestId: '', title: '수익 자동화 · 다음 영상 주제를 골라 주세요', detailPath: null,
     situation: '수익 자동화 팀이 회장님 결정을 기다려요', options: ['A안', '보류', '반려'], subjectHash: 'h-team',
     optionHelp: { A안: '이 선택으로 팀이 다음 단계를 진행해요', 보류: '지금은 고르지 않아요 · 팀이 나중에 다시 물어요', 반려: '팀이 이 항목을 진행하지 않아요' } }),
+  // Team card with long option labels: buttons must wrap into rows instead of truncating to "…".
+  decision({ kind: 'team', teamId: 'revenue', id: 'team:revenue:topic-2', requestId: '', title: '수익자동화 · 다음 영상 주제를 골라 주세요', detailPath: null,
+    situation: '수익 자동화 팀이 회장님 결정을 기다려요', options: ['웅진그룹 (woongjin)', '팬택 (pantech)', '한진해운 (hanjin_shipping)', '보류'], subjectHash: 'h-team-2' }),
   // A kind this pet build does not know: must still decode and render generically.
   decision({ kind: 'future_kind' as DecisionItem['kind'], id: 'future:1', requestId: '', title: '새 종류의 결정', detailPath: null,
     situation: '아직 모르는 종류도 카드로 보여야 해요', options: ['확인'], subjectHash: 'h-future' }),
