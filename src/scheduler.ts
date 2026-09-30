@@ -6,9 +6,10 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type { Bus } from './bus.ts'
 import type { Store } from './store.ts'
-import type { TeamConfig, TeamState, TeamView } from './types.ts'
+import type { RunRecord, TeamConfig, TeamState, TeamView } from './types.ts'
 
 const LIMIT_BACKOFF_MS = 30 * 60_000
+const SPAWN_FAILED = '실행할 수 없어요:'
 
 export interface TeamQuota { holdUntil(): string | null; teamLimited(untilIso: string): void }
 
@@ -26,7 +27,12 @@ export class Scheduler {
   /** `quota` connects teams to the shared quota hold (execution.md §13); without it the legacy kv hold is used. */
   constructor(teams: TeamConfig[], store: Store, bus: Bus, hqUrl: string, token: string, quota: TeamQuota | null = null) {
     this.teams = teams; this.store = store; this.bus = bus; this.hqUrl = hqUrl; this.token = token; this.quota = quota
-    for (const t of teams) this.state.set(t.id, { state: 'idle', bubble: '대기 중', running: false })
+    // Restore each enabled team's last outcome so a daemon restart doesn't reset every pet to '대기 중'.
+    for (const t of teams) {
+      const last = t.enabled ? store.lastRun(t.id) : null
+      const o = last ? restoredOutcome(last) : { state: 'idle' as const, bubble: '대기 중' }
+      this.state.set(t.id, { ...o, running: false })
+    }
   }
 
   start(): void {
@@ -92,19 +98,17 @@ export class Scheduler {
         const summary = [...tail.slice(-8), ...(failure ? [failure] : [])].join('\n')
         this.store.endRun(runId, exit, summary)
         s.running = false
-        if (failure) this.set(t.id, 'error', failure.slice(0, 140))
-        else if (exit === 0) this.set(t.id, 'idle', lastStatus(tail) ?? '완료')
-        else if (exit === 3) this.set(t.id, 'waiting', lastStatus(tail) ?? '승인 대기')
-        else if (exit === 75) {
+        if (!failure && exit === 75) {
           const until = new Date(Date.now() + LIMIT_BACKOFF_MS).toISOString()
           if (this.quota) this.quota.teamLimited(until)
           else this.store.set('limit.blockedUntil', until)
           this.bus.emit({ kind: 'limit', teamId: t.id, text: `사용 한도 — ${until}까지 대기` })
-          this.set(t.id, 'sleeping', '사용 한도, 쉬는 중')
-        } else this.set(t.id, 'error', `오류 (종료 코드 ${exit}): ${tail.at(-1) ?? ''}`.slice(0, 140))
+        }
+        const o = runOutcome(exit, tail, failure)
+        this.set(t.id, o.state, o.bubble)
         resolve()
       }
-      const spawnFailed = (err: NodeJS.ErrnoException) => finish(-1, `실행할 수 없어요: ${err.code ?? err.message} (${cmd})`)
+      const spawnFailed = (err: NodeJS.ErrnoException) => finish(-1, `${SPAWN_FAILED} ${err.code ?? err.message} (${cmd})`)
       let child: ChildProcess
       try {
         child = spawn(cmd, args, { cwd: t.cwd, env: { ...process.env, HQ_URL: this.hqUrl, HQ_TOKEN: this.token, HQ_TEAM: t.id }, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -124,4 +128,22 @@ export class Scheduler {
 function lastStatus(tail: string[]): string | null {
   for (let i = tail.length - 1; i >= 0; i--) if (tail[i].startsWith('STATUS:')) return tail[i].slice(7).trim()
   return null
+}
+
+/** The one exit→state mapping, used when a run ends and when restoring after a restart. */
+function runOutcome(exit: number, lines: string[], failure: string | null): { state: TeamState; bubble: string } {
+  if (failure) return { state: 'error', bubble: failure.slice(0, 140) }
+  if (exit === 0) return { state: 'idle', bubble: lastStatus(lines) ?? '완료' }
+  if (exit === 3) return { state: 'waiting', bubble: lastStatus(lines) ?? '승인 대기' }
+  if (exit === 75) return { state: 'sleeping', bubble: '사용 한도, 쉬는 중' }
+  return { state: 'error', bubble: `오류 (종료 코드 ${exit}): ${lines.at(-1) ?? ''}`.slice(0, 140) }
+}
+
+/** State to show for a team's last recorded run after a daemon restart. */
+function restoredOutcome(run: RunRecord): { state: TeamState; bubble: string } {
+  if (!run.endedAt || run.exitCode == null) return { state: 'idle', bubble: '지난 실행이 중단됐어요 · 다음 실행 때 이어서 해요' }
+  const lines = run.summary ? run.summary.split('\n') : []
+  // endRun appends a spawn failure as the summary's last line; split it back out.
+  const failure = run.exitCode === -1 && lines.at(-1)?.startsWith(SPAWN_FAILED) ? lines.pop()! : null
+  return runOutcome(run.exitCode, lines, failure)
 }
