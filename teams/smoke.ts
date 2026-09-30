@@ -3,7 +3,7 @@ import { runClaude } from '../src/claude.ts'
 const hq = process.env.HQ_URL!, team = process.env.HQ_TEAM!
 const headers = { authorization: `Bearer ${process.env.HQ_TOKEN}`, 'content-type': 'application/json' }
 const subjectHash = 'smoke-v1' // hash of what is being approved (fixed prompt here)
-const id = 'smoke-approval-1'
+const id = 'team:smoke:approval-1'
 let a = await (await fetch(`${hq}/api/approvals/${id}`, { headers })).json() as { decision?: string | null; error?: string }
 if (a.error) {
   await fetch(`${hq}/api/approvals`, { method: 'POST', headers, body: JSON.stringify({ id, teamId: team, title: '시험 실행 승인', body: 'Claude에게 한 줄 답을 요청합니다.', options: ['승인', '반려'], subjectHash, expiresInMinutes: 60 }) })

@@ -1,0 +1,116 @@
+// Shared CLI context: resolved paths, env overrides, output sinks and command runners.
+// Every side effect (launchctl, open, build scripts) goes through `act`, which only prints under HQ_DRY_RUN=1.
+import { execFile } from 'node:child_process'
+import { existsSync, mkdirSync, renameSync, writeFileSync, chmodSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
+import { loadConfig } from '../config.ts'
+
+export const DAEMON_LABEL = 'com.agent-headquarters.daemon'
+export const PET_LABEL = 'com.agent-headquarters.pet'
+
+export interface ExecResult { code: number; stdout: string; stderr: string }
+export interface RunOpts { timeoutMs?: number; cwd?: string; env?: NodeJS.ProcessEnv }
+
+export interface Ctx {
+  /** Repository root (contains src/, config/, pet/). */
+  root: string
+  /** $HQ_HOME: runtime data, logs, pidfile. */
+  home: string
+  agentsDir: string
+  port: number
+  tokenFile: string
+  /** Directory for the optional `hq` symlink (~/.local/bin). */
+  binDir: string
+  /** The user's home directory (for `~` shortening). */
+  userHome: string
+  uid: number
+  dryRun: boolean
+  env: NodeJS.ProcessEnv
+  out(line: string): void
+  err(line: string): void
+  /** Read-only command: always runs, never throws (ENOENT → code 127). */
+  run(cmd: string, args: string[], opts?: RunOpts): Promise<ExecResult>
+  /** Side-effecting command: printed instead of run when dryRun. */
+  act(cmd: string, args: string[], opts?: RunOpts): Promise<ExecResult>
+}
+
+export const expandHome = (p: string, home: string) => p.replace(/^~(?=\/|$)/, home)
+export const shortenHome = (p: string, home: string) => (p === home ? '~' : p.startsWith(home + '/') ? '~' + p.slice(home.length) : p)
+
+/** Quote for display only (commands are always run with execFile argv, never through a shell). */
+export const showCmd = (cmd: string, args: string[]) =>
+  [cmd, ...args].map((a) => (/^[\w@%+=:,./-]+$/.test(a) ? a : `'${a.replace(/'/g, `'\\''`)}'`)).join(' ')
+
+export function runCmd(cmd: string, args: string[], opts: RunOpts = {}): Promise<ExecResult> {
+  return new Promise((done) => {
+    execFile(cmd, args, { timeout: opts.timeoutMs ?? 30_000, cwd: opts.cwd, env: opts.env, maxBuffer: 16 * 1024 * 1024, encoding: 'utf8' },
+      (e, stdout, stderr) => {
+        const err = e as (NodeJS.ErrnoException & { code?: number | string }) | null
+        const code = !err ? 0 : err.code === 'ENOENT' ? 127 : typeof err.code === 'number' ? err.code : 1
+        done({ code, stdout: String(stdout ?? ''), stderr: String(stderr ?? (err ? err.message : '')) })
+      })
+  })
+}
+
+/** Finds an executable on PATH (or returns the path itself when it contains a slash and exists). */
+export function findBin(name: string, pathEnv: string | undefined): string | null {
+  if (name.includes('/')) return existsSync(name) ? resolve(name) : null
+  for (const dir of (pathEnv ?? '').split(delimiter)) {
+    if (!dir) continue
+    const p = join(dir, name)
+    if (existsSync(p)) return p
+  }
+  return null
+}
+
+/** Atomic write: temp file in the same directory, then rename. */
+export function writeAtomic(file: string, content: string, mode = 0o644): void {
+  mkdirSync(dirname(file), { recursive: true })
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`
+  writeFileSync(tmp, content, { mode })
+  chmodSync(tmp, mode)
+  renameSync(tmp, file)
+}
+
+export function makeCtx(env: NodeJS.ProcessEnv = process.env, over: Partial<Ctx> = {}): Ctx {
+  const userHome = env.HOME || homedir()
+  const root = over.root ?? (env.HQ_ROOT ? resolve(env.HQ_ROOT) : resolve(import.meta.dirname, '../..'))
+  let home: string
+  try { home = loadConfig(root, env).home } catch { home = expandHome(env.HQ_HOME ?? '~/.hq', userHome) }
+  const abs = (p: string) => (isAbsolute(p) ? p : resolve(p))
+  const dryRun = env.HQ_DRY_RUN === '1'
+  const ctx: Ctx = {
+    root,
+    home: abs(expandHome(home, userHome)),
+    agentsDir: abs(expandHome(env.HQ_LAUNCH_AGENTS_DIR ?? join(userHome, 'Library/LaunchAgents'), userHome)),
+    port: Number(env.HQ_PORT ?? 7777),
+    tokenFile: abs(expandHome(env.HQ_TOKEN_FILE ?? join(userHome, '.config/hq/token'), userHome)),
+    binDir: abs(expandHome(env.HQ_BIN_DIR ?? join(userHome, '.local/bin'), userHome)),
+    userHome,
+    uid: process.getuid?.() ?? 501,
+    dryRun,
+    env,
+    out: (l: string) => { process.stdout.write(l + '\n') },
+    err: (l: string) => { process.stderr.write(l + '\n') },
+    run: runCmd,
+    act: async (cmd, args, opts) => {
+      if (ctx.dryRun) { ctx.out(`[dry-run] ${showCmd(cmd, args)}`); return { code: 0, stdout: '', stderr: '' } }
+      return ctx.run(cmd, args, opts)
+    },
+    ...over,
+  }
+  if (!Number.isInteger(ctx.port) || ctx.port <= 0 || ctx.port > 65535) throw new Error(`HQ_PORT가 올바르지 않음: ${env.HQ_PORT}`)
+  return ctx
+}
+
+export const logsDir = (ctx: Ctx) => join(ctx.home, 'logs')
+export const daemonLog = (ctx: Ctx) => join(logsDir(ctx), 'daemon.log')
+export const petLog = (ctx: Ctx) => join(logsDir(ctx), 'pet.log')
+export const pidFile = (ctx: Ctx) => join(ctx.home, 'daemon.pid')
+/** Written by the daemon itself (single-instance lock, exec-engine-spec §134). */
+export const lockFile = (ctx: Ctx) => join(ctx.home, 'daemon.lock')
+export const plistPath = (ctx: Ctx, label: string) => join(ctx.agentsDir, `${label}.plist`)
+export const petApp = (ctx: Ctx) => join(ctx.root, 'pet/HQPet.app')
+export const petBinary = (ctx: Ctx) => join(petApp(ctx), 'Contents/MacOS/hqpet')
+export const projectsFile = (ctx: Ctx) => join(ctx.root, 'config/projects.json')

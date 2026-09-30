@@ -52,14 +52,136 @@ export interface RequestView {
   id: string
   project: string
   text: string
-  /** queued | thinking | asking | planned | approved | rejected | failed */
+  /** queued | thinking | asking | planned | approved | executing | awaiting_acceptance | accepted | merging | merged | rejected | failed | blocked | cancelled | expired */
   status: string
   note: string | null
   turns: number
   costUsd: number
   questions: { id: string; question: string; options: string[]; default: string; reason: string; answer: string | null }[]
   plan: { summary: string; assumptions: string[]; tasks: { id: string; title: string; project: string; role: string; grade: string; model: string }[] } | null
+  /** Execution state per plan task (empty until the plan is approved). */
+  tasks: TaskView[]
   updatedAt: string
+}
+
+export type TaskStatus = 'pending' | 'running' | 'verifying' | 'reviewing' | 'passed' | 'rework' | 'revising' | 'question' | 'held' | 'blocked' | 'cancelled'
+export type AttemptStatus = 'starting' | 'running' | 'succeeded' | 'failed' | 'brief_blocked' | 'question' | 'limited' | 'transient' | 'runaway' | 'unverifiable' | 'start_failed'
+
+export interface TaskView {
+  /** "<requestId>.<taskKey>" (URL-safe; clients still percent-encode path segments) */
+  id: string
+  key: string
+  requestId: string
+  project: string
+  title: string
+  role: string
+  grade: string
+  model: string
+  status: TaskStatus
+  attempts: number
+  /** Latest attempt id (work or review), for activity/evidence lookups. */
+  currentAttemptId: string | null
+  /** Last human-readable activity line of the current attempt. */
+  lastActivity: string | null
+  /** Worker questions waiting for the chairman (status = question). */
+  questions: { id: string; question: string; options: string[]; default: string }[]
+  note: string | null
+  headSha: string | null
+  /** Brief revision (bumped by CEO revise turns); decisions must echo it. */
+  revision: number
+  reviewModel: string | null
+  updatedAt: string
+}
+
+export interface AttemptView {
+  id: string
+  taskId: string
+  kind: 'work' | 'review'
+  n: number
+  model: string
+  status: AttemptStatus
+  startedAt: string | null
+  endedAt: string | null
+  costUsd: number | null
+  reason: string | null
+}
+
+export interface CheckResult { id: string; command: string; exitCode: number | null; durationMs: number; pass: boolean; outputTail: string }
+export interface Verdict {
+  pass: boolean
+  blocking: { id: string; summary: string; evidence: string }[]
+  advisory: { id: string; summary: string }[]
+  criteria: { id: string; result: 'pass' | 'fail' | 'manual'; evidence: string }[]
+  tests_run: { command: string; exit_code: number; summary: string }[]
+  /** Filled by hq, never by the reviewer. */
+  protectedChanges?: string[]
+  task?: string; head_sha?: string; base_sha?: string; reviewer_model?: string; implementer_model?: string; sameFamily?: boolean
+}
+
+/** GET /api/requests/:id */
+export interface RequestDetail {
+  request: RequestView
+  tasks: (TaskView & { spec: unknown; branch: string | null; baseSha: string | null; attemptsList: AttemptView[] })[]
+}
+
+/** One character on the pet per live attempt. */
+export interface WorkerView {
+  attemptId: string
+  taskId: string
+  requestId: string
+  title: string
+  project: string
+  role: string
+  /** Model alias used for the character (haiku | sonnet | opus). */
+  model: string
+  /** verify = hq's own acceptance checks (model "hq"). */
+  kind: 'work' | 'review' | 'verify'
+  /** blocked = stopped and waiting for a chairman decision (shown as "멈춤 · 사장에게 보고"). */
+  state: 'running' | 'verifying' | 'reviewing' | 'held' | 'blocked'
+  bubble: string
+  startedAt: string
+}
+
+export interface Headline { text: string; needsYou: number }
+
+/** Everything the chairman can act on, in display order (see execution.md §17). */
+export interface DecisionItem {
+  kind: 'system' | 'plan' | 'ceo_question' | 'worker_question' | 'revise' | 'blocked' | 'integration' | 'accept' | 'merge'
+  /** Stable id: approval id, question id, or task id. Notifications dedupe on id + revision. */
+  id: string
+  revision: number
+  requestId: string
+  taskId: string | null
+  title: string
+  detail: string
+  /** Plain-language "what happened" (one or two sentences). */
+  situation: string
+  /** Why it happened; `causeConfirmed` false means it is the CEO's inference, shown as 추정. */
+  cause: string | null
+  causeConfirmed: boolean
+  /** Recommended option (one of `options`) and why, or null when there is no recommendation. */
+  recommendation: { option: string; reason: string } | null
+  /** One line per option: what happens if the chairman picks it (cost, reversibility). */
+  optionHelp: Record<string, string>
+  /** Web detail link path (e.g. "/ui/#request=req-x&task=req-x.A") for "원문 보기". */
+  detailPath: string | null
+  /** Exact values to send (approval option, answer choice, or retry|skip|stop for blocked); see execution.md §17. */
+  options: string[]
+  /** For approval-backed kinds. */
+  subjectHash: string | null
+  createdAt: string
+}
+
+export interface QuotaView {
+  /** Every observed window (five_hour, seven_day, …); expired windows are omitted. */
+  windows: { name: string; utilization: number | null; resetsAt: string | null; status: string | null }[]
+  fiveHour: number | null
+  sevenDay: number | null
+  fiveHourResetsAt: string | null
+  sevenDayResetsAt: string | null
+  /** normal | save | hold | unobserved */
+  mode: string
+  observedAt: string | null
 }
 
 export interface Snapshot {
@@ -71,12 +193,16 @@ export interface Snapshot {
   requests: RequestView[]
   projects: { id: string; name: string }[]
   limit: { blockedUntil: string | null }
+  workers: WorkerView[]
+  headline: Headline
+  quota: QuotaView | null
+  decisions: DecisionItem[]
 }
 
 export interface HqEvent {
   id?: number
   at: string
-  kind: 'team' | 'claude' | 'approval' | 'limit' | 'request'
+  kind: 'team' | 'claude' | 'approval' | 'limit' | 'request' | 'task' | 'attempt' | 'quota'
   teamId?: string
   text: string
   data?: unknown

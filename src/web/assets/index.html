@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/ui/assets/app.css">
+<title>HQ · 자세히 보기</title>
+<script type="module" src="/ui/assets/app.js"></script>
+</head>
+<body>
+<a class="skip-link" href="#main">본문으로 건너뛰기</a>
+<header class="topbar" id="topbar">
+  <div class="topbar-inner">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">HQ</span></div>
+    <div class="headline">
+      <button type="button" class="needs-badge" id="needs-badge" hidden></button>
+      <p class="headline-text" id="headline" aria-live="polite">불러오는 중…</p>
+    </div>
+    <div class="topbar-meta">
+      <div class="quota" id="quota" aria-label="사용 한도"></div>
+      <div class="conn" id="conn" role="status"><span class="conn-dot"></span><span class="conn-label">연결 중…</span></div>
+    </div>
+  </div>
+</header>
+<main id="main" class="layout">
+  <section id="decisions" class="decisions" aria-labelledby="decisions-title" hidden></section>
+  <section id="workers" class="workers" aria-label="지금 일하는 작업자" hidden></section>
+  <div class="split">
+    <nav class="requests" aria-labelledby="requests-title">
+      <h2 id="requests-title" class="section-title">요청</h2>
+      <div id="request-list" class="request-list"></div>
+    </nav>
+    <section id="detail" class="detail" aria-live="polite"></section>
+  </div>
+</main>
+<div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+<aside id="drawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden></aside>
+<div id="gate" class="message-page" hidden>
+  <div class="message-card" role="alert">
+    <div class="brand-mark" aria-hidden="true">HQ</div>
+    <h1 id="gate-title">로그인이 필요해요</h1>
+    <p id="gate-text">펫에서 '자세히 보기'로 열어 주세요</p>
+  </div>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

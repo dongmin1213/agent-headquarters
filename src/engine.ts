@@ -1,27 +1,29 @@
 // Moves chairman requests through CEO judgment turns, one at a time.
-// queued → thinking → asking (questions) → queued (all answered) → thinking → planned → (plan approval) → approved
+// queued → thinking → asking (questions) → queued (all answered) → thinking → planned → (plan card) → executing (runner)
 import { createHash, randomUUID } from 'node:crypto'
 import type { Bus } from './bus.ts'
-import { runCeoTurn, validate, type Project } from './ceo.ts'
-import { notify } from './notify.ts'
+import { reviewModelOf, runCeoTurn, validate, type CeoPlan, type Project } from './ceo.ts'
+import type { Runner } from './exec/runner.ts'
 import type { Store } from './store.ts'
 
 const MAX_TURNS = 6
 const MAX_CORRECTIONS = 1
-const LIMIT_HOLD_MS = 60 * 60_000
+const PLAN_TTL_MS = 7 * 24 * 60 * 60_000
 
 export class RequestEngine {
-  private busy = false
   private store: Store
   private bus: Bus
   private projects: Project[]
   private hqRoot: string
+  private runner: Runner
+  private timer: NodeJS.Timeout | null = null
 
-  constructor(store: Store, bus: Bus, projects: Project[], hqRoot: string) {
-    this.store = store; this.bus = bus; this.projects = projects; this.hqRoot = hqRoot
+  constructor(store: Store, bus: Bus, projects: Project[], hqRoot: string, runner: Runner) {
+    this.store = store; this.bus = bus; this.projects = projects; this.hqRoot = hqRoot; this.runner = runner
   }
 
-  start(): void { setInterval(() => void this.tick(), 3_000) }
+  start(intervalMs = 3_000): void { this.timer = setInterval(() => void this.tick(), intervalMs) }
+  stop(): void { if (this.timer) clearInterval(this.timer) }
 
   submit(text: string, projectId: string): string {
     const id = 'req-' + randomUUID().slice(0, 8)
@@ -31,26 +33,26 @@ export class RequestEngine {
     return id
   }
 
-  /** Records one answer; when the request has no unanswered question left, it goes back to the CEO. */
-  answer(requestId: string, questionId: string, answer: string): boolean {
-    const r = this.store.request(requestId)
-    if (!r || r.status !== 'asking' || !this.store.answer(questionId, answer)) return false
-    if (this.store.questions(requestId).every((q) => q.answer !== null)) {
-      this.store.updateRequest(requestId, { status: 'queued' })
-      void this.tick()
-    }
+  /** Records one answer to a question owned by this request; with none left unanswered the request goes back to the CEO. */
+  answer(requestId: string, questionId: string, answer: string): string | null {
+    const err = this.store.tx(() => {
+      const r = this.store.request(requestId)
+      if (!r || r.status !== 'asking') return '질문을 기다리는 요청이 아닙니다'
+      if (!this.store.answer(requestId, questionId, answer)) return '이 요청의 미답 질문이 아닙니다'
+      if (this.store.questions(requestId).every((q) => q.answer !== null)) this.store.updateRequest(requestId, { status: 'queued' })
+      return null
+    })
+    if (err) return err
     this.bus.emit({ kind: 'request', text: `답변: ${answer}`, data: { id: requestId } })
-    return true
+    void this.tick()
+    return null
   }
 
-  private async tick(): Promise<void> {
-    if (this.busy) return
-    const hold = this.store.get('limit.blockedUntil')
-    if (hold && Date.parse(hold) > Date.now()) return
+  async tick(): Promise<void> {
+    if (!this.runner.canStartCeo()) return
     const r = this.store.nextQueued()
-    if (!r) return
-    this.busy = true
-    try { await this.turn(r.id) } finally { this.busy = false }
+    if (!r || !this.runner.ceoLock.tryAcquire()) return
+    try { await this.turn(r.id) } finally { this.runner.ceoLock.release() }
     void this.tick()
   }
 
@@ -63,20 +65,23 @@ export class RequestEngine {
     this.bus.emit({ kind: 'request', text: '사장이 검토 중', data: { id, state: 'thinking' } })
 
     const answers = this.store.questions(id).filter((q) => q.answer !== null).map((q) => ({ question: q.question, answer: q.answer! }))
-    let t = await runCeoTurn({ request: r.text, answers, correction: r.note && r.status === 'queued' && r.corrections > 0 ? r.note : null,
-      project, projects: this.projects, resumeSessionId: r.session_id, hqRoot: this.hqRoot })
+    const base = { request: r.text, answers, project, projects: this.projects, hqRoot: this.hqRoot, claudeBin: this.runner.cfg.claudeBin,
+      onLine: (line: Record<string, unknown>) => { if (line.type === 'rate_limit_event') this.runner.observe(line) } }
+    let t = await runCeoTurn({ ...base, correction: r.note && r.corrections > 0 ? r.note : null, resumeSessionId: r.session_id })
     // A failed resume falls back once to a fresh session that gets the stored conversation (request + answers).
-    if (!t.ok && !t.limited && r.session_id) {
-      t = await runCeoTurn({ request: r.text, answers, correction: null, project, projects: this.projects, resumeSessionId: null, hqRoot: this.hqRoot })
-    }
-    const cost = r.cost_usd + (t.costUsd ?? 0)
-    this.store.updateRequest(id, { session_id: t.sessionId, cost_usd: cost })
+    if (!t.ok && !t.limited && r.session_id) t = await runCeoTurn({ ...base, correction: null, resumeSessionId: null })
+    if (this.store.request(id)?.status !== 'thinking') return // cancelled meanwhile
+    this.store.updateRequest(id, { session_id: t.sessionId, cost_usd: r.cost_usd + (t.costUsd ?? 0) })
 
+    if (!t.ok && /Not logged in/i.test(t.error ?? '')) {
+      this.store.updateRequest(id, { status: 'queued', note: 'Claude 로그인 필요, 대기' })
+      this.runner.requireLogin(t.error ?? 'Not logged in')
+      return
+    }
     if (t.limited) {
-      const until = new Date(Date.now() + LIMIT_HOLD_MS).toISOString()
-      this.store.set('limit.blockedUntil', until)
+      if (this.runner.quota().mode !== 'hold') this.runner.limitBackoff()
       this.store.updateRequest(id, { status: 'queued', note: '사용 한도, 대기' })
-      this.bus.emit({ kind: 'limit', text: `사장 턴이 사용 한도에 걸림 — ${until}까지 대기` })
+      this.bus.emit({ kind: 'limit', text: '사장 턴이 사용 한도에 걸림 — 한도가 풀리면 다시 해요' })
       return
     }
     if (!t.ok || !t.output) { this.fail(id, `사장 턴 실패: ${(t.error ?? '').slice(0, 300)}`); return }
@@ -89,35 +94,38 @@ export class RequestEngine {
       return
     }
     if (t.output.questions.length) {
-      this.store.addQuestions(id, t.output.questions.map((q) => ({ id: 'q-' + randomUUID().slice(0, 8), ...q })))
-      this.store.updateRequest(id, { status: 'asking', note: null })
+      this.store.tx(() => {
+        this.store.addQuestions(id, t.output!.questions.map((q) => ({ id: 'q-' + randomUUID().slice(0, 8), ...q })))
+        this.store.updateRequest(id, { status: 'asking', note: null })
+      })
       this.bus.emit({ kind: 'request', text: `사장 질문 ${t.output.questions.length}개`, data: { id, state: 'asking' } })
-      notify('사장이 질문했어요', t.output.questions[0].question)
       return
     }
-    const plan = JSON.stringify(t.output.plan)
-    const planHash = createHash('sha256').update(plan).digest('hex')
-    this.store.updateRequest(id, { status: 'planned', plan, plan_hash: planHash, note: null })
     const p = t.output.plan!
-    this.store.upsertApproval({
-      id: `plan:${id}`, teamId: 'ceo', title: `계획 승인: ${p.summary.slice(0, 60)}`,
-      body: p.tasks.map((x) => `${x.id} [${x.grade}·${x.model}] ${x.title}`).join('\n'),
-      options: ['승인', '반려'], subjectHash: planHash,
-      expiresAt: new Date(Date.now() + 24 * 60 * 60_000).toISOString(), createdAt: new Date().toISOString(),
+    const plan = JSON.stringify(p)
+    const planHash = createHash('sha256').update(plan).digest('hex')
+    this.store.tx(() => {
+      this.store.updateRequest(id, { status: 'planned', plan, plan_hash: planHash, note: null })
+      this.store.putApproval({ id: `plan:${id}`, teamId: 'ceo', subjectId: id, title: `계획 승인: ${p.summary.slice(0, 60)}`, body: planCardBody(p, this.projects),
+        options: ['승인', '반려'], subjectHash: planHash, expiresAt: new Date(Date.now() + PLAN_TTL_MS).toISOString() })
     })
     this.bus.emit({ kind: 'request', text: `계획 완성: 작업 ${p.tasks.length}개`, data: { id, state: 'planned' } })
-    notify('사장이 계획을 올렸어요', p.summary)
-  }
-
-  /** Called when the chairman decides the plan approval card. */
-  planDecided(requestId: string, decision: string): void {
-    this.store.updateRequest(requestId, { status: decision === '승인' ? 'approved' : 'rejected' })
-    this.bus.emit({ kind: 'request', text: `계획 ${decision}`, data: { id: requestId } })
   }
 
   private fail(id: string, why: string): void {
-    this.store.updateRequest(id, { status: 'failed', note: why })
-    this.bus.emit({ kind: 'request', text: why, data: { id, state: 'failed' } })
-    notify('요청 처리 실패', why)
+    this.runner.failRequest(id, why)
   }
+}
+
+/** §3 plan card: every task with role/grade/model/review model, owned paths, the exact check commands, and project setup. */
+export function planCardBody(p: CeoPlan, projects: Project[]): string {
+  const lines: string[] = []
+  for (const t of p.tasks) {
+    lines.push(`[${t.id}] ${t.title} · ${t.role}·${t.grade}·${t.model} · 검토 ${reviewModelOf(t)}${t.depends_on.length ? ` · 선행 ${t.depends_on.join(', ')}` : ''}`)
+    if (t.owns.length) lines.push(`  소유: ${t.owns.join(', ')}`)
+    for (const a of t.acceptance) lines.push(`  - [${a.id}] (${a.kind === 'new' ? 'new' : 'regression'}) ${a.text}\n    $ ${a.check}`)
+  }
+  const setups = [...new Set(p.tasks.map((t) => t.project))].map((id) => projects.find((x) => x.id === id)).filter((x) => x?.setup)
+  if (setups.length) lines.push('', '프로젝트 setup (작업 폴더마다 샌드박스에서 실행):', ...setups.map((x) => `  ${x!.id}: $ ${x!.setup}`))
+  return lines.join('\n')
 }

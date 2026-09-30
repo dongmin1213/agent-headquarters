@@ -1,17 +1,21 @@
-// One CEO judgment turn: headless `claude -p` with read-only tools and a JSON schema.
+// One CEO judgment turn: headless `claude -p` with read-only tools and a JSON schema (schema v2, execution.md §3).
 // The CEO never writes files or starts work; hq stores its questions or plan.
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { matchesGlob, resolve } from 'node:path'
+import { createInterface } from 'node:readline'
+import { isLimited } from './exec/contract.ts'
 
-export interface Project { id: string; name: string; path: string }
+export interface Project { id: string; name: string; path: string; setup?: string }
 export interface CeoQuestion { question: string; options: string[]; default: string; reason: string }
-export interface Acceptance { id: string; text: string; check: string }
+export interface Acceptance { id: string; text: string; check: string; kind: 'new' | 'regression' }
+export interface TaskReview { brief: string; model: 'sonnet' | 'opus' | 'none' }
 export interface PlanTask {
-  id: string; title: string; project: string; role: 'collect' | 'implement' | 'verify'
-  grade: 'L0' | 'L1' | 'L2' | 'L3'; model: 'haiku' | 'sonnet' | 'opus' | 'none'
-  owns: string[]; acceptance: Acceptance[]; brief: string; depends_on: string[]; external: boolean
+  id: string; title: string; project: string; role: 'collect' | 'implement'
+  grade: 'L0' | 'L1' | 'L2' | 'L3'; model: 'haiku' | 'sonnet' | 'opus'
+  owns: string[]; acceptance: Acceptance[]; brief: string; depends_on: string[]
+  review?: TaskReview
 }
 export interface CeoPlan { summary: string; assumptions: string[]; tasks: PlanTask[] }
 export interface CeoOutput { questions: CeoQuestion[]; plan: CeoPlan | null }
@@ -19,96 +23,184 @@ export interface CeoTurn { ok: boolean; output: CeoOutput | null; sessionId: str
 
 const str = { type: 'string' }
 const strArr = { type: 'array', items: str }
+export const QUESTIONS_SCHEMA = { type: 'array', maxItems: 3, items: { type: 'object', additionalProperties: false,
+  required: ['question', 'options', 'default', 'reason'],
+  properties: { question: str, options: { type: 'array', minItems: 1, maxItems: 8, items: str }, default: str, reason: str } } }
+export const TASK_SCHEMA = { type: 'object', additionalProperties: false,
+  required: ['id', 'title', 'project', 'role', 'grade', 'model', 'owns', 'acceptance', 'brief', 'depends_on'],
+  properties: {
+    id: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,32}$' }, title: str, project: str,
+    role: { enum: ['collect', 'implement'] }, grade: { enum: ['L0', 'L1', 'L2', 'L3'] },
+    model: { enum: ['haiku', 'sonnet', 'opus'] }, owns: strArr,
+    acceptance: { type: 'array', minItems: 1, maxItems: 7, items: { type: 'object', additionalProperties: false,
+      required: ['id', 'text', 'check', 'kind'], properties: { id: str, text: str, check: str, kind: { enum: ['new', 'regression'] } } } },
+    brief: str, depends_on: strArr,
+    review: { type: 'object', additionalProperties: false, required: ['brief', 'model'], properties: { brief: str, model: { enum: ['sonnet', 'opus', 'none'] } } } } }
 export const CEO_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['questions', 'plan'],
   properties: {
-    questions: { type: 'array', maxItems: 3, items: { type: 'object', additionalProperties: false,
-      required: ['question', 'options', 'default', 'reason'],
-      properties: { question: str, options: { type: 'array', minItems: 1, maxItems: 8, items: str }, default: str, reason: str } } },
+    questions: QUESTIONS_SCHEMA,
     plan: { anyOf: [{ type: 'null' }, { type: 'object', additionalProperties: false, required: ['summary', 'assumptions', 'tasks'],
-      properties: { summary: str, assumptions: strArr, tasks: { type: 'array', minItems: 1, items: { type: 'object', additionalProperties: false,
-        required: ['id', 'title', 'project', 'role', 'grade', 'model', 'owns', 'acceptance', 'brief', 'depends_on', 'external'],
-        properties: {
-          id: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,32}$' }, title: str, project: str,
-          role: { enum: ['collect', 'implement', 'verify'] }, grade: { enum: ['L0', 'L1', 'L2', 'L3'] },
-          model: { enum: ['haiku', 'sonnet', 'opus', 'none'] }, owns: strArr,
-          acceptance: { type: 'array', minItems: 1, maxItems: 7, items: { type: 'object', additionalProperties: false,
-            required: ['id', 'text', 'check'], properties: { id: str, text: str, check: str } } },
-          brief: str, depends_on: strArr, external: { type: 'boolean' } } } } } }] },
+      properties: { summary: str, assumptions: strArr, tasks: { type: 'array', minItems: 1, items: TASK_SCHEMA } } }] },
   },
 }
 
-const LIMIT_RE = /usage limit|rate limit|limit reached|5-hour limit|weekly limit/i
+/** Default review model by grade (§3): L0 none, L1 sonnet, L2·L3 opus. */
+export const defaultReviewModel = (grade: string) => (grade === 'L0' ? 'none' : grade === 'L1' ? 'sonnet' : 'opus')
+/** Review model: implement by grade (or task.review); collect is reviewed only from L2 up (§10). */
+export const reviewModelOf = (t: PlanTask) => (t.role === 'collect' && (t.grade === 'L0' || t.grade === 'L1') ? 'none' : t.review?.model ?? defaultReviewModel(t.grade))
 
-/** Checks what the schema cannot: exactly one of questions/plan, known projects, ownership overlap, dependency ids. */
+/** A check is one command: chaining hides failures (§3). Returns the offending token, or null. */
+export function chainedCheck(check: string): string | null {
+  if (check.trim() === 'manual') return null
+  for (const tok of ['&&', '||', '|', ';', '`', '$(', '\n']) if (check.includes(tok)) return tok === '\n' ? '줄바꿈' : tok
+  return null
+}
+
+const norm = (p: string) => p.replace(/^\.\//, '').replace(/\/+$/, '')
+const isGlob = (p: string) => /[*?[{]/.test(p)
+const fixedPrefix = (g: string) => { const i = g.search(/[*?[{]/); const head = i < 0 ? g : g.slice(0, i); return head.slice(0, head.lastIndexOf('/') + 1) }
+const underOrEqual = (a: string, b: string) => a === b || a.startsWith(b + '/')
+
+/** §3 overlap: prefix paths, matchesGlob either way, or overlapping fixed prefixes of globs. */
+export function ownsOverlap(x: string, y: string): boolean {
+  const a = norm(x), b = norm(y)
+  if (a === b) return true
+  if (!isGlob(a) && !isGlob(b)) return underOrEqual(a, b) || underOrEqual(b, a)
+  if (matchesGlob(a, b) || matchesGlob(b, a)) return true
+  const pa = isGlob(a) ? fixedPrefix(a) : a + '/', pb = isGlob(b) ? fixedPrefix(b) : b + '/'
+  return pa.startsWith(pb) || pb.startsWith(pa)
+}
+
+/** Checks what the schema cannot (§3). Returns a Korean problem string or null. */
 export function validate(o: CeoOutput, projects: Project[]): string | null {
   const hasQ = o.questions.length > 0, hasP = o.plan !== null
   if (hasQ === hasP) return '질문과 계획 중 정확히 하나만 채워야 합니다'
   for (const q of o.questions) if (!q.options.includes(q.default)) return `질문 "${q.question}"의 기본값이 선택지에 없습니다`
   if (!o.plan) return null
-  const ids = new Set(o.plan.tasks.map((t) => t.id))
-  if (ids.size !== o.plan.tasks.length) return '작업 id가 중복됩니다'
-  for (const t of o.plan.tasks) {
+  return validateTasks(o.plan.tasks, projects)
+}
+
+export function validateTasks(tasks: PlanTask[], projects: Project[]): string | null {
+  const ids = new Set(tasks.map((t) => t.id))
+  if (ids.size !== tasks.length) return '작업 id가 중복됩니다'
+  for (const t of tasks as (PlanTask & { external?: unknown })[]) {
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(t.id)) return `작업 id "${t.id}"는 영문·숫자·_-로 1~32자여야 합니다`
     if (!projects.some((p) => p.id === t.project)) return `작업 ${t.id}의 프로젝트 "${t.project}"가 등록되지 않았습니다`
+    if (t.role !== 'collect' && t.role !== 'implement') return `작업 ${t.id}의 역할 "${String(t.role)}"은 지원하지 않습니다 (collect | implement)`
+    if (!['haiku', 'sonnet', 'opus'].includes(t.model)) return `작업 ${t.id}의 모델 "${String(t.model)}"은 지원하지 않습니다`
+    if (t.external !== undefined) return `작업 ${t.id}: 외부 게시·삭제·결제 작업은 지원하지 않습니다`
+    if (t.review && !['sonnet', 'opus', 'none'].includes(t.review.model)) return `작업 ${t.id}의 검토 모델 "${String(t.review.model)}"은 지원하지 않습니다`
+    if (t.depends_on.includes(t.id)) return `작업 ${t.id}가 자기 자신에 의존합니다`
     for (const d of t.depends_on) if (!ids.has(d)) return `작업 ${t.id}가 없는 작업 ${d}에 의존합니다`
-    if (t.role !== 'verify' && t.owns.length === 0) return `작업 ${t.id}에 owns가 없습니다`
+    if (t.role === 'implement' && t.owns.length === 0) return `작업 ${t.id}에 owns가 없습니다`
+    const accIds = t.acceptance.map((a) => a.id)
+    if (new Set(accIds).size !== accIds.length) return `작업 ${t.id}의 수용 기준 id가 중복됩니다`
+    for (const a of t.acceptance) {
+      if (a.kind !== 'new' && a.kind !== 'regression') return `작업 ${t.id}의 수용 기준 ${a.id}에 kind(new | regression)가 없습니다`
+      const tok = chainedCheck(a.check)
+      if (tok) return `작업 ${t.id}의 수용 기준 ${a.id} check는 명령 하나여야 합니다 (${tok} 사용 금지): ${a.check.slice(0, 80)}`
+    }
   }
-  // Writers that can run in parallel (no dependency path) must not share an owned path.
-  const reach = (a: string, b: string, seen = new Set<string>()): boolean => {
+  // Cycle check (Kahn).
+  const indeg = new Map(tasks.map((t) => [t.id, t.depends_on.length]))
+  const queue = tasks.filter((t) => !t.depends_on.length).map((t) => t.id)
+  let seen = 0
+  while (queue.length) {
+    const id = queue.shift()!; seen++
+    for (const t of tasks) if (t.depends_on.includes(id)) { indeg.set(t.id, indeg.get(t.id)! - 1); if (indeg.get(t.id) === 0) queue.push(t.id) }
+  }
+  if (seen !== tasks.length) return '작업 의존에 순환이 있습니다'
+  const reach = (a: string, b: string, seenSet = new Set<string>()): boolean => {
     if (a === b) return true
-    if (seen.has(a)) return false
-    seen.add(a)
-    return o.plan!.tasks.find((t) => t.id === a)!.depends_on.some((d) => reach(d, b, seen))
+    if (seenSet.has(a)) return false
+    seenSet.add(a)
+    return tasks.find((t) => t.id === a)!.depends_on.some((d) => reach(d, b, seenSet))
   }
-  const writers = o.plan.tasks.filter((t) => t.role === 'implement')
+  const writers = tasks.filter((t) => t.role === 'implement')
   for (let i = 0; i < writers.length; i++) for (let j = i + 1; j < writers.length; j++) {
     const a = writers[i], b = writers[j]
     if (a.project !== b.project || reach(a.id, b.id) || reach(b.id, a.id)) continue
-    const shared = a.owns.find((x) => b.owns.includes(x))
-    if (shared) return `병렬 작업 ${a.id}와 ${b.id}가 같은 경로 ${shared}를 소유합니다`
+    for (const x of a.owns) for (const y of b.owns) if (ownsOverlap(x, y)) return `병렬 작업 ${a.id}와 ${b.id}의 소유 경로가 겹칩니다: ${x} / ${y}`
   }
   return null
 }
 
-export interface TurnInput { request: string; answers: { question: string; answer: string }[]; correction: string | null; project: Project; projects: Project[]; resumeSessionId: string | null; hqRoot: string }
+// ----- running a structured (JSON schema) turn over stream-json -----
 
-export function runCeoTurn(input: TurnInput): Promise<CeoTurn> {
+export interface JsonTurnInput {
+  claudeBin: string
+  cwd: string
+  prompt: string
+  schema: object
+  sessionId: string
+  resume: boolean
+  addDirs: string[]
+  /** Every stream line (the caller records rate_limit_event into the quota table). */
+  onLine?: (line: Record<string, unknown>) => void
+  timeoutMs?: number
+}
+export interface JsonTurn { ok: boolean; output: unknown; sessionId: string; error: string | null; limited: boolean; costUsd: number | null }
+
+export function runJsonTurn(i: JsonTurnInput): Promise<JsonTurn> {
+  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--json-schema', JSON.stringify(i.schema),
+    '--tools', 'Read,Glob,Grep', '--disallowedTools', 'Read(**/.env*)',
+    '--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--max-turns', '30',
+    ...i.addDirs.flatMap((d) => ['--add-dir', d]),
+    ...(i.resume ? ['--resume', i.sessionId] : ['--session-id', i.sessionId])]
+  const env = { ...process.env }
+  delete env.CLAUDECODE
+  return new Promise((done) => {
+    const child = spawn(i.claudeBin, args, { cwd: i.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    let result: Record<string, unknown> | null = null
+    let err = '', rejected = false, sid = i.sessionId
+    const timer = setTimeout(() => child.kill('SIGINT'), i.timeoutMs ?? 15 * 60_000)
+    createInterface({ input: child.stdout! }).on('line', (raw) => {
+      let line: Record<string, unknown>
+      try { line = JSON.parse(raw) } catch { return }
+      if (!line || typeof line !== 'object') return
+      if (line.type === 'result') result = line
+      if (typeof line.session_id === 'string') sid = line.session_id
+      if (line.type === 'rate_limit_event' && (line.rate_limit_info as Record<string, unknown> | undefined)?.status === 'rejected') rejected = true
+      try { i.onLine?.(line) } catch { /* observer errors never break the turn */ }
+    })
+    child.stderr!.on('data', (b: Buffer) => { if (err.length < 20_000) err += b })
+    child.on('error', (e) => { err += String(e) })
+    child.stdin!.on('error', () => {})
+    child.stdin!.end(i.prompt)
+    child.on('close', () => {
+      clearTimeout(timer)
+      const r = result as Record<string, unknown> | null
+      const limited = isLimited(r, err, rejected)
+      const cost = typeof r?.total_cost_usd === 'number' ? r.total_cost_usd : null
+      const so = r?.structured_output
+      if (!r || r.is_error || so === undefined || so === null) return done({ ok: false, output: null, sessionId: sid, error: r ? String(r.result ?? r.subtype ?? '오류') : (err.trim() || '출력 없음').slice(0, 500), limited, costUsd: cost })
+      done({ ok: true, output: so, sessionId: sid, error: null, limited: false, costUsd: cost })
+    })
+  })
+}
+
+export interface TurnInput {
+  request: string; answers: { question: string; answer: string }[]; correction: string | null; project: Project; projects: Project[]
+  resumeSessionId: string | null; hqRoot: string; claudeBin: string; onLine?: (line: Record<string, unknown>) => void
+}
+
+export async function runCeoTurn(input: TurnInput): Promise<CeoTurn> {
   const rules = readFileSync(resolve(input.hqRoot, 'skills/ceo.md'), 'utf8')
   const sessionId = input.resumeSessionId ?? randomUUID()
   const prompt = [
     rules,
     '## 등록된 프로젝트',
-    ...input.projects.map((p) => `- ${p.id}: ${p.name} (${p.path})`),
+    ...input.projects.map((p) => `- ${p.id}: ${p.name} (${p.path})${p.setup ? ` — setup: \`${p.setup}\`` : ''}`),
     `기본 대상 프로젝트: ${input.project.id}`,
     '## 회장의 요청',
     input.request,
     ...(input.answers.length ? ['## 회장이 답한 질문', ...input.answers.map((a) => `- ${a.question} → ${a.answer}`)] : []),
     ...(input.correction ? ['## 이전 출력이 거부된 이유 (고쳐서 다시 내라)', input.correction] : []),
   ].join('\n')
-  const args = ['-p', '--output-format', 'json', '--json-schema', JSON.stringify(CEO_SCHEMA),
-    '--tools', 'Read,Glob,Grep', '--disallowedTools', 'Read(**/.env*)',
-    '--setting-sources', '', '--strict-mcp-config', '--max-turns', '30',
-    ...input.projects.filter((p) => p.id !== input.project.id).flatMap((p) => ['--add-dir', p.path]),
-    ...(input.resumeSessionId ? ['--resume', sessionId] : ['--session-id', sessionId])]
-  const env = { ...process.env }
-  delete env.CLAUDECODE
-  return new Promise((done) => {
-    const child = spawn('claude', args, { cwd: input.project.path, env, stdio: ['pipe', 'pipe', 'pipe'] })
-    let out = '', err = ''
-    const timer = setTimeout(() => child.kill('SIGINT'), 15 * 60_000)
-    child.stdout.on('data', (b: Buffer) => { if (out.length < 2_000_000) out += b })
-    child.stderr.on('data', (b: Buffer) => { if (err.length < 20_000) err += b })
-    child.stdin.end(prompt)
-    child.on('close', () => {
-      clearTimeout(timer)
-      let r: Record<string, unknown> | null = null
-      try { r = JSON.parse(out) } catch { /* fallthrough */ }
-      const text = r ? String(r.result ?? '') : (err || out).slice(0, 500)
-      const limited = LIMIT_RE.test(text)
-      const so = r?.structured_output as CeoOutput | undefined
-      const cost = typeof r?.total_cost_usd === 'number' ? r.total_cost_usd : null
-      if (!r || r.is_error || !so) return done({ ok: false, output: null, sessionId, error: text || '출력 없음', limited, costUsd: cost })
-      done({ ok: true, output: so, sessionId: typeof r.session_id === 'string' ? r.session_id : sessionId, error: null, limited: false, costUsd: cost })
-    })
-  })
+  const t = await runJsonTurn({ claudeBin: input.claudeBin, cwd: input.project.path, prompt, schema: CEO_SCHEMA, sessionId, resume: !!input.resumeSessionId,
+    addDirs: input.projects.filter((p) => p.id !== input.project.id).map((p) => p.path), onLine: input.onLine })
+  const out = t.output as CeoOutput | null
+  if (t.ok && (!out || !Array.isArray(out.questions))) return { ...t, ok: false, output: null, error: '출력 형식 오류' }
+  return { ...t, output: out }
 }
