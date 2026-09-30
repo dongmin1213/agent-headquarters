@@ -245,3 +245,24 @@ export function percent(frac) {
   if (typeof frac !== 'number' || !isFinite(frac)) return null
   return Math.max(0, Math.min(100, Math.round(frac * 100)))
 }
+
+/**
+ * Parses a `#code=…&request=…&task=…` fragment (login link and DecisionItem.detailPath). Any key may be missing.
+ * `code` is only accepted in its token alphabet; `task` is turned into the task key when it is `<request>.<key>`.
+ * Route fragments (`#/r/…`) and anything else yield all nulls.
+ * @returns {{code: string|null, request: string|null, task: string|null}}
+ */
+export function parseFragment(hash) {
+  const out = { code: null, request: null, task: null }
+  const raw = String(hash ?? '').replace(/^#/, '')
+  if (!raw || raw.startsWith('/')) return out
+  let p
+  try { p = new URLSearchParams(raw) } catch { return out }
+  const code = p.get('code')
+  if (code && /^[A-Za-z0-9_-]+$/.test(code)) out.code = code
+  const request = p.get('request')
+  if (request) out.request = request
+  const task = p.get('task')
+  if (task) out.task = request && task.startsWith(request + '.') ? task.slice(request.length + 1) : task
+  return out
+}

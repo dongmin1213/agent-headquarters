@@ -2,7 +2,7 @@
 // Security: every piece of data reaches the DOM through textContent / text nodes / setAttribute — never as HTML.
 import {
   ATTEMPT_STATUS, DECISION_KIND, QUOTA_MODE, REQUEST_STATUS, TASK_GROUPS, TASK_STATUS, BLOCKED_LABEL, formatClock, formatCost, formatDuration,
-  formatRelative, parseDiff, percent, renderMarkdown, shortSha, statusInfo, windowLabel,
+  formatRelative, parseDiff, parseFragment, percent, renderMarkdown, shortSha, statusInfo, windowLabel,
 } from './lib.js'
 
 const $ = (id) => document.getElementById(id)
@@ -64,7 +64,7 @@ const state = {
   drawer: null, // { taskKey, tab, attemptId }
 }
 const drafts = new Map() // input key → text
-const ui = { rejectOpen: new Set(), rejectTasks: new Map(), confirm: new Set(), pending: new Set(), errors: new Map(), decisionsCollapsed: false }
+const ui = { rejectOpen: new Set(), rejectTasks: new Map(), confirm: new Set(), pending: new Set(), errors: new Map(), rawOpen: new Set(), decisionsCollapsed: false }
 try { ui.decisionsCollapsed = localStorage.getItem('hq.decisionsCollapsed') === '1' } catch { /* storage unavailable */ }
 const sigs = new Map() // section → last rendered signature
 const activity = new Map() // attemptId → { lines, loading, error }
@@ -92,11 +92,11 @@ function showGate(title, text) {
   document.title = 'HQ · 로그인이 필요해요'
 }
 async function startSession() {
-  const m = /^#code=([A-Za-z0-9_-]+)$/.exec(location.hash)
-  if (m) {
+  const { code } = parseFragment(location.hash)
+  if (code) {
     history.replaceState(null, '', location.pathname) // the code never stays in the address bar or history
     try {
-      const res = await fetch('/ui-api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: m[1] }) })
+      const res = await fetch('/ui-api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code }) })
       const data = await res.json().catch(() => null)
       if (res.ok && typeof data?.token === 'string') { sessionToken = data.token; saveToken(sessionToken); return true }
       showGate('링크가 만료됐어요', typeof data?.error === 'string' ? data.error : "펫에서 '자세히 보기'로 열어 주세요")
@@ -224,12 +224,20 @@ function writeHash(replace) {
 }
 function applyHash() {
   // A new login link opened in an existing tab only changes the fragment: start over so the code is exchanged.
-  if (/^#code=/.test(location.hash)) { location.reload(); return }
+  const f = parseFragment(location.hash)
+  if (f.code) { location.reload(); return }
+  if (f.request) { navigateTo(f); return }
   const r = parseHash()
   if (r.req && r.req !== state.selected) { state.selected = r.req; loadDetail() }
   if (r.task) openDrawer(r.task, r.tab ?? 'activity', { fromHash: true })
   else if (state.drawer) closeDrawer({ fromHash: true })
   render()
+}
+/** Opens a request (and its task drawer) from a `#request=…&task=…` fragment, then rewrites it as a route. */
+function navigateTo(f) {
+  if (f.request !== state.selected) { state.selected = f.request; state.drawer = null; loadDetail() }
+  if (f.task) openDrawer(f.task, 'activity', { replace: true })
+  else { if (state.drawer) state.drawer = null; writeHash(true); render() }
 }
 function selectRequest(id, opts = {}) {
   if (state.selected === id && !opts.force) return
@@ -306,7 +314,7 @@ function renderDecisions() {
   const el = $('decisions')
   const items = Array.isArray(s?.decisions) ? s.decisions : []
   const reqTasks = items.filter((d) => d.kind === 'accept').map((d) => requestOf(d.requestId)?.tasks?.map((t) => [t.key, t.status, t.title]))
-  const sig = JSON.stringify([items, reqTasks, [...ui.rejectOpen], [...ui.rejectTasks].map(([k, v]) => [k, [...v]]), [...ui.confirm], [...ui.pending], [...ui.errors], ui.decisionsCollapsed, minute()])
+  const sig = JSON.stringify([items, reqTasks, [...ui.rejectOpen], [...ui.rejectTasks].map(([k, v]) => [k, [...v]]), [...ui.confirm], [...ui.pending], [...ui.errors], [...ui.rawOpen], ui.decisionsCollapsed, minute()])
   if (!changed('decisions', sig)) return
   el.hidden = items.length === 0
   if (!items.length) { swap(el); return }
@@ -339,18 +347,27 @@ function decisionCard(d) {
     h('span', null, formatRelative(d.createdAt)),
     tkey ? taskLink(d.requestId, tkey) : reqLink(d.requestId),
   ]
-  const body = []
-  if (req && !tkey) body.push(h('p', { class: 'why muted' }, h('span', { class: 'sub-label' }, '요청 '), req.text))
-  if (d.detail) body.push(h('pre', { class: 'card-body' }, d.detail))
-  const actions = []
   const opts = Array.isArray(d.options) ? d.options : []
+  const optLabel = (o) => (d.kind === 'blocked' ? BLOCKED_LABEL[o] ?? o : o)
+  const rec = d.recommendation && typeof d.recommendation.option === 'string' && opts.includes(d.recommendation.option) ? d.recommendation : null
+  const help = d.optionHelp && typeof d.optionHelp === 'object' ? d.optionHelp : {}
+  const explain = explainBlock(d, rec, opts, optLabel, help)
+  // Raw material (request text, daemon detail): shown as-is when there is no explanation, otherwise folded under 원문 보기.
+  const raw = []
+  if (req && !tkey) raw.push(h('p', { class: 'why muted' }, h('span', { class: 'sub-label' }, '요청 '), req.text))
+  if (d.detail) raw.push(h('pre', { class: 'card-body' }, d.detail))
+  const rawEl = !raw.length ? null : !d.situation ? raw
+    : h('details', { class: 'decision-raw', open: ui.rawOpen.has(key) ? true : null, ontoggle: (e) => { if (e.target.open) ui.rawOpen.add(key); else ui.rawOpen.delete(key) } },
+      h('summary', null, '원문 보기'), raw)
+  const body = []
+  const actions = []
   const post = (path, payload, msg, onOk) => act(key, path, payload, msg, onOk)
 
   if (d.kind === 'ceo_question' || d.kind === 'worker_question') {
     const send = d.kind === 'ceo_question'
       ? (answer) => post(`/requests/${enc(d.requestId)}/answer`, { questionId: d.id, answer }, '답변을 보냈어요')
       : (answer) => post(`/tasks/${enc(d.taskId ?? '')}/answer`, { questionId: d.id, answer, revision: d.revision }, '답변을 보냈어요')
-    actions.push(...answerControls(key, opts, busy, send))
+    actions.push(...answerControls(key, opts, busy, send, rec?.option))
   } else if (d.kind === 'blocked') {
     // Options are wire values (retry|skip|stop); unknown values are shown but cannot be sent.
     opts.forEach((decision, i) => {
@@ -364,7 +381,7 @@ function decisionCard(d) {
         return
       }
       actions.push(h('button', {
-        class: `btn ${decision === 'retry' ? 'btn-primary' : decision === 'stop' ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy || !known || !d.taskId,
+        class: `btn ${rec?.option === decision ? 'btn-primary' : decision === 'stop' ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy || !known || !d.taskId,
         title: known ? null : '알 수 없는 결정이라 보낼 수 없어요', 'data-fkey': `opt:${key}:${i}`,
         onclick: () => {
           if (decision === 'stop') { ui.confirm.add(ck); rerenderDecisions(); document.querySelector(`[data-fkey="stopyes:${CSS.escape(key)}"]`)?.focus(); return }
@@ -397,7 +414,7 @@ function decisionCard(d) {
     opts.forEach((opt, i) => {
       const danger = /반려|폐기|거절|중단/.test(opt)
       actions.push(h('button', {
-        class: `btn ${!danger && i === 0 ? 'btn-primary' : danger ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy || !d.subjectHash, 'data-fkey': `opt:${key}:${i}`,
+        class: `btn ${rec?.option === opt ? 'btn-primary' : danger ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy || !d.subjectHash, 'data-fkey': `opt:${key}:${i}`,
         onclick: () => {
           if (d.kind === 'accept' && opt === '반려') { ui.rejectOpen.add(key); ui.errors.delete(key); rerenderDecisions(); document.querySelector(`[data-fkey="reason:${CSS.escape(key)}"]`)?.focus(); return }
           post(`/approvals/${enc(d.id)}`, { decision: opt, subjectHash: d.subjectHash }, `${opt} — 보냈어요`)
@@ -410,14 +427,32 @@ function decisionCard(d) {
   return h('article', { class: `card decision decision-${d.kind}${busy ? ' is-busy' : ''}`, 'aria-busy': busy ? 'true' : null },
     h('div', { class: 'decision-head' }, chip([kl, kt]), h('div', { class: 'decision-meta' }, meta)),
     h('h3', { class: 'decision-title' }, txt(d.title, '제목 미확인')),
+    explain,
+    d.situation ? null : rawEl,
     body,
     h('div', { class: 'actions' }, actions),
-    err ? h('p', { class: 'card-error', role: 'alert' }, err) : null)
+    err ? h('p', { class: 'card-error', role: 'alert' }, err) : null,
+    d.situation ? rawEl : null)
 }
 
-function answerControls(key, options, busy, send) {
+/** §17 explanation: situation, cause (확인됨/추정), highlighted recommendation, then one consequence line per option. Text only. */
+function explainBlock(d, rec, opts, optLabel, help) {
+  const out = []
+  if (d.situation) out.push(h('p', { class: 'decision-situation' }, d.situation))
+  if (d.cause) out.push(h('p', { class: 'decision-cause' },
+    h('span', { class: `cause-label ${d.causeConfirmed ? 'is-confirmed' : 'is-guess'}` }, d.causeConfirmed ? '원인(확인됨)' : '원인(추정)'), ' ', d.cause))
+  if (rec) out.push(h('div', { class: 'decision-rec' },
+    h('p', { class: 'rec-head' }, h('strong', null, `추천 · ${optLabel(rec.option)}`)),
+    rec.reason ? h('p', { class: 'rec-reason' }, rec.reason) : null))
+  const lines = opts.filter((o) => typeof help[o] === 'string' && help[o])
+  if (lines.length) out.push(h('ul', { class: 'option-help' }, lines.map((o) => h('li', { class: rec?.option === o ? 'is-rec' : null },
+    h('span', { class: 'option-name' }, `${optLabel(o)}:`), ' ', help[o]))))
+  return out
+}
+
+function answerControls(key, options, busy, send, recOption) {
   const dk = `ans:${key}`
-  const out = options.map((opt, i) => h('button', { class: `btn ${i === 0 ? 'btn-primary' : ''}`, type: 'button', disabled: busy, 'data-fkey': `ansopt:${key}:${i}`, onclick: () => send(opt) }, opt))
+  const out = options.map((opt, i) => h('button', { class: `btn ${opt === recOption ? 'btn-primary' : ''}`, type: 'button', disabled: busy, 'data-fkey': `ansopt:${key}:${i}`, onclick: () => send(opt) }, opt))
   const input = h('input', { class: 'input input-inline', type: 'text', 'data-fkey': dk, placeholder: '직접 답하기', 'aria-label': '직접 답하기', value: drafts.get(dk) ?? '', disabled: busy,
     oninput: (e) => drafts.set(dk, e.target.value),
     onkeydown: (e) => { if (e.key === 'Enter' && e.target.value.trim()) { send(e.target.value.trim()); drafts.delete(dk) } } })
@@ -599,7 +634,7 @@ function openDrawer(taskKey, tab = 'activity', opts = {}) {
   const same = state.drawer?.taskKey === taskKey
   if (!lastFocusBeforeDrawer) lastFocusBeforeDrawer = document.activeElement
   state.drawer = { taskKey, tab: TABS.some(([k]) => k === tab) ? tab : 'activity', attemptId: same ? state.drawer.attemptId : null }
-  if (!opts.fromHash) writeHash(false)
+  if (!opts.fromHash) writeHash(opts.replace)
   sigs.delete('drawer'); sigs.delete('detail')
   render()
   refreshDrawerData()
@@ -958,12 +993,15 @@ setInterval(() => { if (state.conn === 'live' && lastBeat && Date.now() - lastBe
 document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleRefresh(0) })
 
 // ---------- boot ----------
+// The pet opens /ui/#code=…&request=…&task=… (detailPath): read the target before the code exchange clears the fragment.
+const bootTarget = parseFragment(location.hash)
 {
-  const r = parseHash()
+  const r = bootTarget.request ? { req: bootTarget.request, task: bootTarget.task, tab: null } : parseHash()
   if (r.req) { state.selected = r.req; if (r.task) state.drawer = { taskKey: r.task, tab: TABS.some(([k]) => k === r.tab) ? r.tab : 'activity', attemptId: null } }
 }
 startSession().then((ok) => {
   if (!ok) return
+  if (bootTarget.request) writeHash(true) // #request=…&task=… becomes #/r/<id>/t/<key>/activity
   render()
   loadState()
   loadDetail()

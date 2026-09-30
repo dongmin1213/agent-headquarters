@@ -156,6 +156,23 @@ ul.compact li + li { margin-top: 2px; }
 .card-body { margin: 0; padding: var(--s2) var(--s3); background: var(--surface-2); border-radius: var(--r1); white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.6; color: var(--text-2); max-height: 180px; overflow: auto; }
 .actions { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; margin-top: var(--s1); }
 .decision > .actions { margin-top: auto; padding-top: var(--s2); }
+.decision p { margin: 0; }
+.decision-situation { font-size: 14px; line-height: 1.6; color: var(--text); }
+.decision-cause { font-size: 13px; line-height: 1.6; color: var(--text-2); }
+.cause-label { display: inline-block; font-size: 11.5px; font-weight: 700; padding: 0 var(--s1); border-radius: var(--r1); margin-right: 2px; }
+.cause-label.is-confirmed { color: var(--ok); background: var(--ok-soft); }
+.cause-label.is-guess { color: var(--warn); background: var(--warn-soft); }
+.decision-rec { padding: var(--s2) var(--s3); background: var(--accent-soft); border-left: 3px solid var(--accent); border-radius: var(--r1); display: flex; flex-direction: column; gap: 2px; }
+.rec-head { font-size: 14px; color: var(--accent-strong); }
+.rec-reason { font-size: 13px; line-height: 1.55; color: var(--text); }
+.option-help { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 2px; font-size: 12.5px; line-height: 1.55; color: var(--text-2); }
+.option-help li { padding-left: var(--s3); position: relative; }
+.option-help li::before { content: "·"; position: absolute; left: var(--s1); color: var(--text-3); }
+.option-help .option-name { font-weight: 650; color: var(--text); }
+.option-help li.is-rec .option-name { color: var(--accent-strong); }
+.decision-raw summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--text-3); }
+.decision-raw[open] summary { margin-bottom: var(--s2); }
+.decision-raw > * + * { margin-top: var(--s2); }
 .free-answer { display: inline-flex; gap: var(--s2); flex: 1 1 220px; min-width: 0; }
 .free-answer .input { flex: 1; min-width: 0; width: auto; }
 .wq { border-top: 1px solid var(--border); padding-top: var(--s2); }

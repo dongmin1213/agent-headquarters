@@ -242,20 +242,63 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
   // ---------- helpers ----------
   const allTasks = () => [...details.values()].flat()
   /** The daemon builds this list (execution.md §17); the mock mirrors its order: plan → ceo_question → worker_question → revise → blocked → integration → accept → merge. */
+  type Explain = Pick<DecisionItem, 'situation' | 'cause' | 'causeConfirmed' | 'recommendation' | 'optionHelp' | 'detailPath'>
+  const HELP: Record<string, string> = {
+    retry: '같은 작업을 최상위 모델로 한 번 더 해요 · 사용량이 들어요',
+    skip: '이 작업과 여기에 의존하는 작업을 빼고 계속해요 · 나중에 새 요청으로 다시 할 수 있어요',
+    stop: '요청 전체를 멈춰요 · 만든 브랜치는 남겨 둬요',
+    수락: '통합본을 병합 대기로 넘겨요 · 병합은 따로 승인해요',
+    반려: '사유를 붙여 다시 작업시켜요',
+    병합: '대상 브랜치에 fast-forward로 반영해요',
+    보류: '지금은 병합하지 않고 둬요 · 나중에 다시 제시할 수 있어요',
+  }
+  const help = (opts: string[], extra: Record<string, string> = {}) => Object.fromEntries(opts.map((o) => [o, extra[o] ?? HELP[o] ?? '']).filter(([, v]) => v))
+  const detailPath = (requestId: string, taskId: string | null) => `/ui/#request=${encodeURIComponent(requestId)}${taskId ? `&task=${encodeURIComponent(taskId)}` : ''}`
+  /** Explanation fields per decision (execution.md §17 "결정 카드 설명"): with a recommendation, without one, and a cause marked 추정. */
+  const EXPLAIN: Record<string, Omit<Explain, 'optionHelp' | 'detailPath'> & { help?: Record<string, string> }> = {
+    [`plan:${R2}`]: { situation: '태그 필터 계획이 준비됐어요 · 작업 2개(필터 컴포넌트, 모바일 카드 간격)로 나눴어요', cause: null, causeConfirmed: false,
+      recommendation: { option: '승인', reason: '요청 범위와 일치하고 둘 다 작은 작업이라 사용량 부담이 적어요' },
+      help: { 승인: '작업자 2명이 바로 시작해요', 반려: '사유를 붙여 사장이 계획을 다시 짜요' } },
+    'q-5e6f7a8b': { situation: '펫 캐릭터를 모델별로 다르게 보여 주려면 캐릭터 팩을 먼저 정해야 해요', cause: null, causeConfirmed: false,
+      recommendation: { option: '포켓몬', reason: '이미 사장 캐릭터(피카츄)가 포켓몬이라 한 팩으로 맞추면 크기가 일정해요' },
+      help: { 포켓몬: '사장과 같은 팩으로 맞춰요', 디지몬: '작업자만 디지몬으로 바꿔요 · 스프라이트 크기 조정이 필요해요', 섞어서: '모델마다 팩을 섞어요 · 표시 규칙이 복잡해져요' } },
+    'q-9c0d1e2f': { situation: '작업이 끝난 캐릭터를 언제 치울지 정해야 해요', cause: null, causeConfirmed: false, recommendation: null,
+      help: { 바로: '끝나는 즉시 사라져요', '10초 뒤': '완료 표시를 10초 보여 주고 사라져요' } },
+    'wq-1a2b3c4d': { situation: '알림 작업자가 알림을 보내는 주기를 묻고 있어요', cause: null, causeConfirmed: false,
+      recommendation: { option: '매번', reason: '결정은 늦게 알수록 작업이 멈춰 있는 시간이 길어져요' },
+      help: { 매번: '결정이 생길 때마다 바로 알려요', '5분 묶음': '5분마다 모아서 한 번에 알려요 · 알림이 줄어요' } },
+    'wq-5e6f7a8b': { situation: `알림 제목 예시에 ${XSS} 같은 문자열이 들어 있어요`, cause: null, causeConfirmed: false, recommendation: null,
+      help: { 그대로: '예시 문자열을 남겨요', 제거: '예시에서 빼요' } },
+    [`revise:${R1}.sandbox`]: { situation: '샌드박스 작업자가 지시서의 담당 파일 범위를 넓혀 달라고 했어요', cause: '프로필 템플릿을 별도 파일로 둬야 검사를 돌릴 수 있어요 (작업자 보고 · 검사 로그 확인)', causeConfirmed: true,
+      recommendation: { option: '승인', reason: '넓히는 범위가 src/exec/profiles/** 하나뿐이고 다른 작업과 겹치지 않아요' },
+      help: { 승인: '고친 지시서로 작업을 이어가요', 반려: '원래 범위 안에서 다시 하게 해요' } },
+    [`${R1}.recover`]: { situation: '재시작 복구 작업이 3번 시도했지만 끝났다는 표시(done.json)를 남기지 못했어요', cause: '작업자가 종료 코드 0으로 끝났지만 done.json을 쓰기 전에 프로세스가 끝난 것 같아요', causeConfirmed: false,
+      recommendation: { option: 'retry', reason: '실패 원인이 코드가 아니라 마무리 단계로 보여 최상위 모델이 한 번 더 하면 풀릴 가능성이 높아요' } },
+    [`integration:${R5}:blog`]: { situation: 'blog 브랜치를 합치는 중에 충돌이 나고 검사가 실패했어요', cause: `src/list.ts가 두 작업에서 함께 바뀌었고 npm test가 종료 코드 1로 실패했어요 ${XSS}`, causeConfirmed: true,
+      recommendation: { option: '다시 통합', reason: '충돌이 파일 하나뿐이라 순서를 바꿔 다시 합치면 풀릴 수 있어요' },
+      help: { '다시 통합': '작업 순서를 바꿔 다시 합쳐요 · 사용량이 조금 들어요', '요청 중단': '요청 전체를 멈춰요 · 만든 브랜치는 남겨 둬요' } },
+    [`accept:${R4}`]: { situation: '작업 2개가 검사·검토를 통과했어요 · 결과를 확인하고 수락해 주세요', cause: null, causeConfirmed: false, recommendation: null },
+    [`merge:${R5}:hq`]: { situation: 'hq/req-91aa7c3b/fix를 main(4c1e9a0)에 병합할 차례예요 · 커밋 1개, 파일 2개 변경', cause: null, causeConfirmed: false, recommendation: null },
+  }
+  function explain(id: string, requestId: string, taskId: string | null, options: string[]): Explain {
+    const e = EXPLAIN[id] ?? { situation: '', cause: null, causeConfirmed: false, recommendation: null }
+    return { situation: e.situation, cause: e.cause, causeConfirmed: e.causeConfirmed, recommendation: e.recommendation, optionHelp: help(options, e.help), detailPath: detailPath(requestId, taskId) }
+  }
   function decisionItems(): DecisionItem[] {
     const open = approvals.filter((a) => a.decision === null)
     const fromApproval = (prefix: string, kind: DecisionItem['kind']): DecisionItem[] => open.filter((a) => a.id.startsWith(prefix)).map((a) => {
       const rest = a.id.slice(prefix.length)
       const requestId = rest.split(/[.:]/)[0]
-      return { kind, id: a.id, revision: kind === 'revise' ? 1 : 0, requestId, taskId: kind === 'revise' ? rest : null, title: a.title, detail: a.body, options: a.options, subjectHash: a.subjectHash, createdAt: a.createdAt }
+      const taskId = kind === 'revise' ? rest : null
+      return { kind, id: a.id, revision: kind === 'revise' ? 1 : 0, requestId, taskId, title: a.title, detail: a.body, ...explain(a.id, requestId, taskId, a.options), options: a.options, subjectHash: a.subjectHash, createdAt: a.createdAt }
     })
     const ceoQ: DecisionItem[] = requests.filter((r) => r.status === 'asking').flatMap((r) => r.questions.filter((q) => q.answer === null).map((q) => ({
-      kind: 'ceo_question' as const, id: q.id, revision: 0, requestId: r.id, taskId: null, title: q.question, detail: `이유: ${q.reason}\n기본값: ${q.default}`, options: q.options, subjectHash: null, createdAt: r.updatedAt })))
+      kind: 'ceo_question' as const, id: q.id, revision: 0, requestId: r.id, taskId: null, title: q.question, detail: `이유: ${q.reason}\n기본값: ${q.default}`, ...explain(q.id, r.id, null, q.options), options: q.options, subjectHash: null, createdAt: r.updatedAt })))
     const workerQ: DecisionItem[] = allTasks().filter((t) => t.status === 'question').flatMap((t) => t.questions.map((q) => ({
-      kind: 'worker_question' as const, id: q.id, revision: t.revision, requestId: t.requestId, taskId: t.id, title: q.question, detail: `${t.title} · 기본값: ${q.default}`, options: q.options, subjectHash: null, createdAt: t.updatedAt })))
+      kind: 'worker_question' as const, id: q.id, revision: t.revision, requestId: t.requestId, taskId: t.id, title: q.question, detail: `${t.title} · 기본값: ${q.default}`, ...explain(q.id, t.requestId, t.id, q.options), options: q.options, subjectHash: null, createdAt: t.updatedAt })))
     const blocked: DecisionItem[] = allTasks().filter((t) => t.status === 'blocked').map((t) => ({
       kind: 'blocked' as const, id: t.id, revision: t.revision, requestId: t.requestId, taskId: t.id, title: `작업 "${t.title}"이 막혔어요`, detail: t.note ?? '',
-      options: ['retry', 'skip', 'stop'], subjectHash: null, createdAt: t.updatedAt }))
+      ...explain(t.id, t.requestId, t.id, ['retry', 'skip', 'stop']), options: ['retry', 'skip', 'stop'], subjectHash: null, createdAt: t.updatedAt }))
     return [...fromApproval('plan:', 'plan'), ...ceoQ, ...workerQ, ...fromApproval('revise:', 'revise'), ...blocked, ...fromApproval('integration:', 'integration'),
       ...fromApproval('accept:', 'accept'), ...fromApproval('merge:', 'merge')]
   }

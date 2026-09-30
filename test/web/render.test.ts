@@ -110,6 +110,22 @@ test('mock fixtures follow v2 shapes: every task status, every decision kind in 
   assert.deepEqual(kinds, [...kinds].sort((a: string, b: string) => order.indexOf(a) - order.indexOf(b)), 'daemon order')
   assert.equal(snap.headline.needsYou, snap.decisions.length)
   assert.deepEqual(snap.decisions.find((d: { kind: string }) => d.kind === 'blocked').options, ['retry', 'skip', 'stop'])
+  type D = { kind: string; options: string[]; situation: string; cause: string | null; causeConfirmed: boolean; recommendation: { option: string; reason: string } | null; optionHelp: Record<string, string>; detailPath: string | null; requestId: string; taskId: string | null }
+  for (const d of snap.decisions as D[]) {
+    assert.ok(typeof d.situation === 'string' && d.situation, `${d.kind} situation`)
+    assert.equal(typeof d.causeConfirmed, 'boolean')
+    assert.ok(d.cause === null || typeof d.cause === 'string')
+    if (d.recommendation) assert.ok(d.options.includes(d.recommendation.option) && d.recommendation.reason, `${d.kind} recommendation is an option`)
+    for (const o of d.options) assert.ok(d.optionHelp[o], `${d.kind} optionHelp[${o}]`)
+    const f = lib.parseFragment(d.detailPath!.replace(/^\/ui\//, ''))
+    assert.equal(f.request, d.requestId)
+    if (d.taskId) assert.equal(`${d.requestId}.${f.task}`, d.taskId)
+  }
+  const ds = snap.decisions as D[]
+  assert.ok(ds.some((d) => d.recommendation), 'one with a recommendation')
+  assert.ok(ds.some((d) => !d.recommendation), 'one without')
+  assert.ok(ds.some((d) => d.cause && !d.causeConfirmed), 'one cause marked 추정')
+  assert.ok(ds.some((d) => d.cause && d.causeConfirmed), 'one cause 확인됨')
   assert.ok(snap.quota.windows.length >= 2)
   assert.ok(snapRes.includes('<script>'))
   const act = JSON.parse(await callMock(mock, '/api/attempts/req-7f3a9c21.runner~a2/activity?after=0'))
@@ -117,6 +133,18 @@ test('mock fixtures follow v2 shapes: every task status, every decision kind in 
   const diff = JSON.parse(await callMock(mock, '/api/requests/req-7f3a9c21/diff?task=runner'))
   assert.ok(Array.isArray(diff.files) && typeof diff.diff === 'string' && typeof diff.truncated === 'boolean')
   mock.close()
+})
+
+test('parseFragment reads code, request and task from the login / detailPath fragment', () => {
+  assert.deepEqual(lib.parseFragment('#code=AbC_-12&request=req-7f3a9c21&task=req-7f3a9c21.recover'), { code: 'AbC_-12', request: 'req-7f3a9c21', task: 'recover' })
+  assert.deepEqual(lib.parseFragment('#request=req-x&task=req-x.A'), { code: null, request: 'req-x', task: 'A' })
+  assert.deepEqual(lib.parseFragment('#task=req-x.A&request=req-x&code=zz'), { code: 'zz', request: 'req-x', task: 'A' }, 'order does not matter')
+  assert.deepEqual(lib.parseFragment('#code=only'), { code: 'only', request: null, task: null })
+  assert.deepEqual(lib.parseFragment('#request=req-x'), { code: null, request: 'req-x', task: null })
+  assert.deepEqual(lib.parseFragment('#request=req-x&task=other'), { code: null, request: 'req-x', task: 'other' }, 'a bare task key is kept')
+  assert.deepEqual(lib.parseFragment('#request=req%2Dx&task=req-x.a%2Fb'), { code: null, request: 'req-x', task: 'a/b' }, 'values are decoded')
+  assert.equal(lib.parseFragment('#code=<script>&request=r').code, null, 'code outside the token alphabet is ignored')
+  for (const h of ['', '#', '#/r/req-x/t/A/activity', null, undefined]) assert.deepEqual(lib.parseFragment(h), { code: null, request: null, task: null }, String(h))
 })
 
 async function callMock(mock: ReturnType<typeof createMockApi>, url: string): Promise<string> {
