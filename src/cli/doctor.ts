@@ -183,6 +183,18 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
     }
   }
 
+  // Recurring teams: an explicit Seatbelt opt-out (TeamConfig.sandbox: "none") is reported, never silent.
+  const teamsFile = ['config/teams.json', 'config/teams.example.json'].map((f) => join(ctx.root, f)).find(existsSync)
+  let teamList: unknown = null
+  try { if (teamsFile) teamList = JSON.parse(readFileSync(teamsFile, 'utf8')) } catch { /* the daemon reports a broken file itself */ }
+  if (Array.isArray(teamList)) {
+    for (const t of teamList as { id?: unknown; name?: unknown; sandbox?: unknown }[]) {
+      if (t?.sandbox !== 'none') continue
+      add(`team-sandbox:${String(t.id ?? '?')}`, `팀 ${String(t.name ?? t.id ?? '?')}`, 'warn', '샌드박스 없이 실행돼요 (config/teams.json sandbox: "none")',
+        'config/teams.json에서 이 팀의 "sandbox": "none"을 지우면 작업자와 같은 격리 안에서 실행돼요. 더 필요한 경로는 "sandbox": {"readable": [...], "writable": [...]}로 허용하세요 (docs/SETUP.md "반복 팀")')
+    }
+  }
+
   // $HQ_HOME
   try {
     const target = existsSync(ctx.home) ? ctx.home : nearestExisting(ctx.home)

@@ -14,6 +14,12 @@ export interface TeamConfig {
   enabled: boolean
   /** Wall-clock limit per run (default 180); on expiry the run's process group gets SIGTERM, then SIGKILL after 10s. */
   timeoutMinutes?: number
+  /**
+   * Seatbelt for this team (default: the shared v4 rules + read/write of `cwd`, temp, its own ~/.claude/projects/<cwd>/).
+   * `readable`/`writable` add paths (~ allowed; relative paths are from `cwd`). `'none'` runs without Seatbelt
+   * (explicit opt-out; `hq doctor` warns).
+   */
+  sandbox?: { readable?: string[]; writable?: string[] } | 'none'
 }
 
 export interface RunRecord {
