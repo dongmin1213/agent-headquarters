@@ -17,7 +17,9 @@ export function claudeArgs(cfg: HqConfig, o: { role: Role; model: string; sessio
   const base = ['-p', '--output-format', 'stream-json', '--verbose', '--model', modelArg(cfg, o.model),
     ...(o.resume ? ['--resume', o.sessionId] : ['--session-id', o.sessionId]), '--max-turns', String(cfg.maxTurns)]
   const guard = ['--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--disallowedTools', ...cfg.workerDisallowedTools]
-  if (o.role === 'implement') return [...base, '--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch', '--permission-mode', 'acceptEdits', '--add-dir', o.out!, ...guard]
+  if (o.role === 'implement') return [...base, '--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch',
+    // Without --allowedTools, `git commit` is denied as "requires approval" in -p mode (verified on 2.1.285); the sandbox is the boundary.
+    '--allowedTools', 'Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'WebFetch', 'WebSearch', '--permission-mode', 'acceptEdits', '--add-dir', o.out!, ...guard]
   if (o.role === 'collect') return [...base, '--tools', 'Read,Glob,Grep,WebFetch,WebSearch,Write', '--permission-mode', 'dontAsk',
     '--allowedTools', 'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch', `Write(/${o.out}/**)`, ...guard]
   return [...base, '--tools', 'Bash,Read,Glob,Grep', '--permission-mode', 'dontAsk', '--allowedTools', 'Bash', 'Read', 'Glob', 'Grep',
