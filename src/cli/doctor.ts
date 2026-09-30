@@ -5,6 +5,7 @@ import { loadConfig } from '../config.ts'
 import { probeHq, type HqProbe } from './api.ts'
 import { pidCommand, readLockPid } from './daemon.ts'
 import { sandboxSmoke, type SmokeResult } from './sandbox.ts'
+import { hqReadPaths, protectedFolders, tccLabels, tccPathList } from './tcc.ts'
 import {
   DAEMON_LABEL, PET_LABEL, expandHome, findBin, lockFile, petApp, plistPath, projectsFile, runCmd, type Ctx, type ExecResult,
 } from './ctx.ts'
@@ -216,11 +217,25 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
   else add('pet', '데스크 펫', 'warn', petBuilt ? '실행 중이 아님' : '빌드되지 않음 (pet/HQPet.app 없음)', petBuilt ? `open ${petApp(ctx)}` : 'hq install (또는 pet/build.sh)')
 
   // LaunchAgents
+  let daemonAgentLoaded = false
   for (const [label, name] of [[DAEMON_LABEL, '자동 시작: 데몬'], [PET_LABEL, '자동 시작: 펫']] as const) {
     const installed = existsSync(plistPath(ctx, label))
     const loaded = installed && await p.launchctlLoaded(label)
+    if (label === DAEMON_LABEL) daemonAgentLoaded = loaded
     if (installed && loaded) add(`launchd:${label}`, name, 'ok', '설치·로드됨')
     else add(`launchd:${label}`, name, 'warn', installed ? `${plistPath(ctx, label)} 있으나 로드 안 됨` : 'LaunchAgent 미설치', 'hq install')
+  }
+
+  // macOS TCC: a launchd-started node blocks on a permission dialog the first time it reads a protected folder.
+  const tcc = protectedFolders(hqReadPaths(ctx), ctx.userHome)
+  const TCC_TITLE = '폴더 접근 권한 (macOS)'
+  if (!tcc.length) add('tcc', TCC_TITLE, 'ok', '보호 폴더(데스크탑·문서·다운로드) 밖이라 권한 창이 필요 없음')
+  else {
+    const labels = tccLabels(tcc)
+    if (hq.kind === 'hq' && daemonAgentLoaded) add('tcc', TCC_TITLE, 'ok', `${labels} 폴더 아래에 있지만 자동 시작 데몬이 응답 중 → 권한 허용됨`)
+    else add('tcc', TCC_TITLE, 'warn',
+      `hq가 읽는 경로가 ${labels} 폴더 아래에 있어요 (${tccPathList(tcc, ctx.userHome)}). 자동 시작한 데몬이 처음 이 폴더를 읽을 때 macOS가 'node'의 접근 허용 창을 띄우고, 허용할 때까지 데몬이 멈춰요`,
+      `창이 뜨면 [허용]을 누르세요. 이미 거부했다면: 시스템 설정 → 개인정보 보호 및 보안 → 파일 및 폴더 → node에서 ${labels} 폴더를 켜세요. 권한 창을 피하려면 저장소를 ~/src 같은 곳으로 옮기세요`)
   }
 
   // Sprites (optional)

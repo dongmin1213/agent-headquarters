@@ -7,6 +7,7 @@ import { DAEMON_LABEL, PET_LABEL, daemonLog, findBin, logsDir, petApp, petBinary
 import { stopTarget } from './daemon.ts'
 import { printDoctor, realProbes, runDoctor, type Probes } from './doctor.ts'
 import { daemonPlist, launchPath, petPlist } from './plist.ts'
+import { hqReadPaths, protectedFolders, tccLabels } from './tcc.ts'
 
 const hasSprites = (ctx: Ctx) => ['pokemon', 'digimon'].every((k) => {
   try { return readdirSync(join(ctx.root, 'pet/packs', k, 'pool')).length > 0 } catch { return false }
@@ -48,7 +49,15 @@ function linkHint(ctx: Ctx): void {
   ctx.out(`hq 명령을 어디서나 쓰려면 PATH에 추가하세요: export PATH="${join(ctx.root, 'bin')}:$PATH"`)
 }
 
-export async function install(ctx: Ctx, opts: { sprites: boolean; probes?: Probes }): Promise<number> {
+export interface InstallOpts {
+  sprites: boolean
+  probes?: Probes
+  /** Step-6 daemon wait in ms (tests override): normal 10 s, 90 s when a macOS TCC dialog may appear. */
+  daemonWaitMs?: number
+  protectedWaitMs?: number
+}
+
+export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
   ctx.out('1/6 환경 진단')
   const checks = await runDoctor(ctx, opts.probes ?? realProbes(ctx))
   if (checks.some((c) => c.status === 'fail')) {
@@ -90,6 +99,9 @@ export async function install(ctx: Ctx, opts: { sprites: boolean; probes?: Probe
     ctx.out('  정리할 것 없음')
   }
 
+  const tcc = protectedFolders(hqReadPaths(ctx), ctx.userHome)
+  const labels = tccLabels(tcc)
+
   ctx.out('5/6 LaunchAgent 등록 (로그인 때 자동 시작)')
   mkdirSync(logsDir(ctx), { recursive: true })
   const pl = buildPlists(ctx)
@@ -101,9 +113,18 @@ export async function install(ctx: Ctx, opts: { sprites: boolean; probes?: Probe
 
   ctx.out('6/6 데몬 응답 확인')
   if (ctx.dryRun) ctx.out('[dry-run] 데몬 응답 확인 생략')
-  else if (!(await waitFor(async () => (await probeHq(ctx, 1000)).kind === 'hq', 10_000))) {
-    ctx.err(`데몬이 10초 안에 응답하지 않았습니다. 로그: hq logs  (${daemonLog(ctx)})`)
-    return 1
+  else {
+    if (tcc.length) {
+      ctx.out(`  macOS가 'node'의 ${labels} 폴더 접근 허용 창을 띄우면 [허용]을 눌러 주세요 (처음 한 번)`)
+      ctx.out('  응답 기다리는 중… (최대 90초)')
+    }
+    const waitMs = tcc.length ? (opts.protectedWaitMs ?? 90_000) : (opts.daemonWaitMs ?? 10_000)
+    if (!(await waitFor(async () => (await probeHq(ctx, 1000)).kind === 'hq', waitMs))) {
+      ctx.err(tcc.length
+        ? `데몬이 90초 안에 응답하지 않았습니다. 화면에 'node'의 ${labels} 폴더 접근 허용 창이 떠 있으면 [허용]을 누른 뒤 hq install을 다시 실행하세요. 거부했다면: 시스템 설정 → 개인정보 보호 및 보안 → 파일 및 폴더 → node. 로그: hq logs  (${daemonLog(ctx)})`
+        : `데몬이 10초 안에 응답하지 않았습니다. 로그: hq logs  (${daemonLog(ctx)})`)
+      return 1
+    }
   }
   if (!(await bootstrap(ctx, PET_LABEL))) return 1
   ctx.out(`  데몬 응답 확인됨 (127.0.0.1:${ctx.port}), 펫 실행`)
