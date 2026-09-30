@@ -13,6 +13,8 @@ export interface TaskRow {
   review_invalid: number; revise_turns: number; branch: string | null; worktree: string | null; base_sha: string | null
   head_sha: string | null; checks_state: string | null; resume_session: string | null; report_sha: string | null
   diagnosis: string | null; generation: number; block_count: number; note: string | null; updated_at: string
+  /** JSON `{ pid, lstart, since }`: an earlier worker whose identity could not be confirmed may still run; no attempt starts until it is gone. */
+  lingering: string | null
 }
 export interface AttemptRow {
   id: string; task_id: string; kind: string; n: number; model: string; status: string; session_id: string; pid: number | null
@@ -30,12 +32,12 @@ export interface MergeRow {
 export interface TaskQuestionRow { id: string; task_id: string; attempt_id: string | null; revision: number; question: string; options: string[]; default: string; answer: string | null; created_at: string }
 export interface ApprovalRow extends Approval { revision: number; kind: string; subjectId: string | null; state: string }
 
-const SCHEMA_VERSION = 6
+const SCHEMA_VERSION = 7
 /** Cards fixed to a subject hash never expire (execution.md §12). */
 export const NO_EXPIRY = '9999-12-31T00:00:00.000Z'
 
 const TASK_COLS = new Set(['title', 'role', 'grade', 'model', 'review_model', 'spec', 'revision', 'status', 'attempts', 'limited_streak', 'review_invalid',
-  'revise_turns', 'branch', 'worktree', 'base_sha', 'head_sha', 'checks_state', 'resume_session', 'report_sha', 'diagnosis', 'generation', 'block_count', 'note'])
+  'revise_turns', 'branch', 'worktree', 'base_sha', 'head_sha', 'checks_state', 'resume_session', 'report_sha', 'diagnosis', 'generation', 'block_count', 'note', 'lingering'])
 const ATTEMPT_COLS = new Set(['model', 'status', 'session_id', 'pid', 'lstart', 'started_at', 'ended_at', 'cost_usd', 'input_tokens', 'output_tokens', 'outcome', 'reason', 'bash_runs'])
 const MERGE_COLS = new Set(['target', 'target_sha', 'integration_sha', 'state', 'result_sha', 'note', 'diagnosis', 'known_failures'])
 type Val = string | number | null
@@ -125,6 +127,8 @@ export class Store {
       addColumn('runs', 'pid', 'integer'); addColumn('runs', 'lstart', 'text'); addColumn('runs', 'token_hash', 'text')
       // schema 6: base-failed integration checks the chairman accepted, bound to one integration SHA.
       addColumn('merges', 'known_failures', 'text')
+      // schema 7: a possibly still running worker whose identity could not be confirmed (gates new attempts of its task).
+      addColumn('tasks', 'lingering', 'text')
       if (v === 2 || v === 3) this.convertV2Execution()
       this.db.exec(`pragma user_version = ${SCHEMA_VERSION}`)
     })
@@ -337,6 +341,9 @@ export class Store {
   }
 
   task(id: string): TaskRow | null { return (this.db.prepare('select * from tasks where id = ?').get(id) as TaskRow | undefined) ?? null }
+
+  /** Tasks with a possibly still running earlier worker. */
+  lingeringTasks(): TaskRow[] { return this.db.prepare('select * from tasks where lingering is not null order by rowid').all() as unknown as TaskRow[] }
 
   /** Plan order (insertion order). */
   tasks(requestId: string): TaskRow[] { return this.db.prepare('select * from tasks where request_id = ? order by rowid').all(requestId) as unknown as TaskRow[] }

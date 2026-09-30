@@ -18,7 +18,8 @@ export async function recover(d: Runner): Promise<void> {
       const info = readJson<{ pid: number; lstart: string | null; startedAt: string }>(join(hqDirOf(att), 'process.json'))
       if (info) {
         // It did start. Whatever its identity now, the tick judges it: `same` is supervised, `gone`/`other` are finished
-        // from their evidence without a signal, `unknown` stops the task (§22).
+        // from their evidence without a signal; a lasting `unknown` stops the task and gates its next attempt until the
+        // pid is gone (lingering, §22).
         s.updateAttempt(att.id, { status: 'running', pid: info.pid, lstart: info.lstart, started_at: att.started_at ?? info.startedAt })
         d.track({ ...att, status: 'running', pid: info.pid, lstart: info.lstart }, info.pid, info.lstart, info.startedAt, null)
         continue
