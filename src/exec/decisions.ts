@@ -51,7 +51,9 @@ export function taskView(store: Store, t: TaskRow, activity: (a: AttemptRow) => 
   }
 }
 
-export function workerViews(store: Store, activity: (a: AttemptRow) => string | null = (a) => lastActivityOf(hqDirOf(a))): WorkerView[] {
+export const hhmm = (iso: string) => { const d = new Date(iso); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` }
+
+export function workerViews(store: Store, activity: (a: AttemptRow) => string | null = (a) => lastActivityOf(hqDirOf(a)), holdUntil: string | null = null): WorkerView[] {
   const out: WorkerView[] = []
   for (const a of store.liveAttempts()) {
     const t = store.task(a.task_id)
@@ -60,18 +62,17 @@ export function workerViews(store: Store, activity: (a: AttemptRow) => string | 
     out.push({ attemptId: a.id, taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, model: a.model,
       kind: review ? 'review' : 'work', state: review ? 'reviewing' : 'running', bubble: activity(a) ?? (review ? '검토 준비 중' : '준비 중'), startedAt: a.started_at ?? t.updated_at })
   }
-  for (const t of store.tasksByStatus(['verifying', 'held'])) {
-    const a = store.attempts(t.id).filter((x) => x.kind === 'work').at(-1)
-    if (t.status === 'verifying') out.push({ attemptId: a?.id ?? '', taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, model: 'hq',
-      kind: 'verify', state: 'verifying', bubble: '수용 기준 검사 중', startedAt: t.updated_at })
-    else out.push({ attemptId: a?.id ?? '', taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, model: t.model,
-      kind: 'work', state: 'held', bubble: '사용 한도, 쉬는 중', startedAt: t.updated_at })
+  for (const t of store.tasksByStatus(['verifying', 'held', 'blocked'])) {
+    const last = store.attempts(t.id).at(-1)
+    const base = { attemptId: last?.id ?? '', taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, startedAt: t.updated_at }
+    if (t.status === 'verifying') out.push({ ...base, attemptId: store.attempts(t.id).filter((x) => x.kind === 'work').at(-1)?.id ?? '', model: 'hq', kind: 'verify', state: 'verifying', bubble: '수용 기준 검사 중' })
+    else if (t.status === 'held') out.push({ ...base, model: t.model, kind: 'work', state: 'held', bubble: holdUntil ? `한도 보류 · ${hhmm(holdUntil)}까지` : '한도 보류' })
+    else out.push({ ...base, model: t.model, kind: last?.kind === 'review' ? 'review' : 'work', state: 'blocked', bubble: '멈춤 · 사장에게 보고' })
   }
   return out
 }
 
 const WINDOW_NAMES: Record<string, string> = { five_hour: '5시간', seven_day: '7일', seven_day_opus: '7일(opus)', seven_day_sonnet: '7일(sonnet)', team: '팀' }
-const hhmm = (iso: string) => { const d = new Date(iso); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` }
 
 export interface HeadlineInput {
   decisions: DecisionItem[]
@@ -92,7 +93,7 @@ export function buildHeadline(h: HeadlineInput): Headline {
   const needsYou = h.decisions.length
   if (needsYou) return { text: `회장님 결정 ${needsYou}건: ${h.decisions[0].title}`, needsYou }
   if (h.failures.length) return { text: `${h.failures[0].title}이 막혔어요: ${h.failures[0].reason.split('\n')[0].slice(0, 80)}`, needsYou }
-  const active = h.workers.filter((w) => w.state !== 'held')
+  const active = h.workers.filter((w) => w.state !== 'held' && w.state !== 'blocked')
   if (active.length) {
     const w = active[0]
     const verb = w.kind === 'review' ? '검토' : w.kind === 'verify' ? '검증' : '구현'

@@ -1140,8 +1140,8 @@ export class Runner {
   // ----- screen data -----
   views(): { workers: WorkerView[]; headline: Headline; quota: QuotaView | null; decisions: DecisionItem[] } {
     const decisions = decisionItems(this.store, this.now())
-    const workers = workerViews(this.store, (a) => this.live.get(a.id)?.tail.lastActivity ?? lastActivityOf(hqDirOf(a)))
     const q = this.quota()
+    const workers = workerViews(this.store, (a) => this.live.get(a.id)?.tail.lastActivity ?? lastActivityOf(hqDirOf(a)), q.mode === 'hold' ? q.until : null)
     const failures = this.store.requestsByStatus(['blocked']).map((r) => ({ title: r.text.replace(/\s+/g, ' ').slice(0, 30), reason: r.note ?? '' }))
     const merged = this.store.requestsByStatus(['merged']).filter((r) => this.now() - Date.parse(r.updated_at) < 10 * 60_000).at(-1)
     const waiting = this.readyTasks().length + this.store.tasksByStatus(['reviewing']).filter((t) => !this.store.liveAttempts().some((a) => a.task_id === t.id)).length

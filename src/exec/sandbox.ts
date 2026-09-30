@@ -18,6 +18,11 @@ export interface SandboxOpts {
   extraWritable: string[]
   /** ~/.claude (the CLI's own state). */
   claudeDir: string
+  /**
+   * hq-owned files wired to the process as stdin/stdout/stderr. Node aborts at startup when it cannot fstat its stdio,
+   * so these get metadata-only access (no content read or write) — measured, see report.
+   */
+  stdioFiles?: string[]
 }
 
 /** Seatbelt matches resolved paths (/var → /private/var); resolve the deepest existing ancestor. */
@@ -46,6 +51,7 @@ export function sandboxProfile(o: SandboxOpts): string {
     `(allow file-read* file-write* ${own.map((p) => `(subpath ${q(p)})`).join(' ')})`,
     `(deny file-write* (require-not (require-any ${writable.map((p) => `(subpath ${q(p)})`).join(' ')} (regex ${q(`^${reEsc(home)}/\\.claude\\.json`)}))))`,
     `(deny network-outbound (remote ip ${q(`localhost:${o.hqPort}`)}))`,
+    ...(o.stdioFiles?.length ? [`(allow file-read-metadata ${o.stdioFiles.map((f) => `(literal ${q(real(f))})`).join(' ')})`] : []),
     '',
   ].join('\n')
 }
