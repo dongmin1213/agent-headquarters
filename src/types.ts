@@ -136,7 +136,8 @@ export interface WorkerView {
   model: string
   /** verify = hq's own acceptance checks (model "hq"). */
   kind: 'work' | 'review' | 'verify'
-  state: 'running' | 'verifying' | 'reviewing' | 'held'
+  /** blocked = stopped and waiting for a chairman decision (shown as "멈춤 · 사장에게 보고"). */
+  state: 'running' | 'verifying' | 'reviewing' | 'held' | 'blocked'
   bubble: string
   startedAt: string
 }
