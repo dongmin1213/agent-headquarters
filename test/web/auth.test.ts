@@ -105,14 +105,23 @@ test('/ui-api requires a valid session token as Bearer', async () => {
   assert.ok(Array.isArray(JSON.parse(r.body).decisions))
 })
 
-test('the query token is accepted on /ui-api/events only', async () => {
+test('no route accepts the session token in the query string, the events stream included', async () => {
   const token = await login()
-  assert.equal((await raw('GET', `/ui-api/state?t=${token}`)).status, 401)
-  assert.equal((await raw('GET', `/ui-api/requests/req-7f3a9c21?t=${token}`)).status, 401)
-  assert.equal((await raw('POST', `/ui-api/requests/req-7f3a9c21/cancel?t=${token}`, {}, '{}')).status, 401)
+  const n = mock.calls.length
+  for (const [m, p] of [['GET', 'state'], ['GET', 'events'], ['GET', 'requests/req-7f3a9c21'], ['POST', 'requests/req-7f3a9c21/cancel']]) {
+    for (const q of [`t=${token}`, `token=${token}`, `access_token=${token}`]) {
+      const r = await raw(m, `/ui-api/${p}?${q}`, {}, m === 'POST' ? '{}' : undefined)
+      assert.equal(r.status, 401, `${m} ${p}?${q.split('=')[0]}`)
+    }
+  }
+  assert.equal(mock.calls.length, n, 'nothing reached routeApi')
+})
+
+test('SSE /ui-api/events streams through with the Authorization header', async () => {
+  const token = await login()
   const n = mock.calls.length
   await new Promise<void>((resolve, reject) => {
-    const req = request({ host: '127.0.0.1', port, path: `/ui-api/events?t=${token}`, headers: { host: `127.0.0.1:${port}` } }, (res) => {
+    const req = request({ host: '127.0.0.1', port, path: '/ui-api/events', headers: { host: `127.0.0.1:${port}`, ...bearer(token), accept: 'text/event-stream' } }, (res) => {
       assert.equal(res.statusCode, 200)
       assert.match(String(res.headers['content-type']), /text\/event-stream/)
       assert.equal(res.headers['cache-control'], 'no-store', 'security headers win over the SSE handler')
@@ -129,8 +138,8 @@ test('the query token is accepted on /ui-api/events only', async () => {
     req.end()
   })
   const call = mock.calls[n]
-  assert.equal(call.url, '/api/events', 'the token is stripped before routeApi')
-  assert.equal(call.headers.authorization, 'Bearer mock-token')
+  assert.equal(call.url, '/api/events')
+  assert.equal(call.headers.authorization, 'Bearer mock-token', 'session token swapped for the daemon token')
 })
 
 test('/ui-api is rewritten to /api with the daemon Bearer; Origin and cookies are dropped', async () => {

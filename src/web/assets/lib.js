@@ -189,7 +189,7 @@ export const DECISION_KIND = {
   blocked: ['회로 차단', 'bad'], integration: ['통합 실패', 'bad'], accept: ['결과 수락', 'ok'], merge: ['병합 승인', 'info'],
 }
 /** Fixed display labels for `blocked` card options, which are wire values retry|skip|stop (execution.md §17). */
-export const BLOCKED_LABEL = { retry: '한 번 더 (최상위 모델)', skip: '이 작업 건너뛰기', stop: '요청 중단' }
+export const BLOCKED_LABEL = { retry: '한 번 더', skip: '이 작업 건너뛰기', stop: '요청 중단' }
 /** Board columns, in order. */
 export const TASK_GROUPS = [
   { id: 'wait', label: '대기', statuses: ['pending', 'rework', 'revising', 'held'] },
@@ -265,4 +265,40 @@ export function parseFragment(hash) {
   const task = p.get('task')
   if (task) out.task = request && task.startsWith(request + '.') ? task.slice(request.length + 1) : task
   return out
+}
+
+/**
+ * Incremental Server-Sent Events parser (the page reads /ui-api/events with fetch so it can send Authorization).
+ * Feed it decoded text chunks in any split; it calls onEvent({event, data, id}) per dispatched frame.
+ * Follows the SSE rules: CRLF/LF/CR line ends, `:` comments, multi-line data joined with \n, frames without data are dropped.
+ */
+export function createSseParser(onEvent) {
+  let buf = '', data = [], event = '', id = null, lastId = null
+  const dispatch = () => {
+    if (id !== null) lastId = id
+    if (data.length) onEvent({ event: event || 'message', data: data.join('\n'), id: lastId })
+    data = []; event = ''; id = null
+  }
+  const line = (l) => {
+    if (l === '') return dispatch()
+    if (l.startsWith(':')) return
+    const i = l.indexOf(':')
+    const field = i < 0 ? l : l.slice(0, i)
+    let value = i < 0 ? '' : l.slice(i + 1)
+    if (value.startsWith(' ')) value = value.slice(1)
+    if (field === 'data') data.push(value)
+    else if (field === 'event') event = value
+    else if (field === 'id' && !value.includes('\0')) id = value
+  }
+  return (chunk) => {
+    buf += chunk
+    for (;;) {
+      const m = /\r\n|\r|\n/.exec(buf)
+      if (!m) break
+      // A lone \r at the very end may be the first half of \r\n: wait for more input.
+      if (m[0] === '\r' && m.index === buf.length - 1) break
+      line(buf.slice(0, m.index))
+      buf = buf.slice(m.index + m[0].length)
+    }
+  }
 }

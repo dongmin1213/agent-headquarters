@@ -3,7 +3,7 @@
 //   GET  /ui, /ui/           page shell (no auth; the page itself holds no data)
 //   GET  /ui/assets/*        static assets read at startup
 //   POST /ui-api/session     {code} → {token}   one-time code from issueLoginUrl() (60 s, single use)
-//   *    /ui-api/<allowed>   Authorization: Bearer <session token> (events: ?t=<token> only) → routeApi as /api/*
+//   *    /ui-api/<allowed>   Authorization: Bearer <session token> (events too) → routeApi as /api/*
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ApiRouter } from '../server.ts'
 import { randomBytes } from 'node:crypto'
@@ -124,12 +124,9 @@ export function createWebUi(opts: { port: number; token: string; routeApi: ApiRo
         const segments = rest.split('/')
         // Rejected requests have their body drained first so the keep-alive socket stays usable.
         if (!isAllowed(req.method ?? '', segments)) { req.resume(); return json(res, 404, { error: '찾을 수 없어요' }) }
-        const isEvents = req.method === 'GET' && rest === 'events'
-        const bearer = /^Bearer (.+)$/.exec(String(req.headers.authorization ?? ''))?.[1] ?? ''
-        // EventSource cannot send headers, so the events stream (and only it) takes ?t=<token>.
-        const token = bearer || (isEvents ? url.searchParams.get('t') ?? '' : '')
+        // Every route, the events stream included, takes the session token only from Authorization (v3: never in URLs).
+        const token = /^Bearer (.+)$/.exec(String(req.headers.authorization ?? ''))?.[1] ?? ''
         if (!session(token)) { req.resume(); return json(res, 401, { error: "세션이 없어요. 펫에서 '자세히 보기'로 열어 주세요." }) }
-        if (isEvents) url.searchParams.delete('t')
         req.url = '/api/' + rest + url.search
         req.headers.authorization = `Bearer ${opts.token}`
         delete req.headers.origin

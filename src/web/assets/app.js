@@ -2,7 +2,7 @@
 // Security: every piece of data reaches the DOM through textContent / text nodes / setAttribute — never as HTML.
 import {
   ATTEMPT_STATUS, DECISION_KIND, QUOTA_MODE, REQUEST_STATUS, TASK_GROUPS, TASK_STATUS, BLOCKED_LABEL, formatClock, formatCost, formatDuration,
-  formatRelative, parseDiff, parseFragment, percent, renderMarkdown, shortSha, statusInfo, windowLabel,
+  createSseParser, formatRelative, parseDiff, parseFragment, percent, renderMarkdown, shortSha, statusInfo, windowLabel,
 } from './lib.js'
 
 const $ = (id) => document.getElementById(id)
@@ -83,7 +83,7 @@ function saveToken(t) { try { if (t) sessionStorage.setItem(SESSION_KEY, t); els
 function showGate(title, text) {
   sessionToken = ''
   saveToken('')
-  if (es) { es.close(); es = null }
+  stopStream()
   $('gate-title').textContent = title
   $('gate-text').textContent = text
   $('gate').hidden = false
@@ -178,29 +178,45 @@ function scheduleRefresh(delay = 300) {
   refreshTimer = setTimeout(() => { loadState(); loadDetail() }, delay)
 }
 
-// ---------- SSE ----------
-let es = null, lastBeat = 0, hadError = false
-function connect() {
-  if (es) es.close()
+// ---------- SSE (fetch + ReadableStream so the session token travels in Authorization, never in the URL) ----------
+let sse = null, lastBeat = 0, hadError = false, backoff = 1000, reconnectTimer = null
+function stopStream() { clearTimeout(reconnectTimer); sse?.abort(); sse = null }
+async function connect() {
+  stopStream()
   if (!sessionToken) return
-  es = new EventSource(`/ui-api/events?t=${enc(sessionToken)}`)
-  es.onopen = () => { setConn('live'); lastBeat = Date.now(); if (hadError) { hadError = false; scheduleRefresh(0) } }
-  es.onmessage = (ev) => {
-    lastBeat = Date.now()
-    scheduleRefresh()
-    try {
-      const data = JSON.parse(ev.data)
-      if (data?.kind === 'attempt' && state.drawer) pollActivity()
-    } catch { /* ignore malformed event */ }
-  }
-  es.addEventListener('heartbeat', () => { lastBeat = Date.now(); if (state.conn !== 'live') setConn('live') })
-  es.onerror = () => {
+  const ctrl = new AbortController()
+  sse = ctrl
+  try {
+    const res = await fetch('/ui-api/events', { headers: { accept: 'text/event-stream', authorization: `Bearer ${sessionToken}` }, cache: 'no-store', signal: ctrl.signal })
+    if (res.status === 401) { showGate('세션이 끝났어요', "펫에서 '자세히 보기'로 열어 주세요"); return }
+    if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
+    setConn('live'); lastBeat = Date.now(); backoff = 1000
+    if (hadError) { hadError = false; scheduleRefresh(0) } // missed events are not replayed: refetch instead
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader()
+    const feed = createSseParser(onStreamEvent)
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) break
+      lastBeat = Date.now()
+      feed(value)
+    }
+    throw new Error('stream closed')
+  } catch {
+    if (sse !== ctrl || !sessionToken) return // replaced by a newer connection, or signed out
+    sse = null
     hadError = true
-    if (!sessionToken) { es?.close(); return }
-    setConn('retry')
-    // A closed stream may mean the session ended (401): probe with a normal call, which shows the gate if so.
-    if (es.readyState === EventSource.CLOSED) { loadState(); setTimeout(connect, 5000) }
+    setConn(state.conn === 'down' ? 'down' : 'retry')
+    reconnectTimer = setTimeout(connect, backoff + Math.floor(Math.random() * 500))
+    backoff = Math.min(backoff * 2, 30_000)
   }
+}
+function onStreamEvent(ev) {
+  if (ev.event === 'heartbeat') { if (state.conn !== 'live') setConn('live'); return }
+  scheduleRefresh()
+  try {
+    const data = JSON.parse(ev.data)
+    if (data?.kind === 'attempt' && state.drawer) pollActivity()
+  } catch { /* ignore malformed event */ }
 }
 function setConn(c) {
   state.conn = c
@@ -394,7 +410,13 @@ function decisionCard(d) {
     const chosen = ui.rejectTasks.get(key) ?? new Set()
     const passed = (req?.tasks ?? []).filter((t) => t.status === 'passed')
     body.push(h('div', { class: 'reject-form' },
-      h('textarea', { class: 'input', rows: 3, 'data-fkey': dk, placeholder: '무엇을 고쳐야 하는지 적어 주세요', 'aria-label': '반려 사유', value: drafts.get(dk) ?? '', oninput: (e) => drafts.set(dk, e.target.value), disabled: busy }),
+      h('textarea', { class: 'input', rows: 3, 'data-fkey': dk, placeholder: '무엇을 고쳐야 하는지 적어 주세요', 'aria-label': '반려 사유 (필수)', required: true, value: drafts.get(dk) ?? '', disabled: busy,
+        oninput: (e) => {
+          drafts.set(dk, e.target.value)
+          // Toggle the send button in place (no re-render while typing).
+          const btn = document.querySelector(`[data-fkey="send:${CSS.escape(key)}"]`)
+          if (btn) btn.disabled = busy || !e.target.value.trim()
+        } }),
       passed.length ? h('fieldset', { class: 'task-pick' },
         h('legend', null, '다시 할 작업 (고르지 않으면 통과한 작업 전부)'),
         passed.map((t) => h('label', { class: 'check-row' },
@@ -402,10 +424,11 @@ function decisionCard(d) {
             onchange: (e) => { const set = ui.rejectTasks.get(key) ?? new Set(); if (e.target.checked) set.add(t.key); else set.delete(t.key); ui.rejectTasks.set(key, set); rerenderDecisions() } }),
           h('span', { class: 'mono' }, t.key), h('span', null, t.title)))) : null))
     actions.push(
-      h('button', { class: 'btn btn-danger', type: 'button', disabled: busy, 'data-fkey': `send:${key}`, onclick: () => {
+      h('button', { class: 'btn btn-danger', type: 'button', disabled: busy || !(drafts.get(dk) ?? '').trim() || !d.subjectHash, 'data-fkey': `send:${key}`, onclick: () => {
         const reason = (drafts.get(dk) ?? '').trim()
-        if (!reason) { ui.errors.set(key, '반려 사유를 입력해 주세요'); rerenderDecisions(); return }
-        const payload = chosen.size ? { reason, tasks: [...chosen] } : { reason }
+        if (!reason || !d.subjectHash) return
+        // Accept 반려 always goes through /reject with the card's subjectHash, never approvals/:id (execution.md §12).
+        const payload = chosen.size ? { reason, subjectHash: d.subjectHash, tasks: [...chosen] } : { reason, subjectHash: d.subjectHash }
         post(`/requests/${enc(d.requestId)}/reject`, payload, '반려했어요', () => { ui.rejectOpen.delete(key); ui.rejectTasks.delete(key); drafts.delete(dk) })
       } }, busy ? '보내는 중…' : '반려 보내기'),
       h('button', { class: 'btn', type: 'button', disabled: busy, onclick: () => { ui.rejectOpen.delete(key); ui.errors.delete(key); rerenderDecisions() } }, '취소'))
@@ -989,7 +1012,8 @@ document.addEventListener('keydown', (e) => {
 $('needs-badge').addEventListener('click', () => $('decisions').scrollIntoView({ block: 'start', behavior: 'smooth' }))
 window.addEventListener('popstate', applyHash)
 setInterval(() => { render() }, 30_000) // relative times
-setInterval(() => { if (state.conn === 'live' && lastBeat && Date.now() - lastBeat > 90_000) setConn('retry') }, 15_000)
+// No bytes (not even a heartbeat) for 90 s: treat the stream as dead and reconnect (then refetch).
+setInterval(() => { if (sse && lastBeat && Date.now() - lastBeat > 90_000) { hadError = true; setConn('retry'); connect() } }, 15_000)
 document.addEventListener('visibilitychange', () => { if (!document.hidden) scheduleRefresh(0) })
 
 // ---------- boot ----------
