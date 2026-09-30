@@ -9,6 +9,7 @@ import { runSandboxed } from '../../src/exec/checks.ts'
 import { atomicWrite } from '../../src/exec/fsx.ts'
 import { childEnv, sandboxProfile } from '../../src/exec/sandbox.ts'
 import { makeRepo, sh, tmp } from './helpers.ts'
+import { NESTED_SKIP, nestedSandbox } from '../nested.ts'
 
 async function setup() {
   const dir = tmp('hq-sbx-')
@@ -36,7 +37,7 @@ async function setup() {
   return { dir, home, tok, wt, other, out, port, run, server, repo, mirror }
 }
 
-test('1. sandbox denies token, hq port, writes outside the allow list, other worktrees and hq.db; allows own worktree commits and out/', async () => {
+test('1. sandbox denies token, hq port, writes outside the allow list, other worktrees and hq.db; allows own worktree commits and out/', { skip: nestedSandbox && NESTED_SKIP }, async () => {
   const s = await setup()
   try {
     assert.equal((await s.run(`cat ${s.tok}/token`)).pass, false, 'token read')
@@ -58,7 +59,7 @@ test('1. sandbox denies token, hq port, writes outside the allow list, other wor
   } finally { s.server.close() }
 })
 
-test('1. sandbox env carries no HQ_TOKEN, API keys or SSH agent', async () => {
+test('1. sandbox env carries no HQ_TOKEN, API keys or SSH agent', { skip: nestedSandbox && NESTED_SKIP }, async () => {
   const env = childEnv({ HQ_ATTEMPT_OUT: '/x' }, { PATH: '/bin', HOME: '/h', HQ_TOKEN: 't', ANTHROPIC_API_KEY: 'k', SSH_AUTH_SOCK: '/s', GITHUB_TOKEN: 'g' })
   assert.equal(env.HQ_TOKEN, undefined)
   assert.equal(env.ANTHROPIC_API_KEY, undefined)

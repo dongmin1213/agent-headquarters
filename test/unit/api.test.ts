@@ -5,6 +5,9 @@ import type { Server } from 'node:http'
 import { Scheduler } from '../../src/scheduler.ts'
 import { startServer } from '../../src/server.ts'
 import { harness, req, task, tsk, type Harness } from './helpers.ts'
+import { useFakeSandboxIfNested } from '../nested.ts'
+
+useFakeSandboxIfNested()
 
 const TOKEN = 'test-token-123'
 /** Percent-encode every character, so the server must decode path ids exactly once. */

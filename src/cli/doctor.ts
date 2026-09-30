@@ -200,12 +200,14 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
   else add('daemon', '데몬', 'warn', '실행 중이 아님', 'hq start (자동 시작까지: hq install)')
 
   // Daemon single-instance lock
+  const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM' } }
   const lf = lockFile(ctx)
   if (!existsSync(lf)) add('lock', '데몬 잠금', 'ok', '없음')
   else {
     const pid = readLockPid(ctx)
     const cmd = pid ? await p.pidCommand(pid) : null
     if (!pid) add('lock', '데몬 잠금', 'warn', `${lf}에서 pid를 읽지 못함`, `데몬이 꺼져 있다면 rm ${lf}`)
+    else if (cmd === null && pidAlive(pid)) add('lock', '데몬 잠금', 'warn', `pid ${pid}의 프로그램을 확인할 수 없음 (ps 실행 불가)`, 'ps가 동작하는 터미널에서 hq doctor를 다시 실행하세요')
     else if (cmd === null) add('lock', '데몬 잠금', 'warn', `오래된 잠금 (pid ${pid} 종료됨)`, `hq start (데몬이 넘겨받음). 안 되면 rm ${lf}`)
     else if (!cmd.includes('src/main.ts')) add('lock', '데몬 잠금', 'warn', `pid ${pid}가 hq가 아닌 프로세스 (pid 재사용: 오래된 잠금)`, `rm ${lf} 후 hq start`)
     else add('lock', '데몬 잠금', 'ok', `pid ${pid} 실행 중`)

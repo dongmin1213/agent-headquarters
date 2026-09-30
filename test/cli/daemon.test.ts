@@ -3,9 +3,10 @@ import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { rotateLog, start, stop } from '../../src/cli/daemon.ts'
+import { rotateLog, start, stop, stopTarget } from '../../src/cli/daemon.ts'
 import { lockFile, pidFile } from '../../src/cli/ctx.ts'
 import { fakeDaemon, freePort, testCtx, tmp, writeToken } from './helpers.ts'
+import { NESTED_PS_SKIP, nestedSandbox } from '../nested.ts'
 
 test('start refuses when a live hq already answers on the port', async (t) => {
   const d = await fakeDaemon('tok', { teams: [] }); t.after(() => d.server.close())
@@ -37,7 +38,7 @@ test('stop with nothing running is a no-op', async () => {
   assert.match(ctx.text(), /실행 중이 아닙니다/)
 })
 
-test('stop ignores a stale pidfile pointing at a non-hq process', async () => {
+test('stop ignores a stale pidfile pointing at a non-hq process', { skip: nestedSandbox && NESTED_PS_SKIP }, async () => {
   const ctx = testCtx({ port: await freePort() })
   mkdirSync(ctx.home, { recursive: true })
   writeFileSync(pidFile(ctx), `${process.pid}\n`) // alive, but not src/main.ts
@@ -59,7 +60,7 @@ test('rotateLog keeps 3 generations', () => {
   assert.equal(rotateLog(f, 10, 3), false)
 })
 
-test('real detached start/stop with a stand-in daemon (pidfile, single instance, log file)', async (t) => {
+test('real detached start/stop with a stand-in daemon (pidfile, single instance, log file)', { skip: nestedSandbox && NESTED_PS_SKIP }, async (t) => {
   const port = await freePort()
   const ctx = testCtx({ port, dryRun: false })
   writeToken(ctx, 'tok')
@@ -106,7 +107,7 @@ test('start proceeds past a stale lock (dead pid)', async () => {
   assert.equal(await start(ctx), 0, ctx.text())
 })
 
-test('stop refuses to kill a lock pid whose command is not src/main.ts', async () => {
+test('stop refuses to kill a lock pid whose command is not src/main.ts', { skip: nestedSandbox && NESTED_PS_SKIP }, async () => {
   const ctx = testCtx({ port: await freePort(), dryRun: false })
   mkdirSync(ctx.home, { recursive: true })
   writeFileSync(lockFile(ctx), `${process.pid}\n`) // the test runner: alive, not hq
@@ -131,4 +132,19 @@ test('with a lock present, stop targets only the lock pid, not the pidfile', asy
     assert.match(ctx.text(), /실행 중이 아닙니다/)
     assert.equal(other.exitCode, null, 'pidfile process left alone')
   } finally { other.kill('SIGKILL') }
+})
+
+test('stop refuses a live lock pid whose command cannot be read (ps unavailable)', async () => {
+  const ctx = testCtx({ port: await freePort(), dryRun: false })
+  mkdirSync(ctx.home, { recursive: true })
+  writeFileSync(lockFile(ctx), `${process.pid}\n`) // alive; ps "fails"
+  const r = await stopTarget(ctx, async () => null)
+  assert.deepEqual(r, { error: `pid ${process.pid}의 프로그램을 확인할 수 없어 종료하지 않습니다 (ps 실행 불가)` })
+})
+
+test('a dead lock pid with no command is still a stale lock, not a refusal', async () => {
+  const ctx = testCtx({ port: await freePort(), dryRun: false })
+  mkdirSync(ctx.home, { recursive: true })
+  writeFileSync(lockFile(ctx), '999999\n')
+  assert.equal(await stopTarget(ctx, async () => null), null)
 })

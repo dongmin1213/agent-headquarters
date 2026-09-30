@@ -171,7 +171,7 @@ export function buildHeadline(h: HeadlineInput): Headline {
     const w = active[0]
     const verb = w.kind === 'review' ? '검토' : w.kind === 'verify' ? '검증' : '구현'
     const next = w.kind === 'work' ? (w.role === 'collect' ? '결과 수락' : '검증') : w.kind === 'verify' ? (h.reviewFollows?.(w.taskId) === false ? '통합' : '검토') : '통합'
-    return { text: `${w.model}가 ${w.title} ${verb} 중 · 다음: ${next}${active.length > 1 ? ` 외 ${active.length - 1}명` : ''}`, needsYou }
+    return { text: `${w.title} ${verb} 중 · ${w.model} · 다음: ${next}${active.length > 1 ? ` 외 ${active.length - 1}명` : ''}`, needsYou }
   }
   if (h.ceoThinking) return { text: '사장이 계획 중이에요', needsYou }
   const held = h.workers.some((w) => w.state === 'held')

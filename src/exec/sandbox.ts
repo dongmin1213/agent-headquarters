@@ -80,8 +80,12 @@ export function sandboxProfile(o: SandboxOpts): string {
   ].join('\n')
 }
 
+// Test-only seam: reachable solely by direct import (never from config, env vars, CLI flags or HTTP).
+let sandboxWrapper = 'sandbox-exec'
+export function setSandboxWrapperForTests(bin: string | null): void { sandboxWrapper = bin ?? 'sandbox-exec' }
+
 export function wrap(argv: string[], profilePath: string): string[] {
-  return ['sandbox-exec', '-f', profilePath, ...argv]
+  return [sandboxWrapper, '-f', profilePath, ...argv]
 }
 
 const PASS = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL']

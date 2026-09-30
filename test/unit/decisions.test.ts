@@ -4,6 +4,9 @@ import assert from 'node:assert/strict'
 import { buildHeadline, decisionItems, type HeadlineInput } from '../../src/exec/decisions.ts'
 import type { DecisionItem, WorkerView } from '../../src/types.ts'
 import { harness, task } from './helpers.ts'
+import { useFakeSandboxIfNested } from '../nested.ts'
+
+useFakeSandboxIfNested()
 
 const q = { mode: 'normal' as const, until: null, window: null, pct: null }
 const base: HeadlineInput = { decisions: [], failures: [], workers: [], ceoThinking: false, waiting: 0, quota: q, recentMerged: null }
@@ -13,9 +16,9 @@ test('18. headline sentences', () => {
   const d = { kind: 'plan', title: '계획 승인: X' } as DecisionItem
   assert.deepEqual(buildHeadline({ ...base, decisions: [d, d] }), { text: '회장님 결정 2건: 계획 승인: X', needsYou: 2 })
   assert.equal(buildHeadline({ ...base, failures: [{ title: '요청 A', reason: '통합 충돌\n자세히' }] }).text, '막혔어요 · 요청 A: 통합 충돌')
-  assert.equal(buildHeadline({ ...base, workers: [w({}), w({ kind: 'review', model: 'opus', state: 'reviewing' })] }).text, 'sonnet가 로그인 고치기 구현 중 · 다음: 검증 외 1명')
-  assert.equal(buildHeadline({ ...base, workers: [w({ kind: 'review', model: 'opus', state: 'reviewing' })] }).text, 'opus가 로그인 고치기 검토 중 · 다음: 통합')
-  assert.equal(buildHeadline({ ...base, workers: [w({ kind: 'verify', model: 'hq', state: 'verifying' })] }).text, 'hq가 로그인 고치기 검증 중 · 다음: 검토')
+  assert.equal(buildHeadline({ ...base, workers: [w({}), w({ kind: 'review', model: 'opus', state: 'reviewing' })] }).text, '로그인 고치기 구현 중 · sonnet · 다음: 검증 외 1명')
+  assert.equal(buildHeadline({ ...base, workers: [w({ kind: 'review', model: 'opus', state: 'reviewing' })] }).text, '로그인 고치기 검토 중 · opus · 다음: 통합')
+  assert.equal(buildHeadline({ ...base, workers: [w({ kind: 'verify', model: 'hq', state: 'verifying' })] }).text, '로그인 고치기 검증 중 · hq · 다음: 검토')
   assert.equal(buildHeadline({ ...base, ceoThinking: true }).text, '사장이 계획 중이에요')
   const until = new Date(2026, 8, 30, 14, 5).toISOString()
   assert.equal(buildHeadline({ ...base, waiting: 1, quota: { mode: 'hold', until, window: 'five_hour', pct: 0.96 } }).text, '사용 한도 5시간 96% — 14:05까지 쉬어요')

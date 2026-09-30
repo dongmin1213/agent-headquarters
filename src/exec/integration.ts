@@ -35,7 +35,7 @@ export async function integrate(o: {
       if (!s.pass) return { kind: 'failed', targetSha, checks: null, reason: `setup 실패 (종료 코드 ${s.exitCode ?? '시간 초과'}): ${s.outputTail.split('\n').slice(-5).join(' ').slice(0, 300)}` }
     }
     const checks = await runChecks({ wt, base: targetSha, head: sha, checks: o.checks, timeoutMs: o.timeoutMs, sandbox: o.sandbox, profilePath: o.profilePath, onSpawn: o.onSpawn })
-    if (!checks.pass) return { kind: 'failed', targetSha, checks, reason: checks.error ?? `통합 검사 실패: ${checks.checks.filter((c) => !c.pass).map((c) => c.id).join(', ') || '비밀값 탐지'}` }
+    if (!checks.pass) return { kind: 'failed', targetSha, checks, reason: checks.error ?? `통합 검사 실패: ${checks.checks.filter((c) => !c.pass && !c.baseFailed).map((c) => c.id).join(', ') || '비밀값 탐지'}` }
     // Keep the integration commit reachable after the worktree goes away; the merge fetches this ref.
     await withRepo(o.mirror, () => hqGitOk(o.mirror, null, ['update-ref', integrationRef(o.requestId, o.project), sha]))
     return { kind: 'ok', sha, targetSha, checks }

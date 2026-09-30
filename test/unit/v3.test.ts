@@ -13,6 +13,9 @@ import { atomicWrite } from '../../src/exec/fsx.ts'
 import { checkVerdict } from '../../src/exec/review.ts'
 import { sandboxProfile } from '../../src/exec/sandbox.ts'
 import { commitFile, harness, req, sh, task, tmp, tsk, type Harness } from './helpers.ts'
+import { NESTED_SKIP, nestedSandbox, useFakeSandboxIfNested } from '../nested.ts'
+
+useFakeSandboxIfNested()
 
 const mgit = (h: Harness, ...args: string[]) => execFileSync('git', ['--git-dir', join(h.runner.home, 'repos', 'p.git'), ...args], { encoding: 'utf8' }).trim()
 
@@ -22,7 +25,7 @@ async function toMergeCard(h: Harness, id: string): Promise<void> {
   await h.waitFor(() => h.store.approval(`merge:${id}:p`)?.state === 'open', 'merge card')
 }
 
-test('v3-1. escape attempts (hooks, core.fsmonitor, .git gitfile swap, git replace) have no effect through fetch → verify → integrate → merge', async () => {
+test('v3-1. escape attempts (hooks, core.fsmonitor, .git gitfile swap, git replace) have no effect through fetch → verify → integrate → merge', { skip: nestedSandbox && NESTED_SKIP }, async () => {
   const mark = tmp('hq-mark-')
   const h = harness()
   try {
@@ -42,7 +45,7 @@ test('v3-1. escape attempts (hooks, core.fsmonitor, .git gitfile swap, git repla
   } finally { await h.close() }
 })
 
-test('v3-1b. a check cannot write the mirror index (assume-unchanged fails); source changes are caught by the before/after comparison', async () => {
+test('v3-1b. a check cannot write the mirror index (assume-unchanged fails); source changes are caught by the before/after comparison', { skip: nestedSandbox && NESTED_SKIP }, async () => {
   const h = harness()
   try {
     const id = h.plan([task('A', { acceptance: [
@@ -59,7 +62,7 @@ test('v3-1b. a check cannot write the mirror index (assume-unchanged fails); sou
   } finally { await h.close() }
 })
 
-test('v3-2. metadata lstat allowed: node import and npm test succeed in a verification worktree under $HQ_HOME', async () => {
+test('v3-2. metadata lstat allowed: node import and npm test succeed in a verification worktree under $HQ_HOME', { skip: nestedSandbox && NESTED_SKIP }, async () => {
   const dir = tmp('hq-meta-')
   const home = join(dir, 'hqhome')
   const wt = join(home, 'worktrees', 'req-1', 'A.v1')
@@ -77,7 +80,7 @@ test('v3-2. metadata lstat allowed: node import and npm test succeed in a verifi
   assert.match(npm.outputTail, /x-ok/)
 })
 
-test('v3-3. ~/.claude control files are write-protected (fake HOME); runtime dirs and ~/.claude.json stay writable; secrets unreadable', async () => {
+test('v3-3. ~/.claude control files are write-protected (fake HOME); runtime dirs and ~/.claude.json stay writable; secrets unreadable', { skip: nestedSandbox && NESTED_SKIP }, async () => {
   const dir = tmp('hq-home-')
   const home = join(dir, 'fakehome')
   const wt = join(dir, 'wt')
@@ -113,7 +116,7 @@ test('v3-4. a new-kind check that the work does not implement fails (no baseline
   } finally { await h.close() }
 })
 
-test('v3-5. a regression check already failing on the base becomes manual for the reviewer and "기존 실패" on the accept card', async () => {
+test('v3-5. a regression check failing on the base and again on the candidate becomes manual for the reviewer and "기존 실패" on the accept card', async () => {
   const h = harness()
   try {
     const id = h.plan([task('A', { acceptance: [{ id: 'R1', text: '기존에 깨진 검사', check: 'test -f missing.txt', kind: 'regression' }] })])
@@ -122,7 +125,9 @@ test('v3-5. a regression check already failing on the base becomes manual for th
     const work = h.store.attempts(`${id}.A`).find((a) => a.kind === 'work' && a.status === 'succeeded')!
     const checks = JSON.parse(readFileSync(join(work.dir, 'hq', 'checks.json'), 'utf8'))
     assert.deepEqual(checks.manual, ['R1'])
-    assert.equal(checks.checks.length, 0)
+    assert.equal(checks.checks.length, 1, 'still run on the candidate')
+    assert.equal(checks.checks[0].baseFailed, true)
+    assert.equal(checks.pass, true)
     const review = h.store.attempts(`${id}.A`).find((a) => a.kind === 'review')!
     assert.match(readFileSync(join(review.dir, 'hq', 'prompt.md'), 'utf8'), /R1\].*manual .*기존 실패/)
     assert.match(h.store.approval(`accept:${id}`)!.body, /기존 실패\(검토자 판단\): R1/)

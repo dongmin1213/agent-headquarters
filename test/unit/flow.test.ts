@@ -5,6 +5,9 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { decisionItems } from '../../src/exec/decisions.ts'
 import { commitFile, harness, req, sh, task, tsk, type Harness } from './helpers.ts'
+import { useFakeSandboxIfNested } from '../nested.ts'
+
+useFakeSandboxIfNested()
 
 const firstArgv = (dir: string): string[] => JSON.parse(readFileSync(join(dir, 'hq', 'stream.jsonl'), 'utf8').split('\n')[0]).argv
 

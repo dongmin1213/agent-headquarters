@@ -7,6 +7,9 @@ import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { Runner } from '../../src/exec/runner.ts'
 import { FAKE, harness, ROOT, req, task, tsk, type Harness } from './helpers.ts'
+import { useFakeSandboxIfNested } from '../nested.ts'
+
+useFakeSandboxIfNested()
 
 /** A second runner on the same DB = the daemon after a restart. */
 function restart(h: Harness): Runner {

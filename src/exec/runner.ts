@@ -12,7 +12,7 @@ import { reviewModelOf, validateTasks, type Acceptance, type CeoPlan, type PlanT
 import type { HqConfig } from '../config.ts'
 import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../store.ts'
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
-import { baseline, checksProfile, runChecks, runSandboxed, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
+import { baseline, checksProfile, envFailure, runChecks, runSandboxed, type BaseResult, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
 import { DONE_MAX, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
 import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, outDirOf, workerViews } from './decisions.ts'
 import { runDiagnoseTurn } from './diagnose.ts'
@@ -688,7 +688,7 @@ export class Runner {
     if (!claimed) return false
     this.launching.add(id)
     this.bg(this.prepareAndLaunch(id, !!resume, prev ?? null).finally(() => this.launching.delete(id)))
-    this.emitTask(t, `${t.model}가 ${t.title} 시작`)
+    this.emitTask(t, `${t.title} 시작 · ${t.model}`)
     return true
   }
 
@@ -753,12 +753,14 @@ export class Runner {
         cwd = this.workDir(t.request_id, t.key)
         if (!t.worktree) {
           const base = await this.resolveBase(t)
-          await newWorkClone(mirror, cwd, base)
+          await newWorkClone(mirror, cwd, base, await this.projectIdentity(project))
           await this.runSetup(project, cwd, hq, 'setup')
           if (!this.tset(t, { worktree: cwd, base_sha: base })) throw new Setup('작업이 다른 세대로 바뀌어 시작을 멈췄어요')
           t = this.store.task(t.id)!
         }
-        await this.ensureBaseline(t, hq)
+        const bases = await this.ensureBaseline(t, hq)
+        const envMsg = this.baselineEnvMessage(t, bases)
+        if (envMsg) throw new Setup(envMsg)
       }
       const role = t.role === 'collect' ? 'collect' : 'implement'
       let prompt: string
@@ -799,30 +801,94 @@ export class Runner {
     return `baseline:${this.mirror(t.project)}:${t.base_sha}:${sha256(`${this.project(t.project)?.setup ?? ''}\n${a.check}`)}`
   }
 
-  /** §9 baseline: each check once on the base, recorded (never an exemption). */
-  private async ensureBaseline(t: TaskRow, hq: string): Promise<void> {
+  /** Stored base result; legacy 'pass'/'fail' values are still understood. Unreadable → null (rerun). */
+  private readBase(key: string): BaseResult | null {
+    const v = this.store.get(key)
+    if (v === null) return null
+    if (v === 'pass') return { pass: true, exitCode: 0, timedOut: false, tail: '' }
+    if (v === 'fail') return { pass: false, exitCode: null, timedOut: false, tail: '' }
+    try { return JSON.parse(v) as BaseResult } catch { return null }
+  }
+
+  /**
+   * §9 baseline: each check once on the base, recorded (never an exemption). Returns every nonManual check's base result
+   * (fresh and cached). Environment failures are not stored, so a retry after fixing the setup runs the baseline again.
+   */
+  private async ensureBaseline(t: TaskRow, hq: string): Promise<Record<string, BaseResult>> {
     const project = this.project(t.project)!
-    const missing = nonManual(specOf(t)).filter((a) => this.store.get(this.baselineKey(t, a)) === null)
-    if (!missing.length) return
+    const out: Record<string, BaseResult> = {}
+    const missing: Acceptance[] = []
+    for (const a of nonManual(specOf(t))) {
+      const b = this.readBase(this.baselineKey(t, a))
+      if (b) out[a.id] = b
+      else missing.push(a)
+    }
+    if (!missing.length) return out
     const p = this.procTracker('baseline')
     try {
       const res = await baseline({ mirror: this.mirror(t.project), base: t.base_sha!, path: this.worktreeDir(t.request_id, `${t.key}.baseline`),
         checks: missing.map((a) => ({ id: a.id, command: a.check })), setup: project.setup ?? null, timeoutMs: this.cfg.checkTimeoutMinutes * 60_000,
         sandbox: (wt) => this.sandboxFor(wt, null), profilePath: join(hq, 'baseline.sb'), onSpawn: p.onSpawn })
-      for (const a of missing) this.store.set(this.baselineKey(t, a), res[a.id] ? 'pass' : 'fail')
+      for (const a of missing) {
+        const b = res[a.id]
+        if (!b) continue
+        out[a.id] = b
+        if (!envFailure(b)) this.store.set(this.baselineKey(t, a), JSON.stringify(b))
+      }
     } finally { p.done() }
+    return out
   }
 
-  /** Checks hq runs itself, and regression checks handed to the reviewer because they already failed on the base (§9). */
-  effectiveChecks(t: TaskRow, prefix = ''): { checks: CheckSpec[]; manual: string[]; basePassed: Record<string, boolean> } {
-    const checks: CheckSpec[] = [], manual: string[] = [], basePassed: Record<string, boolean> = {}
+  /**
+   * Why the base run says nothing about the code (setup failed, timeout, command not found/executable), or null.
+   * A new-kind check exiting 126/127 on the base is expected (the script it runs is what the task adds), so only
+   * setup failures and timeouts count for those.
+   */
+  private baselineEnvMessage(t: TaskRow, bases: Record<string, BaseResult>): string | null {
+    const lastLine = (tail: string) => (tail.split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('[hq] 시간 초과')).at(-1) ?? '').slice(0, 200)
+    const lines: string[] = []
+    let setupLine = false
     for (const a of nonManual(specOf(t))) {
-      const b = this.store.get(this.baselineKey(t, a))
-      if (b !== null) basePassed[prefix + a.id] = b === 'pass'
-      if (kindOf(a) === 'regression' && b === 'fail') manual.push(prefix + a.id)
-      else checks.push({ id: prefix + a.id, command: a.check, kind: kindOf(a) })
+      const b = bases[a.id]
+      if (!b || !envFailure(b)) continue
+      if (b.setupFailed) {
+        if (!setupLine) { const l = lastLine(b.tail); lines.unshift(`- setup 명령 실패${l ? `: ${l}` : ''}`); setupLine = true }
+        continue
+      }
+      if (!b.timedOut && kindOf(a) === 'new') continue
+      const why = b.timedOut ? `${this.cfg.checkTimeoutMinutes}분 안에 끝나지 않음` : b.exitCode === 127 ? 'exit 127 (명령을 찾지 못함)' : 'exit 126 (실행할 수 없음)'
+      const l = lastLine(b.tail)
+      lines.push(`- [${a.id}] ${a.check} → ${why}${l ? `: ${l}` : ''}`)
     }
-    return { checks, manual, basePassed }
+    if (!lines.length) return null
+    return ['검사 명령이 원래 코드에서 실행되지 않아 작업을 시작하지 않았어요', ...lines,
+      '원인 후보: 프로젝트 setup(의존성 설치)이 없거나 검사 명령이 잘못됐어요. setup을 등록하거나(hq projects add … --setup) 계획을 고친 뒤 다시 시도해 주세요'].join('\n')
+  }
+
+  /** The project repo's effective commit identity (read-only; the user's repo is not worker-writable, §6.1). */
+  private async projectIdentity(project: Project): Promise<{ name?: string; email?: string }> {
+    const get = async (k: string) => {
+      const r = await hqGit(null, null, ['config', '--get', k], { cwd: project.path }).catch(() => null)
+      const v = r && r.code === 0 ? r.stdout.trim() : ''
+      return v || undefined
+    }
+    return { name: await get('user.name'), email: await get('user.email') }
+  }
+
+  /**
+   * Checks hq runs itself (§9). Regression checks that already failed on the base for an ordinary reason still run,
+   * marked `baseFailed`; `baseTails` holds their base output for the reviewer.
+   */
+  effectiveChecks(t: TaskRow, prefix = ''): { checks: CheckSpec[]; basePassed: Record<string, boolean>; baseTails: Record<string, string> } {
+    const checks: CheckSpec[] = [], basePassed: Record<string, boolean> = {}, baseTails: Record<string, string> = {}
+    for (const a of nonManual(specOf(t))) {
+      const b = this.readBase(this.baselineKey(t, a))
+      if (b) basePassed[prefix + a.id] = b.pass
+      const baseFailed = kindOf(a) === 'regression' && !!b && !b.pass && !envFailure(b)
+      if (baseFailed) baseTails[prefix + a.id] = b.tail
+      checks.push({ id: prefix + a.id, command: a.check, kind: kindOf(a), ...(baseFailed ? { baseFailed: true } : {}) })
+    }
+    return { checks, basePassed, baseTails }
   }
 
   /** start_failed never restarts automatically (v3): the task stops for the chairman. */
@@ -859,17 +925,22 @@ export class Runner {
       const eff = this.effectiveChecks(t)
       const file = await runChecks({ wt, base: t.base_sha, head: t.head_sha, checks: eff.checks, basePassed: eff.basePassed,
         timeoutMs: this.cfg.checkTimeoutMinutes * 60_000, sandbox: this.sandboxFor(wt.path, null), profilePath: checksProfile(hq), onSpawn: p.onSpawn })
-      file.manual = eff.manual
+      file.manual = file.checks.filter((c) => c.baseFailed).map((c) => c.id)
+      file.baseTails = Object.fromEntries(file.manual.map((id) => [id, eff.baseTails[id] ?? '']))
       atomicJson(join(hq, 'checks.json'), file)
-      const failed = file.checks.filter((c) => !c.pass).map((c) => `[${c.id}] ${c.command} → ${c.exitCode ?? '시간 초과'}`)
+      const failed = file.checks.filter((c) => !c.pass && !c.baseFailed).map((c) => `[${c.id}] ${c.command} → ${c.exitCode ?? '시간 초과'}`)
       if (file.error) failed.unshift(file.error)
       if (file.secrets.length) failed.push(`비밀값 패턴·금지 파일: ${file.secrets.map((s) => `${s.file}:${s.line}(${s.pattern})`).join(', ')}`)
       this.store.tx(() => {
         const cur = this.store.task(t.id)
         if (!cur || cur.status !== 'verifying' || cur.generation !== t.generation || cur.head_sha !== t.head_sha) return
-        if (file.pass) this.tset(cur, { status: cur.review_model === 'none' ? 'passed' : 'reviewing', checks_state: 'passed' })
+        // Manual items (failed on base and candidate) need a judge: with no reviewer, add a sonnet review instead of passing.
+        const addReview = file.pass && cur.review_model === 'none' && (file.manual?.length ?? 0) > 0
+        if (addReview) this.tset(cur, { status: 'reviewing', review_model: 'sonnet', checks_state: 'passed' })
+        else if (file.pass) this.tset(cur, { status: cur.review_model === 'none' ? 'passed' : 'reviewing', checks_state: 'passed' })
         else { this.tset(cur, { checks_state: 'failed' }); this.rework(this.store.task(cur.id)!, `기계 검증 실패: ${failed.join('; ')}`) }
         this.emitTask(cur, `${cur.title}: 검증 ${file.pass ? '통과' : '실패'}`)
+        if (addReview) this.emitTask(cur, '기존 실패 항목이 있어 검토를 추가해요 · sonnet')
       })
     } catch (e) {
       this.store.tx(() => {
@@ -892,7 +963,7 @@ export class Runner {
       dir: this.runDir(t.request_id, t.key, id), session_id: randomUUID(), generation: t.generation })
     this.launching.add(id)
     this.bg(this.launchReview(id).finally(() => this.launching.delete(id)))
-    this.emitTask(t, `${t.review_model}가 ${t.title} 검토 시작`)
+    this.emitTask(t, `${t.title} 검토 시작 · ${t.review_model}`)
     return true
   }
 
@@ -913,7 +984,8 @@ export class Runner {
       const checks = work ? readJson<ChecksFile>(join(hqDirOf(work), 'checks.json')) : null
       const report = t.role === 'collect' && work ? readText(join(hqDirOf(work), 'report.sealed.md'), 200_000) : null
       const prompt = reviewPrompt({ task: specOf(t), requestText: this.store.request(t.request_id)!.text, base: t.base_sha!, head: t.head_sha!, diffStat: stat.stdout,
-        checks, protectedChanges: result?.protectedChanges ?? [], manualIds: checks?.manual ?? [], report })
+        checks, protectedChanges: result?.protectedChanges ?? [], manualIds: checks?.manual ?? [], report,
+        manualTails: Object.fromEntries((checks?.manual ?? []).map((id) => [id, { candidate: checks!.checks.find((c) => c.id === id)?.outputTail ?? '', base: checks!.baseTails?.[id] ?? '' }])) })
       const argv = claudeArgs(this.cfg, { role: 'review', model: att.model, sessionId: att.session_id, resume: false, out: null, schema: VERDICT_SCHEMA })
       const { info, child } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd: wt.path, hqDir: hq, outDir: null, prompt, sessionId: att.session_id,
         sandbox: this.sandboxFor(wt.path, null),
@@ -1034,7 +1106,7 @@ export class Runner {
       return
     }
     if (res.kind === 'failed') {
-      const failedIds = new Set((res.checks?.checks ?? []).filter((c) => !c.pass).map((c) => c.id.split('.')[0]))
+      const failedIds = new Set((res.checks?.checks ?? []).filter((c) => !c.pass && !c.baseFailed).map((c) => c.id.split('.')[0]))
       fail('failed', res.reason, res.reason, tasks.filter((t) => failedIds.has(t.key)).map((t) => t.id))
       return
     }
@@ -1393,7 +1465,7 @@ export class Runner {
 
   private checksEvidence(file: ChecksFile | null): string {
     if (!file) return '(검사 기록 없음)'
-    const lines = file.checks.filter((c) => !c.pass).map((c) => `- [${c.id}] \`${c.command}\` → 종료 코드 ${c.exitCode ?? '시간 초과'}\n\`\`\`\n${c.outputTail.split('\n').slice(-30).join('\n')}\n\`\`\``)
+    const lines = file.checks.filter((c) => !c.pass && !c.baseFailed).map((c) => `- [${c.id}] \`${c.command}\` → 종료 코드 ${c.exitCode ?? '시간 초과'}\n\`\`\`\n${c.outputTail.split('\n').slice(-30).join('\n')}\n\`\`\``)
     if (file.error) lines.unshift(`- 오류: ${file.error}`)
     if (file.secrets.length) lines.push(`- 비밀값 패턴·금지 파일: ${file.secrets.map((x) => `${x.file}:${x.line} (${x.pattern})`).join(', ')}`)
     return lines.join('\n') || '(실패한 검사 없음)'
