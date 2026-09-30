@@ -11,6 +11,8 @@ export interface MockApi {
   emit(e: Omit<HqEvent, 'at'>): void
   /** Stops live timers and closes SSE clients. */
   close(): void
+  /** Ends every open SSE stream (to exercise client reconnects). */
+  dropStreams(): void
 }
 
 export const XSS = '<script>alert("xss")</script><img src=x onerror=alert(1)>'
@@ -470,6 +472,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
   return {
     routeApi, calls, emit,
     close() { for (const t of timers) clearInterval(t); for (const c of clients) c.end(); clients.clear() },
+    dropStreams() { for (const c of clients) c.end(); clients.clear() },
   }
 }
 
