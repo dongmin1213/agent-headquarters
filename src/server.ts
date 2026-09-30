@@ -13,6 +13,7 @@ import type { RequestView, Snapshot } from './types.ts'
 import type { RequestEngine } from './engine.ts'
 import type { Project } from './ceo.ts'
 import { timingSafeEqual } from 'node:crypto'
+import { createWebUi } from './web/index.ts'
 
 // Every request must carry the app token (from .data/token, mode 0600) and come from localhost
 // without a browser Origin, so a web page or another user cannot forge an approval.
@@ -29,22 +30,23 @@ function requestViews(store: Store): RequestView[] {
   return store.requests(10).map((r) => {
     const plan = r.plan ? JSON.parse(r.plan) : null
     return { id: r.id, project: r.project, text: r.text, status: r.status, note: r.note, turns: r.turns, costUsd: r.cost_usd,
-      questions: store.questions(r.id),
+      questions: store.questions(r.id), tasks: [],
       plan: plan && { summary: plan.summary, assumptions: plan.assumptions, tasks: plan.tasks.map((x: Record<string, string>) => ({ id: x.id, title: x.title, project: x.project, role: x.role, grade: x.grade, model: x.model })) },
       updatedAt: r.updated_at }
   })
 }
 
+export type ApiRouter = (req: IncomingMessage, res: ServerResponse) => Promise<void>
+
 export function startServer(port: number, store: Store, bus: Bus, scheduler: Scheduler, token: string, engine: RequestEngine, projects: Project[]) {
-  const server = createServer(async (req, res) => {
-    try {
-      if (!authorized(req, token)) return json(res, 401, { error: 'unauthorized' })
+  // /api/* handlers after authentication. The web UI (src/web) reuses them behind cookie + CSRF auth.
+  const routeApi: ApiRouter = async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1')
       const parts = url.pathname.split('/').filter(Boolean)
       if (req.method === 'GET' && url.pathname === '/api/state') {
         const snap: Snapshot = { updatedAt: new Date().toISOString(), lastEventId: store.lastEventId(), teams: scheduler.views(),
           approvals: store.openApprovals(), requests: requestViews(store), projects: projects.map((p) => ({ id: p.id, name: p.name })),
-          limit: { blockedUntil: scheduler.blockedUntil() } }
+          limit: { blockedUntil: scheduler.blockedUntil() }, workers: [], headline: { text: '', needsYou: 0 }, quota: null }
         return json(res, 200, snap)
       }
       if (req.method === 'GET' && url.pathname === '/api/events') return bus.subscribe(res)
@@ -90,6 +92,15 @@ export function startServer(port: number, store: Store, bus: Bus, scheduler: Sch
         return scheduler.runNow(parts[2]) ? json(res, 202, { started: true }) : json(res, 409, { error: 'unknown team or already running' })
       }
       json(res, 404, { error: 'not found' })
+  }
+  const web = createWebUi({ port, token, routeApi })
+  const server = createServer(async (req, res) => {
+    try {
+      const path = (req.url ?? '/').split('?')[0]
+      if (path === '/ui' || path.startsWith('/ui/') || path.startsWith('/ui-api/')) return await web.handle(req, res)
+      if (!authorized(req, token)) return json(res, 401, { error: 'unauthorized' })
+      if (path === '/api/ui-code' && req.method === 'POST') return json(res, 200, { url: web.issueLoginUrl() })
+      await routeApi(req, res)
     } catch (e) {
       json(res, 500, { error: String(e) })
     }
