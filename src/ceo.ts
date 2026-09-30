@@ -50,11 +50,26 @@ export const defaultReviewModel = (grade: string) => (grade === 'L0' ? 'none' : 
 /** Review model: implement by grade (or task.review); collect is reviewed only from L2 up (§10). */
 export const reviewModelOf = (t: PlanTask) => (t.role === 'collect' && (t.grade === 'L0' || t.grade === 'L1') ? 'none' : t.review?.model ?? defaultReviewModel(t.grade))
 
-/** A check is one command: chaining hides failures (§3). Returns the offending token, or null. */
+/**
+ * One command only (§3, §10.2): anything that can chain, background or overrule an exit code hides failures.
+ * Applied to the RAW string (before any whitespace normalisation, which would turn a newline into a space).
+ * Shared by plan checks and reviewer tests_run. Returns the offending token (Korean label), or null.
+ */
+export function unsafeCommand(cmd: string): string | null {
+  if (/[\n\r]/.test(cmd)) return '줄바꿈'
+  for (const tok of ['&&', '||', '`', '$(', ';', '|']) if (cmd.includes(tok)) return tok
+  // A lone `&` backgrounds (also `&>`); `2>&1`-style redirections are fine.
+  if (/(?<![&<>])&(?!&)/.test(cmd)) return '&'
+  if (/(^|[^\w-])exit([^\w-]|$)/.test(cmd)) return 'exit'
+  const last = cmd.trim().split(/\s+/).at(-1)
+  if (last === 'true' || last === ':') return `끝의 ${last}`
+  return null
+}
+
+/** A plan check is one command or the word `manual` (§3). Returns the offending token, or null. */
 export function chainedCheck(check: string): string | null {
   if (check.trim() === 'manual') return null
-  for (const tok of ['&&', '||', '|', ';', '`', '$(', '\n']) if (check.includes(tok)) return tok === '\n' ? '줄바꿈' : tok
-  return null
+  return unsafeCommand(check)
 }
 
 const norm = (p: string) => p.replace(/^\.\//, '').replace(/\/+$/, '')

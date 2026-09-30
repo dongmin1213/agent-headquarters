@@ -121,7 +121,9 @@ test('v3-5. a regression check failing on the base and again on the candidate be
   try {
     const id = h.plan([task('A', { acceptance: [{ id: 'R1', text: '기존에 깨진 검사', check: 'test -f missing.txt', kind: 'regression' }] })])
     await h.approve(id)
-    await h.waitFor(() => req(h, id).status === 'awaiting_acceptance', 'awaiting_acceptance')
+    // The task passes review; integration has no exemption (F02), so the request stops at the integration card.
+    await h.waitFor(() => h.store.approval(`integration:${id}:p`)?.state === 'open', 'integration card')
+    assert.equal(tsk(h, `${id}.A`).status, 'passed')
     const work = h.store.attempts(`${id}.A`).find((a) => a.kind === 'work' && a.status === 'succeeded')!
     const checks = JSON.parse(readFileSync(join(work.dir, 'hq', 'checks.json'), 'utf8'))
     assert.deepEqual(checks.manual, ['R1'])
@@ -130,7 +132,10 @@ test('v3-5. a regression check failing on the base and again on the candidate be
     assert.equal(checks.pass, true)
     const review = h.store.attempts(`${id}.A`).find((a) => a.kind === 'review')!
     assert.match(readFileSync(join(review.dir, 'hq', 'prompt.md'), 'utf8'), /R1\].*manual .*기존 실패/)
+    // The accept card still renders the item and the reviewer's judgement (if the chairman gets there another way).
+    ;(h.runner as unknown as { putAcceptCard(id: string): void }).putAcceptCard(id)
     assert.match(h.store.approval(`accept:${id}`)!.body, /기존 실패\(검토자 판단\): R1/)
+    assert.match(h.store.approval(`accept:${id}`)!.body, /검토자 판정: \[R1\] pass — checked/)
   } finally { await h.close() }
 })
 

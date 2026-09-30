@@ -106,9 +106,12 @@ export function decisionItems(store: Store, now = Date.now(), teamNames: Record<
   }
   for (const t of store.tasksByStatus(['question'])) for (const q of store.taskQuestions(t.id)) {
     if (q.answer !== null || q.revision !== t.revision) continue
-    items.push({ kind: 'worker_question', id: q.id, revision: t.revision, requestId: t.request_id, taskId: t.id, title: `${t.title}: ${q.question}`, detail: `기본값: ${q.default}`,
-      situation: `작업자가 '${t.title}' 작업 중에 물어볼 게 있어요: ${q.question}`, cause: firstLine(t.note) || null, causeConfirmed: false,
-      recommendation: q.options.includes(q.default) ? { option: q.default, reason: '작업자가 제안한 기본값이에요' } : null, optionHelp: answerHelp(q.options, q.default),
+    // CEO revise-turn questions (attempt id `ceo-revise:…`) are answered through the same task question path.
+    const ceo = q.attempt_id?.startsWith('ceo-revise:') ?? false
+    items.push({ kind: 'worker_question', ...(ceo ? { label: '사장 질문' } : {}), id: q.id, revision: t.revision, requestId: t.request_id, taskId: t.id, title: `${t.title}: ${q.question}`, detail: `기본값: ${q.default}`,
+      situation: ceo ? `사장이 '${t.title}' 지시서를 고치려면 회장님 답이 필요해요: ${q.question}` : `작업자가 '${t.title}' 작업 중에 물어볼 게 있어요: ${q.question}`,
+      cause: firstLine(t.note) || null, causeConfirmed: false,
+      recommendation: q.options.includes(q.default) ? { option: q.default, reason: ceo ? '사장이 추천한 기본값이에요' : '작업자가 제안한 기본값이에요' } : null, optionHelp: answerHelp(q.options, q.default),
       detailPath: detailPath(t.request_id, t.id), options: q.options, subjectHash: null, createdAt: q.created_at })
   }
   for (const t of store.tasksByStatus(['blocked'])) {

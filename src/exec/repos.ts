@@ -61,13 +61,22 @@ export async function newWorkClone(mirror: string, path: string, baseSha: string
   if (identity?.email) await hqGitOk(join(path, '.git'), path, ['config', 'user.email', identity.email])
 }
 
-/** Brings the worker's `hq-work` into the mirror under `ref` (runs in the mirror). Returns the fetched SHA, or null. */
-export async function fetchWork(mirror: string, clonePath: string, ref: string): Promise<string | null> {
+/**
+ * Brings the worker's `hq-work` into the mirror under `ref` (runs in the mirror). Every received object is checked
+ * (fsck: e.g. a tree entry named `.git`, malformed objects), so nothing corrupt or malicious enters the mirror (S6).
+ * Returns the fetched SHA, or null with a Korean reason.
+ */
+export async function fetchWork(mirror: string, clonePath: string, ref: string): Promise<{ sha: string | null; error: string | null }> {
   return withRepo(mirror, async () => {
-    const r = await hqGit(mirror, null, ['fetch', '-q', '--no-tags', '--no-write-fetch-head', clonePath, `+refs/heads/hq-work:${ref}`])
-    if (r.code !== 0) return null
+    const r = await hqGit(mirror, null, ['-c', 'transfer.fsckObjects=true', '-c', 'fetch.fsckObjects=true',
+      'fetch', '-q', '--no-tags', '--no-write-fetch-head', clonePath, `+refs/heads/hq-work:${ref}`])
+    if (r.code !== 0) {
+      const msg = (r.stderr || r.stdout).trim().split('\n').filter(Boolean).slice(0, 3).join(' / ').slice(0, 400)
+      const fsck = /fsck|hasDotgit|badTree|bad(Date|Email|Name|Filemode)|missing(Author|Committer|Tree)|zeroPaddedFilemode|index-pack failed/i.test(r.stderr)
+      return { sha: null, error: fsck ? `작업 결과를 가져오다 git 객체 검사에서 거부됐어요(손상됐거나 위험한 객체): ${msg}` : `작업 결과(hq-work 브랜치)를 가져오지 못했어요: ${msg}` }
+    }
     const s = await hqGit(mirror, null, ['rev-parse', '--verify', '-q', `${ref}^{commit}`])
-    return s.code === 0 ? s.stdout.trim() : null
+    return s.code === 0 ? { sha: s.stdout.trim(), error: null } : { sha: null, error: '가져온 작업 결과에 커밋이 없어요' }
   })
 }
 

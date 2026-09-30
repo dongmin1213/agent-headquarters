@@ -12,7 +12,7 @@ import { reviewModelOf, validateTasks, type Acceptance, type CeoPlan, type PlanT
 import type { HqConfig } from '../config.ts'
 import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../store.ts'
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
-import { baseline, checksProfile, envFailure, runChecks, runSandboxed, type BaseResult, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
+import { baseline, checksProfile, envFailure, runChecks, runSandboxed, setupChangedReason, trackedChanges, type BaseResult, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
 import { DONE_MAX, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
 import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, outDirOf, workerViews, type HeadlineInput } from './decisions.ts'
 import { runDiagnoseTurn } from './diagnose.ts'
@@ -23,7 +23,7 @@ import { applyMerge } from './merge.ts'
 import { resumePrompt, reviewPrompt, reworkEvidence, workPrompt, type Upstream } from './prompt.ts'
 import { isAllowedEvent, quotaState, quotaView, recordRateLimit, rejectedWithoutReset, type QuotaState } from './quota.ts'
 import { ensureMirror, fetchWork, hqGit, hqGitOk, mirrorChanged, mirrorPath, mirrorRev, newWorkClone, removeMirrorWorktree, verifyWorktree, wtGit, wtMerge, wtStatus } from './repos.ts'
-import { canAutoApply, reviseDiff, runReviseTurn } from './revise.ts'
+import { canAutoApply, reviseDiff, reviseProblem, runReviseTurn } from './revise.ts'
 import { checkVerdict, ladderUp, VERDICT_SCHEMA } from './review.ts'
 import { real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
 import { extractBashRuns, lastActivityOf, StreamTail } from './stream.ts'
@@ -79,6 +79,11 @@ export const LOGIN_CARD = 'system:login'
 
 export const specOf = (t: TaskRow) => JSON.parse(t.spec) as PlanTask
 export const nonManual = (t: PlanTask) => t.acceptance.filter((a) => a.check.trim() && a.check.trim() !== 'manual')
+/** Acceptance items only a person (the reviewer) can judge: explicit `manual` checks (F03). */
+export const manualIds = (t: PlanTask) => t.acceptance.filter((a) => !a.check.trim() || a.check.trim() === 'manual').map((a) => a.id)
+/** Revise-turn questions are task questions whose attempt id carries this prefix (F16). */
+export const REVISE_Q = 'ceo-revise:'
+const JUDGE_ADDED = '사람 확인이 필요한 기준이 있어 검토를 추가해요 · sonnet'
 const kindOf = (a: Acceptance) => (a.kind === 'new' ? 'new' : 'regression')
 
 class Setup extends Error {}
@@ -514,8 +519,10 @@ export class Runner {
     const report = readOut(out, 'report.md', REPORT_MAX)
     let git: GitFacts | null = null
     let fetched: string | null = null
+    let fetchError: string | null = null
     if (role === 'implement' && task.worktree && task.base_sha) {
-      fetched = await fetchWork(mirror, task.worktree, this.resultRef(task, att.id))
+      const f = await fetchWork(mirror, task.worktree, this.resultRef(task, att.id))
+      fetched = f.sha; fetchError = f.error
       git = await mirrorFacts(mirror, task.base_sha, fetched)
     } else if (collectWt && task.base_sha && existsSync(collectWt)) {
       const wt = { path: collectWt, gitDir: join(mirror, 'worktrees', `${task.key}.c${att.n}`), mirror }
@@ -529,8 +536,12 @@ export class Runner {
       runaway: att.outcome === 'runaway', result, stderr, rejectedSeen: l.tail.rejectedSeen,
       doneRaw: readOut(out, 'done.json', DONE_MAX), report, git,
     })
+    // The fetch's own reason (e.g. the object check refused the result) says more than "could not fetch".
+    if (fetchError && j.outcome === 'failed' && !git?.head) j.reasons = [fetchError]
     const reason = j.reasons.join('\n') || null
-    atomicJson(join(hq, 'result.json'), { outcome: j.outcome, reasons: j.reasons, summary: j.done?.summary ?? null, fetched, protectedChanges: j.protectedChanges, at: endedAt })
+    // changedFiles: counted from the mirror diff base..head (hq's fact), not from the worker's done.json (F3).
+    atomicJson(join(hq, 'result.json'), { outcome: j.outcome, reasons: j.reasons, summary: j.done?.summary ?? null, fetched, protectedChanges: j.protectedChanges,
+      changedFiles: role === 'implement' ? git?.changed.length ?? null : 0, at: endedAt })
     if (j.outcome === 'succeeded' && role === 'collect' && report !== null) atomicWrite(join(hq, 'report.sealed.md'), report)
     if (j.login) this.requireLogin(String(result?.result ?? stderr).slice(0, 300))
     else if (j.outcome === 'limited' && this.quota().mode !== 'hold') this.limitBackoff()
@@ -542,10 +553,13 @@ export class Runner {
       if (t.status !== 'running' || t.generation !== att.generation) return
       switch (j.outcome) {
         case 'succeeded': {
-          const reviewModel = t.review_model === 'none' && j.protectedChanges.length ? 'sonnet' : t.review_model
+          // A person-judged criterion needs a judge: with no reviewer, add a sonnet review (F03); protected paths likewise (§3).
+          const needsJudge = t.review_model === 'none' && manualIds(spec).length > 0
+          const reviewModel = t.review_model === 'none' && (j.protectedChanges.length || needsJudge) ? 'sonnet' : t.review_model
           const sha = report === null ? null : sha256(report)
-          if (role === 'collect') this.tset(t, { status: reviewModel === 'none' ? 'passed' : 'reviewing', head_sha: t.base_sha, report_sha: sha, limited_streak: 0, review_invalid: 0, note: null })
+          if (role === 'collect') this.tset(t, { status: reviewModel === 'none' ? 'passed' : 'reviewing', head_sha: t.base_sha, report_sha: sha, review_model: reviewModel, limited_streak: 0, review_invalid: 0, note: null })
           else this.tset(t, { status: 'verifying', head_sha: j.done!.head_sha, report_sha: sha, review_model: reviewModel, limited_streak: 0, review_invalid: 0, checks_state: null, note: null })
+          if (needsJudge) this.emitTask(t, JUDGE_ADDED)
           break
         }
         case 'brief_blocked':
@@ -856,7 +870,11 @@ export class Runner {
       const b = bases[a.id]
       if (!b || !envFailure(b)) continue
       if (b.setupFailed) {
-        if (!setupLine) { const l = lastLine(b.tail); lines.unshift(`- setup 명령 실패${l ? `: ${l}` : ''}`); setupLine = true }
+        if (!setupLine) {
+          const l = lastLine(b.tail)
+          lines.unshift(l.startsWith('setup이 추적 파일을 바꿨어요') ? `- ${l}` : `- setup 명령 실패${l ? `: ${l}` : ''}`)
+          setupLine = true
+        }
         continue
       }
       if (!b.timedOut && kindOf(a) === 'new') continue
@@ -932,6 +950,8 @@ export class Runner {
       file.manual = file.checks.filter((c) => c.baseFailed).map((c) => c.id)
       file.baseTails = Object.fromEntries(file.manual.map((id) => [id, eff.baseTails[id] ?? '']))
       atomicJson(join(hq, 'checks.json'), file)
+      // Setup rewrote tracked files: an environment failure (the chairman decides), not the worker's fault (F01).
+      if (file.setupChanged) throw new Setup(file.error!)
       const failed = file.checks.filter((c) => !c.pass && !c.baseFailed).map((c) => `[${c.id}] ${c.command} → ${c.exitCode ?? '시간 초과'}`)
       if (file.error) failed.unshift(file.error)
       if (file.secrets.length) failed.push(`비밀값 패턴·금지 파일: ${file.secrets.map((s) => `${s.file}:${s.line}(${s.pattern})`).join(', ')}`)
@@ -982,6 +1002,9 @@ export class Runner {
       mkdirSync(hq, { recursive: true })
       const wt = await verifyWorktree(mirror, path, t.head_sha!)
       await this.runSetup(project, wt.path, hq, 'setup')
+      // The reviewer must see the commit under review, not what setup made of it (F01).
+      const changed = await trackedChanges(wt, t.head_sha!)
+      if (changed.length) throw new Setup(setupChangedReason(changed))
       const stat = await hqGit(mirror, null, ['diff', '--stat', '--no-ext-diff', '--no-textconv', t.base_sha!, t.head_sha!])
       const work = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
       const result = work ? readJson<{ protectedChanges?: string[] }>(join(hqDirOf(work), 'result.json')) : null
@@ -1032,10 +1055,13 @@ export class Runner {
     // Evidence first: the reviewer's real Bash runs go to the DB before the verdict is judged.
     const bashRuns = extractBashRuns(join(hq, 'stream.jsonl'))
     this.store.updateAttempt(att.id, { bash_runs: JSON.stringify(bashRuns) })
+    const work = this.store.attempts(task.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
+    const checksFile = work ? readJson<ChecksFile>(join(hqDirOf(work), 'checks.json')) : null
+    // Items handed to the reviewer must be judged pass/fail: explicit manual criteria and base-failed checks (F03).
+    const judgeIds = [...new Set([...manualIds(spec), ...(checksFile?.manual ?? [])])]
     const check = att.outcome === 'runaway' ? { kind: 'invalid' as const, reason: `검토 폭주: ${att.reason ?? ''}`, verdict: null }
       : result?.is_error || !result ? { kind: 'invalid' as const, reason: `검토 실행 오류: ${String(result?.result ?? result?.subtype ?? '결과 없음').slice(0, 300)}`, verdict: null }
-      : checkVerdict(result.structured_output, { acceptanceIds: spec.acceptance.map((a) => a.id), codeChanged, bashRuns })
-    const work = this.store.attempts(task.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
+      : checkVerdict(result.structured_output, { acceptanceIds: spec.acceptance.map((a) => a.id), codeChanged, bashRuns, judgeIds })
     const prot = work ? readJson<{ protectedChanges?: string[] }>(join(hqDirOf(work), 'result.json'))?.protectedChanges ?? [] : []
     const binding = { task: task.id, head_sha: task.head_sha ?? undefined, base_sha: task.base_sha ?? undefined, reviewer_model: att.model, implementer_model: task.model, sameFamily: true, protectedChanges: prot }
     atomicJson(join(hq, 'verdict.json'), check.verdict ? { ...check.verdict, ...binding, ...(check.kind === 'invalid' ? { invalid: check.reason } : {}) }
@@ -1167,18 +1193,23 @@ export class Runner {
     for (const t of this.store.tasks(requestId)) {
       if (t.status === 'cancelled') { body.push(`${t.key} ${t.title} — 취소됨`); continue }
       const work = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
-      const done = work ? readJson<{ summary?: string; files_modified?: string[] }>(join(outDirOf(work), 'done.json')) : null
       const checks = work ? readJson<ChecksFile>(join(hqDirOf(work), 'checks.json')) : null
-      const result = work ? readJson<{ protectedChanges?: string[] }>(join(hqDirOf(work), 'result.json')) : null
+      // hq's own record (result.json): the worker's summary is shown as its report, the file count is the mirror diff (F3).
+      const result = work ? readJson<{ protectedChanges?: string[]; summary?: string | null; changedFiles?: number | null }>(join(hqDirOf(work), 'result.json')) : null
       const review = this.store.attempts(t.id).filter((a) => a.kind === 'review' && a.outcome === 'pass').at(-1)
       const verdict = review ? readJson<Verdict>(join(hqDirOf(review), 'verdict.json')) : null
-      const parts = [`변경 파일 ${done?.files_modified?.length ?? 0}개`,
+      const parts = [`변경 파일 ${typeof result?.changedFiles === 'number' ? result.changedFiles : '?'}개`,
         checks ? `검사 ${checks.checks.filter((c) => c.pass).length}/${checks.checks.length} 통과` : '검사 없음',
         t.review_model === 'none' ? '검토 없음(기계 검증만)' : verdict ? `검토 통과(${review!.model}${verdict.advisory.length ? `, 참고 ${verdict.advisory.length}건` : ''})` : '검토 기록 없음']
       if (checks?.manual?.length) parts.push(`기존 실패(검토자 판단): ${checks.manual.join(', ')}`)
       if (checks?.warnings?.length) parts.push(`경고: ${checks.warnings.join(' / ')}`)
       if (result?.protectedChanges?.length) parts.push(`보호 경로 변경: ${result.protectedChanges.join(', ')}`)
-      body.push(`${t.key} [${t.model}] ${t.title} — ${done?.summary ?? ''}\n  ${parts.join(' · ')}`)
+      const judged = [...new Set([...manualIds(specOf(t)), ...(checks?.manual ?? [])])].map((id) => {
+        const c = verdict?.criteria.find((x) => x.id === id)
+        const why = (c?.evidence ?? '').split('\n').map((l) => l.trim()).find(Boolean) ?? ''
+        return `  검토자 판정: [${id}] ${c?.result ?? '기록 없음'} — ${why.slice(0, 160)}`
+      })
+      body.push([`${t.key} [${t.model}] ${t.title} — 작업자 보고: ${(result?.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 300)}`, `  ${parts.join(' · ')}`, ...judged].join('\n'))
     }
     this.store.putApproval({ id: `accept:${requestId}`, teamId: 'hq', subjectId: requestId, title: `결과 수락: ${r.text.replace(/\s+/g, ' ').slice(0, 60)}`,
       body: body.join('\n'), options: ['수락', '반려'], subjectHash: this.acceptSubject(requestId) })
@@ -1388,14 +1419,24 @@ export class Runner {
       const q = this.store.taskQuestions(taskId).find((x) => x.id === questionId)
       if (!q || q.revision !== t.revision) return '이 작업의 현재 질문이 아닙니다'
       if (!this.store.answerTaskQuestion(questionId, answer)) return '이미 답한 질문입니다'
-      if (!this.store.taskQuestions(taskId, q.attempt_id).some((x) => x.answer === null)) this.tset(t, { status: 'pending' })
+      // All answered: worker questions resume the worker; CEO revise questions re-run the revise turn (F16).
+      if (!this.store.taskQuestions(taskId, q.attempt_id).some((x) => x.answer === null))
+        this.tset(t, q.attempt_id?.startsWith(REVISE_Q) ? { status: 'revising', note: '회장 답변을 받아 지시서를 다시 고쳐요' } : { status: 'pending' })
       return null
     })
-    if (!err) { this.bus.emit({ kind: 'task', text: `작업자 질문 답변: ${answer.slice(0, 60)}`, data: { id: taskId } }); this.kick() }
+    if (!err) {
+      const ceo = this.store.taskQuestions(taskId).find((x) => x.id === questionId)?.attempt_id?.startsWith(REVISE_Q)
+      this.bus.emit({ kind: 'task', text: `${ceo ? '사장' : '작업자'} 질문 답변: ${answer.slice(0, 60)}`, data: { id: taskId } }); this.kick()
+    }
     return err
   }
 
   // ----- brief revision (§10a) -----
+  /** CEO revise questions of the task's current revision (F16). */
+  private reviseQuestions(t: TaskRow) {
+    return this.store.taskQuestions(t.id).filter((q) => q.revision === t.revision && q.attempt_id?.startsWith(`${REVISE_Q}${t.id}:`))
+  }
+
   private async reviseOne(): Promise<void> {
     if (!this.canStartCeo()) return
     const t = this.store.tasksByStatus(['revising']).find((x) => !this.revising.has(x.id) && this.store.approval(`revise:${x.id}`)?.state !== 'open'
@@ -1413,20 +1454,34 @@ export class Runner {
     const report = att ? readOut(outDirOf(att), 'report.md', REPORT_MAX) : null
     const fetched = att ? readJson<{ fetched?: string | null }>(join(hqDirOf(att), 'result.json'))?.fetched ?? null : null
     const stat = fetched && t.base_sha ? (await hqGit(this.mirror(t.project), null, ['diff', '--stat', '--no-ext-diff', '--no-textconv', t.base_sha, fetched])).stdout : ''
+    // Answers the chairman gave to this revision's CEO questions (F16) go back into the turn.
+    const answers = this.reviseQuestions(t).filter((q) => q.answer !== null).map((q) => ({ question: q.question, answer: q.answer! }))
     this.store.updateTask(t.id, { revise_turns: t.revise_turns + 1 })
-    const res = await runReviseTurn({ claudeBin: this.cfg.claudeBin, hqRoot: this.hqRoot, project, projects: this.projects, requestText: r.text, task: spec, report, diffStat: stat,
+    const res = await runReviseTurn({ claudeBin: this.cfg.claudeBin, hqRoot: this.hqRoot, project, projects: this.projects, requestText: r.text, task: spec, report, diffStat: stat, answers,
       onLine: (line) => { if (line.type === 'rate_limit_event') this.observe(line) } })
     if (res.limited) { this.store.updateTask(t.id, { revise_turns: t.revise_turns }); if (this.quota().mode !== 'hold') this.limitBackoff(); return } // not counted
     const cur = this.store.task(t.id)
     if (!cur || cur.status !== 'revising' || cur.generation !== t.generation) return
     if (!res.ok || !res.output) { this.store.tx(() => this.block(cur, `지시서 수정 턴 실패: ${res.error ?? ''}`)); return }
     if (!res.output.revised_task) {
-      this.store.tx(() => this.block(cur, `사장이 지시서를 고치려면 회장님 답이 필요해요:\n${res.output!.questions.map((q) => `- ${q.question} (기본: ${q.default})`).join('\n')}`))
+      // The CEO needs the chairman: its questions become this task's questions (answered like worker questions).
+      // A question round is not a revision: it does not use up the revise budget (rounds are capped instead).
+      const qs = res.output.questions
+      const asked = this.store.tx(() => {
+        this.store.updateTask(cur.id, { revise_turns: t.revise_turns })
+        const rounds = new Set(this.reviseQuestions(cur).map((q) => q.attempt_id)).size
+        if (rounds >= MAX_QUESTION_ROUNDS) { this.block(cur, `사장의 지시서 질문이 ${MAX_QUESTION_ROUNDS}라운드를 넘었어요:\n${qs.map((q) => `- ${q.question} (기본: ${q.default})`).join('\n')}`); return false }
+        this.store.addTaskQuestions(cur.id, `${REVISE_Q}${cur.id}:${randomUUID().slice(0, 8)}`, cur.revision,
+          qs.map((q) => ({ id: 'tq-' + randomUUID().slice(0, 8), question: q.question, options: q.options, default: q.default })))
+        this.tset(cur, { status: 'question', note: `사장이 지시서를 고치려면 회장님 답이 필요해요 (${qs.length}건)` })
+        return true
+      })
+      if (asked) this.emitTask(cur, `사장 질문: ${cur.title}`)
       return
     }
     const rev = res.output.revised_task
     const plan = this.store.tasks(t.request_id).map((x) => (x.id === t.id ? rev : specOf(x)))
-    const problem = rev.id !== spec.id ? '작업 id가 바뀜' : validateTasks(plan, this.projects)
+    const problem = reviseProblem(spec, rev) ?? validateTasks(plan, this.projects)
     if (problem) { this.store.tx(() => this.block(cur, `지시서 수정안이 유효하지 않아요: ${problem}`)); return }
     if (canAutoApply(spec, rev)) { this.store.tx(() => this.applyRevision(t.id, rev)); return }
     this.store.tx(() => {
@@ -1442,7 +1497,7 @@ export class Runner {
     const t = this.store.task(taskId)
     if (!t || t.status !== 'revising') return '지시서 수정을 기다리는 작업이 아닙니다'
     const plan = this.store.tasks(t.request_id).map((x) => (x.id === t.id ? rev : specOf(x)))
-    const problem = validateTasks(plan, this.projects)
+    const problem = reviseProblem(specOf(t), rev) ?? validateTasks(plan, this.projects)
     if (problem) { this.block(t, `지시서 수정안이 유효하지 않아요: ${problem}`); return null }
     for (const a of this.store.liveAttempts()) if (a.task_id === t.id) { this.store.updateAttempt(a.id, { outcome: 'superseded' }); if (a.pid) { const pid = a.pid; queueMicrotask(() => killGroup(pid, 'SIGTERM')) } }
     this.store.updateTask(taskId, { spec: JSON.stringify(rev), title: rev.title, grade: rev.grade, model: rev.model, review_model: reviewModelOf(rev),
