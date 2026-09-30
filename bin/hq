@@ -1,0 +1,16 @@
+#!/bin/bash
+# hq operator CLI shim: resolves symlinks (e.g. ~/.local/bin/hq) to find the repository, then runs the TypeScript CLI.
+set -euo pipefail
+src="${BASH_SOURCE[0]}"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+root="$(cd -P "$(dirname "$src")/.." && pwd)"
+node_bin="${HQ_NODE:-node}"
+if ! command -v "$node_bin" >/dev/null 2>&1; then
+  echo "node를 찾지 못했습니다. Node 26 이상을 설치하세요 (brew install node)." >&2
+  exit 1
+fi
+exec "$node_bin" "$root/src/cli/main.ts" "$@"
