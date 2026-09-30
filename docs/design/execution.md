@@ -210,7 +210,7 @@ stream.jsonl → activity.jsonl `{at, kind: message|tool|error|usage, text}`. �
 - `POST /api/ui-code`(Bearer) → `http://127.0.0.1:<port>/ui/#code=<32바이트 랜덤, 60초, 1회>`.
 - SSE는 `?t=` 쿼리 대신 `fetch` 스트리밍 + `Authorization` 헤더로 받는다(v3: 장기 토큰을 URL에 싣지 않음). 코드는 fragment라 서버 로그·Referer에 남지 않는다.
 - 페이지 JS가 `POST /ui-api/session {code}`로 교환(원자적 1회 소비) → 세션 토큰(32바이트, 유휴 12시간·최대 7일)을 `sessionStorage`에 두고 `Authorization: Bearer`로 호출. **쿠키 없음**(포트 간 쿠키 공유 문제 제거, CSRF 불필요). 데몬 재시작 시 세션 폐기.
-- `/ui-api/*`: 세션 토큰 확인 → `/api/*` 라우터로 위임(Bearer를 데몬 토큰으로 교체). SSE는 `EventSource`가 헤더를 못 보내므로 `?t=<세션 토큰>` 쿼리 허용(해당 경로만).
+- `/ui-api/*`: 세션 토큰 확인 → `/api/*` 라우터로 위임(Bearer를 데몬 토큰으로 교체). 쿼리 문자열 토큰은 어떤 경로에서도 받지 않는다.
 - 모든 `/ui*` 응답: `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store`. 작업자 산출물은 textContent로만 렌더링(마크다운은 원시 HTML 불허 렌더러, 링크는 http(s)만 + `rel=noopener noreferrer`).
 
 ## 17. 화면용 데이터 (src/types.ts가 권위)
