@@ -15,7 +15,7 @@ const enc = (s: string) => [...Buffer.from(s)].map((b) => '%' + b.toString(16).t
 
 async function api(h: Harness): Promise<{ server: Server; call: (method: string, path: string, body?: unknown) => Promise<{ status: number; body: any }> }> {
   const port = 30000 + Math.floor(Math.random() * 20000)
-  const scheduler = new Scheduler([], h.store, h.bus, `http://127.0.0.1:${port}`, TOKEN, { holdUntil: () => h.runner.holdUntil(), teamLimited: () => {} })
+  const scheduler = new Scheduler([], h.store, h.bus, `http://127.0.0.1:${port}`, { hqHome: h.cfg.home, tokenDir: h.dir + '/tokens' }, { holdUntil: () => h.runner.holdUntil(), teamLimited: () => {} })
   const server = startServer({ port, store: h.store, bus: h.bus, scheduler, token: TOKEN, engine: h.engine, runner: h.runner, projects: h.projects })
   await new Promise((r) => server.once('listening', r))
   return {

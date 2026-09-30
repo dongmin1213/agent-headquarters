@@ -7,13 +7,17 @@ import { Scheduler } from '../../src/scheduler.ts'
 import { Store } from '../../src/store.ts'
 import type { TeamConfig } from '../../src/types.ts'
 import { tmp } from './helpers.ts'
+import { useFakeSandboxIfNested } from '../nested.ts'
+
+useFakeSandboxIfNested()
+const iso = (dir: string) => ({ hqHome: join(dir, 'home'), tokenDir: join(dir, 'tokens'), pollMs: 50 })
 
 function setup(team: Partial<TeamConfig>) {
   const dir = tmp('hq-sched-')
   const store = new Store(join(dir, 'hq.db'))
   const bus = new Bus(store)
   const t: TeamConfig = { id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', 'exit 0'], cwd: dir, everyMinutes: 60, enabled: true, ...team }
-  const sched = new Scheduler([t], store, bus, 'http://127.0.0.1:1', 'tok', { holdUntil: () => null, teamLimited: () => {} })
+  const sched = new Scheduler([t], store, bus, 'http://127.0.0.1:1', iso(dir), { holdUntil: () => null, teamLimited: () => {} })
   return { dir, store, sched }
 }
 
@@ -90,7 +94,7 @@ function restarted(seed: (store: Store) => void, team: Partial<TeamConfig> = {})
   before.close()
   const store = new Store(path)
   const t: TeamConfig = { id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', 'exit 0'], cwd: dir, everyMinutes: 60, enabled: true, ...team }
-  const sched = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', 'tok', { holdUntil: () => null, teamLimited: () => {} })
+  const sched = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', iso(dir), { holdUntil: () => null, teamLimited: () => {} })
   const v = sched.views()[0]
   store.close()
   return v
@@ -138,7 +142,7 @@ test('summary keeps the last STATUS line even after 10 more lines; restore shows
   const path = join(dir, 'hq.db')
   const store = new Store(path)
   const t: TeamConfig = { id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', 'echo "STATUS: 대본 준비 완료: X"; for i in 1 2 3 4 5 6 7 8 9 10; do echo "log $i"; done; exit 0'], cwd: dir, everyMinutes: 60, enabled: true }
-  const sched = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', 'tok', { holdUntil: () => null, teamLimited: () => {} })
+  const sched = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', iso(dir), { holdUntil: () => null, teamLimited: () => {} })
   assert.equal(sched.runNow('revenue'), true)
   await ended(store, 1)
   const lines = store.lastRun('revenue')!.summary!.split('\n')
@@ -147,7 +151,7 @@ test('summary keeps the last STATUS line even after 10 more lines; restore shows
   assert.equal(lines.at(-1), 'log 10')
   store.close()
   const again = new Store(path)
-  const v = new Scheduler([t], again, new Bus(again), 'http://127.0.0.1:1', 'tok', { holdUntil: () => null, teamLimited: () => {} }).views()[0]
+  const v = new Scheduler([t], again, new Bus(again), 'http://127.0.0.1:1', iso(dir), { holdUntil: () => null, teamLimited: () => {} }).views()[0]
   assert.equal(v.state, 'idle'); assert.equal(v.bubble, '대본 준비 완료: X')
   again.close()
 })

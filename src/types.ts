@@ -12,6 +12,8 @@ export interface TeamConfig {
   cwd: string
   everyMinutes: number
   enabled: boolean
+  /** Wall-clock limit per run (default 180); on expiry the run's process group gets SIGTERM, then SIGKILL after 10s. */
+  timeoutMinutes?: number
 }
 
 export interface RunRecord {
