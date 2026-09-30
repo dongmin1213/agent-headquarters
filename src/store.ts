@@ -28,7 +28,7 @@ export interface MergeRow {
 export interface TaskQuestionRow { id: string; task_id: string; attempt_id: string | null; revision: number; question: string; options: string[]; default: string; answer: string | null; created_at: string }
 export interface ApprovalRow extends Approval { revision: number; kind: string; subjectId: string | null; state: string }
 
-const SCHEMA_VERSION = 4
+const SCHEMA_VERSION = 5
 /** Cards fixed to a subject hash never expire (execution.md §12). */
 export const NO_EXPIRY = '9999-12-31T00:00:00.000Z'
 
@@ -119,6 +119,8 @@ export class Store {
       // schema 4 (contract v3): generations, per-block decision revision, reviewer Bash evidence.
       addColumn('tasks', 'generation', 'integer not null default 0'); addColumn('tasks', 'block_count', 'integer not null default 0')
       addColumn('attempts', 'generation', 'integer not null default 0'); addColumn('attempts', 'bash_runs', 'text')
+      // schema 5: team run process identity (adopted after a daemon restart) and the scoped token's hash.
+      addColumn('runs', 'pid', 'integer'); addColumn('runs', 'lstart', 'text'); addColumn('runs', 'token_hash', 'text')
       if (v === 2 || v === 3) this.convertV2Execution()
       this.db.exec(`pragma user_version = ${SCHEMA_VERSION}`)
     })
@@ -162,6 +164,17 @@ export class Store {
   endRun(id: number, exitCode: number, summary: string): void {
     this.db.prepare('update runs set ended_at = ?, exit_code = ?, summary = ? where id = ?')
       .run(new Date().toISOString(), exitCode, summary.slice(0, 2000), id)
+  }
+
+  /** Records the team process (pid, `ps` start time or null) and the sha256 of its scoped API token. */
+  setRunProcess(id: number, pid: number, lstart: string | null, tokenHash: string): void {
+    this.db.prepare('update runs set pid = ?, lstart = ?, token_hash = ? where id = ?').run(pid, lstart, tokenHash, id)
+  }
+
+  runProcess(id: number): { pid: number | null; lstart: string | null; tokenHash: string | null } | null {
+    const r = this.db.prepare('select pid, lstart, token_hash from runs where id = ?').get(id) as Record<string, unknown> | undefined
+    if (!r) return null
+    return { pid: r.pid == null ? null : Number(r.pid), lstart: r.lstart == null ? null : String(r.lstart), tokenHash: r.token_hash == null ? null : String(r.token_hash) }
   }
 
   lastRun(teamId: string): RunRecord | null {
