@@ -125,25 +125,36 @@ export class StreamTail {
   }
 }
 
-/** Bash commands the session really ran, with exit codes from the matching tool_result (§10 tests_run check). */
-export function extractBashRuns(streamPath: string): { command: string; exitCode: number }[] {
+export interface BashRun { command: string; exitCode: number | null }
+
+/**
+ * Bash commands the session really ran (§10). Exit code: `is_error=false` → 0, a result starting with "Exit code N" → N,
+ * anything else (interrupted, backgrounded, other errors) → null = unknown.
+ */
+export function extractBashRuns(streamPath: string): BashRun[] {
   const text = readText(streamPath, 64 * 1024 * 1024) ?? ''
-  const pending = new Map<string, string>()
-  const runs: { command: string; exitCode: number }[] = []
+  const pending = new Map<string, { command: string; background: boolean }>()
+  const runs: BashRun[] = []
   for (const raw of text.split('\n')) {
     if (!raw.trim()) continue
     let line: Record<string, unknown>
     try { line = JSON.parse(raw) } catch { continue }
     if (line?.type === 'assistant') {
-      for (const c of contentOf(line)) if (c.type === 'tool_use' && c.name === 'Bash' && typeof c.id === 'string') pending.set(c.id, String(((c.input ?? {}) as Record<string, unknown>).command ?? ''))
+      for (const c of contentOf(line)) if (c.type === 'tool_use' && c.name === 'Bash' && typeof c.id === 'string') {
+        const input = (c.input ?? {}) as Record<string, unknown>
+        pending.set(c.id, { command: String(input.command ?? ''), background: input.run_in_background === true })
+      }
     } else if (line?.type === 'user') {
+      const tur = (line.tool_use_result ?? {}) as Record<string, unknown>
       for (const c of contentOf(line)) {
         if (c.type !== 'tool_result' || typeof c.tool_use_id !== 'string' || !pending.has(c.tool_use_id)) continue
-        const command = pending.get(c.tool_use_id)!
+        const call = pending.get(c.tool_use_id)!
         pending.delete(c.tool_use_id)
-        // Claude Code reports a non-zero exit as an error result starting "Exit code N".
-        const m = /Exit code (\d+)/.exec(resultText(c))
-        runs.push({ command, exitCode: c.is_error === true ? (m ? Number(m[1]) : 1) : 0 })
+        let exitCode: number | null
+        if (call.background || tur.interrupted === true) exitCode = null
+        else if (c.is_error !== true) exitCode = 0
+        else { const m = /^Exit code (\d+)/.exec(resultText(c).trimStart()); exitCode = m ? Number(m[1]) : null }
+        runs.push({ command: call.command, exitCode })
       }
     }
   }

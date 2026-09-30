@@ -3,7 +3,6 @@ import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { QUESTIONS_SCHEMA, runJsonTurn, TASK_SCHEMA, type CeoQuestion, type PlanTask, type Project } from '../ceo.ts'
-import { normPath } from './contract.ts'
 
 export const REVISE_SCHEMA = {
   type: 'object', additionalProperties: false, required: ['revised_task', 'questions'],
@@ -40,13 +39,13 @@ export async function runReviseTurn(i: ReviseInput): Promise<ReviseTurn> {
   return { ok: true, output: out, error: null, limited: false, costUsd: t.costUsd }
 }
 
-/** §10a: same key/project/role, owns a subset of the original, identical set of check commands. */
+/** §10a (v3): applied automatically only when nothing but `brief` and `title` changed; everything else needs the chairman. */
 export function canAutoApply(orig: PlanTask, rev: PlanTask): boolean {
-  if (orig.id !== rev.id || orig.project !== rev.project || orig.role !== rev.role) return false
-  const owns = new Set(orig.owns.map(normPath))
-  if (!rev.owns.every((o) => owns.has(normPath(o)))) return false
-  const checks = (t: PlanTask) => [...new Set(t.acceptance.map((a) => a.check.trim()))].sort().join('\n')
-  return checks(orig) === checks(rev)
+  const canon = (v: unknown): string => Array.isArray(v) ? `[${v.map(canon).join(',')}]`
+    : v && typeof v === 'object' ? `{${Object.keys(v).filter((k) => (v as Record<string, unknown>)[k] !== undefined).sort().map((k) => `${JSON.stringify(k)}:${canon((v as Record<string, unknown>)[k])}`).join(',')}}`
+    : JSON.stringify(v)
+  const rest = (t: PlanTask) => canon({ ...t, brief: undefined, title: undefined })
+  return rest(orig) === rest(rev)
 }
 
 /** Human-readable before/after for the revise card. */

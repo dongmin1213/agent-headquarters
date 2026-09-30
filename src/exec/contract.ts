@@ -1,7 +1,7 @@
 // Completion judgement for a work attempt (execution.md §8). judgeWork() is pure; the helpers gather its inputs.
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs'
 import { join, matchesGlob } from 'node:path'
-import { changedFiles, git, hasMergeCommits, isAncestor, revParse, statusPorcelain } from './git.ts'
+import { mirrorChanged, mirrorHasMerges, mirrorIsAncestor } from './repos.ts'
 
 export interface WorkerQuestion { question: string; options: string[]; default: string }
 export interface DoneJson {
@@ -16,9 +16,11 @@ export interface DoneJson {
 export type WorkOutcome = 'succeeded' | 'failed' | 'brief_blocked' | 'question' | 'limited' | 'transient' | 'runaway' | 'unverifiable'
 
 export interface GitFacts {
+  /** implement: the fetched `hq-work` tip in the mirror; collect: HEAD of the read-only worktree. */
   head: string | null
   /** `git diff --name-only --no-renames base HEAD` (a rename lists both paths). */
   changed: string[]
+  /** collect only; implement results are fetched commits, so uncommitted edits simply are not part of them (§6.1). */
   status: string
   baseIsAncestor: boolean
   hasMerges: boolean
@@ -44,7 +46,7 @@ export interface WorkFacts {
   git: GitFacts | null
 }
 
-export interface Judgement { outcome: WorkOutcome; reasons: string[]; done: DoneJson | null; protectedChanges: string[] }
+export interface Judgement { outcome: WorkOutcome; reasons: string[]; done: DoneJson | null; protectedChanges: string[]; login?: boolean }
 
 export const DONE_MAX = 64 * 1024
 export const REPORT_MAX = 1024 * 1024
@@ -127,11 +129,19 @@ export function reportProblem(report: string | null): string | null {
   return n >= 200 ? null : `report.md 요약이 ${n}자 (200자 이상 필요)`
 }
 
+/** "Not logged in" stops every start until the chairman re-checks (§13); it is not a task failure. */
+export function isNotLoggedIn(result: Record<string, unknown> | null, stderr = ''): boolean {
+  const text = `${result?.is_error === true ? String(result.result ?? '') : ''}\n${result ? '' : stderr}`
+  return /Not logged in/i.test(text)
+}
+
 export function judgeWork(f: WorkFacts): Judgement {
   const j = (outcome: WorkOutcome, reasons: string[], done: DoneJson | null = null, prot: string[] = []): Judgement => ({ outcome, reasons, done, protectedChanges: prot })
+  // hq's own kill wins over any earlier limit event in the same stream (§13).
+  if (f.runaway) return j('runaway', ['폭주 감시로 중단됨'])
+  if (isNotLoggedIn(f.result, f.stderr)) return { ...j('limited', ['Claude 로그인 필요']), login: true }
   if (isLimited(f.result, f.stderr, f.rejectedSeen)) return j('limited', ['사용 한도'])
   if (isTransient(f.result)) return j('transient', [`일시 오류 (API ${String(f.result!.api_error_status)})`])
-  if (f.runaway) return j('runaway', ['폭주 감시로 중단됨'])
   if (f.result?.subtype === 'error_max_turns') return j('failed', ['턴 상한 도달'])
   const { done, problem } = parseDone(f.doneRaw, f.token)
   if (!done) return j('unverifiable', [problem!])
@@ -141,7 +151,7 @@ export function judgeWork(f: WorkFacts): Judgement {
 
   const reasons: string[] = []
   const g = f.git
-  if (!g || !g.head) return j('failed', ['작업 폴더 상태를 확인할 수 없음'], done)
+  if (!g || !g.head) return j('failed', [f.role === 'implement' ? '작업 결과(hq-work 브랜치)를 가져올 수 없음' : '작업 폴더 상태를 확인할 수 없음'], done)
   if (f.role === 'collect') {
     if (g.status || g.head !== f.base) reasons.push('읽기 전용 작업인데 작업 폴더가 바뀜')
     const rp = reportProblem(f.report)
@@ -158,7 +168,6 @@ export function judgeWork(f: WorkFacts): Judgement {
   if (!actual.size) reasons.push('base 이후 변경된 파일이 없음')
   const outside = g.changed.filter((x) => !ownsMatch(x, f.owns))
   if (outside.length) reasons.push(`owns 밖 변경: ${outside.slice(0, 10).join(', ')}`)
-  if (g.status) reasons.push(`작업 트리가 깨끗하지 않음: ${g.status.split('\n').slice(0, 5).join('; ')}`)
   if (!g.baseIsAncestor) reasons.push('HEAD가 base의 자손이 아님')
   if (g.hasMerges) reasons.push('base 이후 merge 커밋이 있음')
   const rp = reportProblem(f.report)
@@ -166,12 +175,11 @@ export function judgeWork(f: WorkFacts): Judgement {
   return j(reasons.length ? 'failed' : 'succeeded', reasons, done, protectedChanges(g.changed, f.protectedPaths))
 }
 
-export async function collectGitFacts(worktree: string, base: string): Promise<GitFacts | null> {
+/** Git facts of a fetched work result, computed in the mirror only (§6.1, §8.8). */
+export async function mirrorFacts(mirror: string, base: string, head: string | null): Promise<GitFacts | null> {
+  if (!head) return { head: null, changed: [], status: '', baseIsAncestor: false, hasMerges: false }
   try {
-    const head = await revParse(worktree)
-    if (!head) return null
-    const baseIsAncestor = await isAncestor(worktree, base, head)
-    return { head, changed: head === base ? [] : await changedFiles(worktree, base, head), status: await statusPorcelain(worktree), baseIsAncestor,
-      hasMerges: baseIsAncestor ? await hasMergeCommits(worktree, base, head) : (await git(worktree, ['rev-list', '--merges', '-n1', head, `^${base}`])).stdout.trim().length > 0 }
+    const baseIsAncestor = await mirrorIsAncestor(mirror, base, head)
+    return { head, changed: await mirrorChanged(mirror, base, head), status: '', baseIsAncestor, hasMerges: baseIsAncestor ? await mirrorHasMerges(mirror, base, head) : true }
   } catch { return null }
 }
