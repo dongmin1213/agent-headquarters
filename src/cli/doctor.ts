@@ -1,6 +1,7 @@
 // `hq doctor`: environment checks, each with a one-line fix. Probes are injectable for tests.
 import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { homedir } from 'node:os'
+import { basename, dirname, join, resolve } from 'node:path'
 import { loadConfig } from '../config.ts'
 import { probeHq, tokenMismatchMsg, type HqProbe } from './api.ts'
 import { pidCommand, readLock, readLockPid } from './daemon.ts'
@@ -188,7 +189,10 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
   let teamList: unknown = null
   try { if (teamsFile) teamList = JSON.parse(readFileSync(teamsFile, 'utf8')) } catch { /* the daemon reports a broken file itself */ }
   if (Array.isArray(teamList)) {
-    for (const t of teamList as { id?: unknown; name?: unknown; sandbox?: unknown }[]) {
+    for (const t of teamList as { id?: unknown; name?: unknown; cwd?: unknown; sandbox?: unknown }[]) {
+      const risky = riskySandboxPaths(t, ctx.root)
+      if (risky.length) add(`team-sandbox-risky:${String(t.id ?? '?')}`, `팀 ${String(t.name ?? t.id ?? '?')}`, 'warn', `샌드박스 설정이 민감한 경로를 열어요 (${risky.join(', ')})`,
+        'config/teams.json에서 이 팀의 sandbox readable·writable을 꼭 필요한 하위 폴더나 파일로 좁혀 주세요 (docs/SETUP.md "반복 팀")')
       if (t?.sandbox !== 'none') continue
       add(`team-sandbox:${String(t.id ?? '?')}`, `팀 ${String(t.name ?? t.id ?? '?')}`, 'warn', '샌드박스 없이 실행돼요 (config/teams.json sandbox: "none")',
         'config/teams.json에서 이 팀의 "sandbox": "none"을 지우면 작업자와 같은 격리 안에서 실행돼요. 더 필요한 경로는 "sandbox": {"readable": [...], "writable": [...]}로 허용하세요 (docs/SETUP.md "반복 팀")')
@@ -300,4 +304,31 @@ export function printDoctor(ctx: Ctx, checks: Check[], json: boolean): number {
 
 export async function doctorCommand(ctx: Ctx, opts: { json: boolean; probes?: Probes }): Promise<number> {
   return printDoctor(ctx, await runDoctor(ctx, opts.probes ?? realProbes(ctx)), opts.json)
+}
+
+/**
+ * ~ paths a team sandbox should not open as a whole: the home folder, ~/Library, ~/.config, LaunchAgents, shell rc files,
+ * ~/.claude and ~/.codex. A configured path warns when it is one of them or contains one (e.g. "/" or ~), or sits inside
+ * LaunchAgents or ~/.codex.
+ */
+export function riskySandboxPaths(t: { cwd?: unknown; sandbox?: unknown } | null, root: string, home = homedir()): string[] {
+  const sb = t?.sandbox
+  if (!sb || typeof sb !== 'object' || Array.isArray(sb)) return []
+  const tilde = (p: string) => p.replace(/^~(?=\/|$)/, home)
+  const cwd = resolve(root, tilde(typeof t?.cwd === 'string' ? t.cwd : '.'))
+  const h = resolve(home)
+  const exact = ['', 'Library', '.config', 'Library/LaunchAgents', '.zshrc', '.bashrc', '.zprofile', '.profile', '.claude', '.codex'].map((p) => resolve(h, p))
+  const within = ['Library/LaunchAgents', '.codex'].map((p) => resolve(h, p))
+  const inside = (p: string, dir: string) => p === dir || p.startsWith(dir === '/' ? '/' : `${dir}/`)
+  const out: string[] = []
+  for (const key of ['readable', 'writable']) {
+    const list = (sb as Record<string, unknown>)[key]
+    if (!Array.isArray(list)) continue
+    for (const raw of list) {
+      if (typeof raw !== 'string' || !raw) continue
+      const p = resolve(cwd, tilde(raw))
+      if (exact.some((r) => inside(r, p)) || within.some((w) => inside(p, w))) if (!out.includes(raw)) out.push(raw)
+    }
+  }
+  return out
 }
