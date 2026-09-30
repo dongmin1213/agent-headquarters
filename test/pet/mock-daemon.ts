@@ -24,6 +24,11 @@ function decision(p: Partial<DecisionItem> & Pick<DecisionItem, 'kind' | 'id' | 
 
 // v2 ids are URL-safe: request req-xxxxxxxx, task <req>.<key>, attempt <task>~a<n> / ~r<n>.
 const decisions: DecisionItem[] = [
+  // System card (no project/task): Claude CLI is not logged in. Kind is whatever the daemon sends; the pet must render it.
+  decision({ kind: 'system' as DecisionItem['kind'], id: 'system:login', requestId: '', title: 'Claude CLI 로그인이 필요해요',
+    situation: '작업자를 띄우려는데 Claude CLI가 로그인되어 있지 않아요. 터미널에서 claude 를 열어 로그인한 뒤 눌러 주세요.',
+    cause: 'claude -p 결과가 "Not logged in"이었어요', causeConfirmed: true, detailPath: null,
+    options: ['다시 확인'], subjectHash: 'h-login', optionHelp: { '다시 확인': '멈춘 시작을 풀고 다음 시작에서 로그인을 다시 확인해요' } }),
   decision({ kind: 'plan', id: 'plan:req-a1b2c3d4', requestId: 'req-a1b2c3d4', title: 'hq · 로그인 화면 다듬기 — 계획 승인',
     detail: '작업 2개', situation: '사장이 작업 2개로 계획을 세웠어요: 폼 검증(sonnet), 오류 문구(haiku). 검사 명령은 npm test -- login 이에요.',
     options: ['승인', '반려'], subjectHash: 'h-plan',
@@ -42,9 +47,9 @@ const decisions: DecisionItem[] = [
     title: 'hq · 성능 측정 — 작업이 멈췄어요', detail: '3번 실패',
     situation: '성능 측정 작업이 3번 모두 검사에서 실패했어요. 벤치마크가 제한 시간 15분을 넘겼어요.',
     cause: '벤치마크가 전체 데이터(20만 건)를 매번 새로 만들어서 느려요', causeConfirmed: false,
-    recommendation: { option: 'retry', reason: '최상위 모델이면 데이터를 한 번만 만들도록 고칠 가능성이 커요' },
+    recommendation: { option: 'retry', reason: '타임아웃은 일시적인 부하 때문일 수 있어요' },
     options: ['retry', 'skip', 'stop'],
-    optionHelp: { retry: '같은 작업을 최상위 모델로 한 번 더 해요 · 사용량이 들어요',
+    optionHelp: { retry: '같은 작업을 같은 모델로 한 번 더 해요 · 사용량이 들어요',
       skip: '이 작업과 여기에 의존하는 작업을 빼고 계속해요 · 나중에 새 요청으로 다시 할 수 있어요',
       stop: '요청 전체를 멈춰요 · 만든 브랜치는 남겨 둬요' } }),
   decision({ kind: 'integration', id: 'integration:req-search01:hq', requestId: 'req-search01', title: 'hq · 검색 기능 추가 — 통합 실패',
@@ -66,7 +71,7 @@ const snapshot: Snapshot = {
   projects: [{ id: 'hq', name: 'agent-headquarters' }, { id: 'blog', name: 'blog' }],
   limit: { blockedUntil: null },
   decisions,
-  headline: { text: `회장님 결정 ${decisions.length}건: 계획 승인 — 로그인 화면 다듬기`, needsYou: decisions.length },
+  headline: { text: `회장님 결정 ${decisions.length}건: Claude CLI 로그인이 필요해요`, needsYou: decisions.length },
   quota: {
     windows: [
       { name: 'five_hour', utilization: 0.42, resetsAt: iso(2 * 3600_000), status: 'allowed' },
@@ -134,7 +139,7 @@ createServer((req, res) => {
       console.log(`POST ${url.pathname} ${body}`)
       if (url.pathname === '/api/ui-code') return send(200, { url: `http://127.0.0.1:${port}/ui/#code=mock` })
       // Stale revision → 409 with a Korean reason, so the pet's inline error path can be exercised.
-      if (url.pathname.endsWith('/decide')) return send(409, { error: '이미 다른 결정이 반영됐어요 (revision 불일치)' })
+      if (url.pathname.endsWith('/decide') || url.pathname.endsWith('/reject')) return send(409, { error: '이미 다른 결정이 반영됐어요 (revision 불일치)' })
       send(200, { ok: true })
     })
     return

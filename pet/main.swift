@@ -340,7 +340,7 @@ final class BarView: NSView {
 final class FlippedView: NSView { override var isFlipped: Bool { true } }
 
 // MARK: - Overlay window + controller
-@MainActor final class Pet: NSObject, NSPopoverDelegate {
+@MainActor final class Pet: NSObject, NSPopoverDelegate, NSTextFieldDelegate {
     let panel: NSPanel
     var critters: [String: Critter] = [:]
     var lastActive: [String: Date] = [:]
@@ -527,7 +527,14 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
             if let target { DispatchQueue.main.async {
                 if target.kind == .ceo { self.showCeo(for: target, tab: env["HQ_TAB"].flatMap { Int($0) }, focusTask: env["HQ_FOCUS"]) }
                 else { self.showDetail(for: target) }
-                if let kind = env["HQ_PRESS"], let i = self.shownDecisions.firstIndex(where: { $0.kind == kind }) {
+                if let reason = env["HQ_REJECT"], let i = self.shownDecisions.firstIndex(where: { $0.kind == "accept" }), let f = self.rejectFields[i] {
+                    // HQ_REJECT=<reason>: open 반려 on the accept card, type the reason, press 반려 보내기.
+                    let b = NSButton(); b.identifier = NSUserInterfaceItemIdentifier("\(i)"); self.rejectOpen(b)
+                    let before = self.rejectSends[i]?.isEnabled ?? true
+                    f.stringValue = reason; self.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: f))
+                    log("reject send enabled: empty=\(before) typed=\(self.rejectSends[i]?.isEnabled ?? false)")
+                    self.rejectSend(b)
+                } else                 if let kind = env["HQ_PRESS"], let i = self.shownDecisions.firstIndex(where: { $0.kind == kind }) {
                     let b = NSButton(); b.identifier = NSUserInterfaceItemIdentifier("\(i)\u{1F}0"); self.decisionButton(b)
                 } else if target.kind == .ceo {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { self.snapshotPopover() }
@@ -911,6 +918,8 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     var requestInput: NSTextView?
     var projectPicker: NSPopUpButton?
     var rejectFields: [Int: NSTextField] = [:]
+    var rejectSends: [Int: NSButton] = [:]
+    var rejectRows: [Int: NSView] = [:]
     var shownDecisions: [DecisionItem] = []
     var decisionErrors: [Int: NSTextField] = [:]
     var ceoTab = 0
@@ -958,7 +967,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     /// 내 차례: one card per DecisionItem in the daemon's order.
     func decisionsBody() -> NSStackView {
         let items = offline ? [] : (snapshot?.decisions ?? [])
-        shownDecisions = items; decisionErrors = [:]; rejectFields = [:]; cardViews = [:]
+        shownDecisions = items; decisionErrors = [:]; rejectFields = [:]; rejectSends = [:]; rejectRows = [:]; cardViews = [:]
         let body = vstack(spacing: 12)
         if items.isEmpty { body.addArrangedSubview(text("지금 하실 결정은 없어요.", color: Palette.muted)); return body }
         for (i, d) in items.enumerated() {
@@ -991,9 +1000,13 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
                 card.addArrangedSubview(freeField("직접 답하기 (엔터)", #selector(decisionFree(_:)), "\(i)"))
             }
             if d.kind == "accept" {
-                let reason = freeField("반려 사유 (엔터로 반려)", #selector(rejectSubmit(_:)), "\(i)")
-                reason.isHidden = true; rejectFields[i] = reason
-                card.addArrangedSubview(reason)
+                // 반려 never decides the accept approval: it posts /reject with a required reason (§12).
+                let reason = freeField("반려 사유 (필수)", #selector(rejectSubmit(_:)), "\(i)", width: Pet.cardText - 100)
+                reason.delegate = self; rejectFields[i] = reason
+                let send = button("반려 보내기", #selector(rejectSend(_:)), "\(i)"); send.isEnabled = false
+                rejectSends[i] = send
+                let r = row([reason, send]); r.isHidden = true; rejectRows[i] = r
+                card.addArrangedSubview(r)
             }
             let err = text("", size: 12.5, weight: .medium, color: .systemRed, width: Pet.cardText); err.isHidden = true; decisionErrors[i] = err
             card.addArrangedSubview(err)
@@ -1080,7 +1093,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         post("api/requests", body: ["text": text, "project": project]); popover?.close()
     }
     /// Blocked-card options are the wire values retry | skip | stop; labels are fixed here.
-    static let blockedLabels = ["retry": "한 번 더 (최상위 모델)", "skip": "이 작업 건너뛰기", "stop": "요청 중단"]
+    static let blockedLabels = ["retry": "한 번 더", "skip": "이 작업 건너뛰기", "stop": "요청 중단"]
 
     func decisionAt(_ v: NSView) -> (Int, DecisionItem, String?)? {
         guard !offline, let raw = v.identifier?.rawValue else { return nil }
@@ -1114,14 +1127,23 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         }
     }
     @objc func rejectOpen(_ b: NSButton) {
-        guard let (i, _, _) = decisionAt(b), let f = rejectFields[i] else { return }
-        f.isHidden = false; relayoutPopover()
+        guard let (i, _, _) = decisionAt(b), let r = rejectRows[i], let f = rejectFields[i] else { return }
+        r.isHidden = false; relayoutPopover()
         f.window?.makeFirstResponder(f)
+    }
+    /// The send button stays disabled until a reason is typed.
+    func controlTextDidChange(_ n: Notification) {
+        guard let f = n.object as? NSTextField, let i = f.identifier.flatMap({ Int($0.rawValue) }), rejectFields[i] === f else { return }
+        rejectSends[i]?.isEnabled = !offline && !f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    @objc func rejectSend(_ b: NSButton) {
+        guard let (i, _, _) = decisionAt(b), let f = rejectFields[i] else { return }
+        rejectSubmit(f)
     }
     @objc func rejectSubmit(_ f: NSTextField) {
         let reason = f.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !reason.isEmpty, let (i, d, _) = decisionAt(f) else { return }
-        post("api/requests/\(seg(d.requestId ?? ""))/reject", body: ["reason": reason], decision: i)
+        post("api/requests/\(seg(d.requestId ?? ""))/reject", body: ["reason": reason, "subjectHash": d.subjectHash ?? ""], decision: i)
     }
     @objc func decide(_ b: NSButton) {   // team approvals (team popover)
         guard let p = parts(b, 3) else { return }
