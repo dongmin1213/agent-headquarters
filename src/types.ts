@@ -146,7 +146,7 @@ export interface Headline { text: string; needsYou: number }
 
 /** Everything the chairman can act on, in display order (see execution.md §17). */
 export interface DecisionItem {
-  kind: 'plan' | 'ceo_question' | 'worker_question' | 'revise' | 'blocked' | 'integration' | 'accept' | 'merge'
+  kind: 'system' | 'plan' | 'ceo_question' | 'worker_question' | 'revise' | 'blocked' | 'integration' | 'accept' | 'merge'
   /** Stable id: approval id, question id, or task id. Notifications dedupe on id + revision. */
   id: string
   revision: number

@@ -1218,7 +1218,7 @@ export class Runner {
 
   // ----- notifications (§17: once per decision id + revision) -----
   private notifyDecisions(): void {
-    const titles: Record<DecisionItem['kind'], string> = { plan: '사장이 계획을 올렸어요', ceo_question: '사장이 질문했어요', worker_question: '작업자가 질문했어요',
+    const titles: Record<DecisionItem['kind'], string> = { system: 'hq가 멈췄어요 — 확인이 필요해요', plan: '사장이 계획을 올렸어요', ceo_question: '사장이 질문했어요', worker_question: '작업자가 질문했어요',
       revise: '지시서 수정안 승인이 필요해요', blocked: '작업이 막혔어요 — 판단이 필요해요', integration: '통합에 실패했어요', accept: '결과 수락을 기다려요', merge: '병합 승인을 기다려요' }
     for (const d of decisionItems(this.store, this.now())) {
       const k = `notified:${d.id}:${d.revision}`
