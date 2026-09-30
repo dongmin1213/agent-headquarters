@@ -14,7 +14,8 @@ import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../sto
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
 import { baseline, checksProfile, runChecks, runSandboxed, type CheckSpec, type ChecksFile } from './checks.ts'
 import { collectGitFacts, DONE_MAX, isLimited, judgeWork, readOut, REPORT_MAX, type WorkOutcome } from './contract.ts'
-import { buildHeadline, decisionItems, hqDirOf, outDirOf, workerViews } from './decisions.ts'
+import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, outDirOf, workerViews } from './decisions.ts'
+import { runDiagnoseTurn } from './diagnose.ts'
 import { atomicJson, atomicWrite, readJson, readText, sha256 } from './fsx.ts'
 import { addDetachedWorktree, branchExists, changedFiles, currentBranch, ensureWorktree, git, gitCommonDir, gitOk, isRepo, mergeHeads,
   removeWorktree, resetClean, revParse, statusPorcelain, withRepo, worktreeDirtySnapshot } from './git.ts'
@@ -90,6 +91,7 @@ export class Runner {
   readonly checking = new Set<string>()
   private integrating = new Set<string>()
   private revising = new Set<string>()
+  private diagnosing = new Set<string>()
   private gitDirs = new Map<string, string | null>()
   private ticking = false
   private again = false
@@ -113,7 +115,17 @@ export class Runner {
   }
 
   /** Stops ticking only; worker processes keep running and are re-adopted on the next start (§F). */
-  stop(): void { if (this.timer) clearInterval(this.timer); this.timer = null }
+  stop(): void { if (this.timer) clearInterval(this.timer); this.timer = null; this.stopped = true }
+
+  private stopped = false
+  private jobs = new Set<Promise<unknown>>()
+  /** Runs a background job and remembers it so shutdown (and tests) can wait for it. */
+  private bg(p: Promise<unknown>): void {
+    const j = p.catch((e) => console.error('[hq runner] job', e)).finally(() => { this.jobs.delete(j); this.kick() })
+    this.jobs.add(j)
+  }
+  /** Resolves when no background job (launch, checks, integration, CEO turn) is running. */
+  async drain(): Promise<void> { while (this.jobs.size) await Promise.allSettled([...this.jobs]) }
 
   recover(): Promise<void> { return recoverState(this) }
 
@@ -196,6 +208,7 @@ export class Runner {
   kick(): void { void this.tick() }
 
   async tick(): Promise<void> {
+    if (this.stopped) return
     if (this.ticking) { this.again = true; return }
     this.ticking = true
     try {
@@ -207,6 +220,7 @@ export class Runner {
         await this.step('dispatch', () => this.dispatch())
         await this.step('complete', () => this.completeRequests())
         await this.step('revise', () => this.reviseOne())
+        await this.step('diagnose', () => this.diagnoseOne())
         await this.step('notify', () => this.notifyDecisions())
         if (this.now() - this.lastReconcile >= RECONCILE_MS) { this.lastReconcile = this.now(); await this.step('reconcile', () => this.reconcile()) }
       } while (this.again)
@@ -367,7 +381,7 @@ export class Runner {
 
   /** Circuit break: the chairman decides (§9). Call inside a tx. */
   block(t: TaskRow, reason: string): void {
-    this.store.updateTask(t.id, { status: 'blocked', note: reason.slice(0, 2000) })
+    this.store.updateTask(t.id, { status: 'blocked', note: reason.slice(0, 2000), diagnosis: null })
     const r = this.store.request(t.request_id)
     if (r && r.status === 'executing') this.store.updateRequest(r.id, { status: 'blocked', note: `작업 ${t.title} 판단 필요` })
     this.emitTask(t, `작업 차단: ${t.title}`)
@@ -388,7 +402,7 @@ export class Runner {
       const sameProjectDep = specOf(d).depends_on.some((k) => all.find((x) => x.key === k)?.project === d.project)
       this.store.updateTask(d.id, { status: 'pending', attempts: 0, head_sha: null, worktree: null, base_sha: sameProjectDep ? null : d.base_sha, limited_streak: 0,
         review_invalid: 0, resume_session: null, checks_state: null, report_sha: null, note: `선행 작업 ${t.key}이(가) 바뀌어 처음부터 다시 해요` })
-      if (d.worktree || d.branch) queueMicrotask(() => void this.archiveTask(this.store.task(d.id)!, d.worktree))
+      if (d.worktree || d.branch) { const snap = { ...d }; queueMicrotask(() => this.bg(this.archiveTask(snap, d.worktree))) }
     }
     this.store.supersede(`accept:${t.request_id}`)
     for (const pid of kill) queueMicrotask(() => killGroup(pid, 'SIGTERM'))
@@ -462,7 +476,7 @@ export class Runner {
     })
     if (!claimed) return false
     this.launching.add(id)
-    void this.prepareAndLaunch(id, !!resume, prev ?? null).finally(() => { this.launching.delete(id); this.kick() })
+    this.bg(this.prepareAndLaunch(id, !!resume, prev ?? null).finally(() => this.launching.delete(id)))
     this.emitTask(t, `${t.model}가 ${t.title} 시작`)
     return true
   }
@@ -604,7 +618,7 @@ export class Runner {
     for (const t of this.store.tasksByStatus(['verifying'])) {
       if (this.checking.has(t.id)) continue
       this.checking.add(t.id)
-      void this.verify(t).finally(() => { this.checking.delete(t.id); this.kick() })
+      this.bg(this.verify(t).finally(() => this.checking.delete(t.id)))
     }
   }
 
@@ -645,7 +659,7 @@ export class Runner {
     this.store.insertAttempt({ id, task_id: t.id, kind: 'review', n, model: t.review_model, status: 'starting', attempt_token: randomBytes(16).toString('hex'),
       dir: this.runDir(t.request_id, t.key, id), session_id: randomUUID() })
     this.launching.add(id)
-    void this.launchReview(id).finally(() => { this.launching.delete(id); this.kick() })
+    this.bg(this.launchReview(id).finally(() => this.launching.delete(id)))
     this.emitTask(t, `${t.review_model}가 ${t.title} 검토 시작`)
     return true
   }
@@ -736,7 +750,7 @@ export class Runner {
         const k = `${r.id}:${m.project}`
         if (this.integrating.has(k)) continue
         this.integrating.add(k)
-        void this.runIntegration(r.id, m.project).finally(() => { this.integrating.delete(k); this.kick() })
+        this.bg(this.runIntegration(r.id, m.project).finally(() => this.integrating.delete(k)))
       }
     }
   }
@@ -750,7 +764,7 @@ export class Runner {
     mkdirSync(hq, { recursive: true })
     const target = await currentBranch(project.path)
     const fail = (state: string, note: string, body: string) => this.store.tx(() => {
-      this.store.putMerge(requestId, projectId, { state, note })
+      this.store.putMerge(requestId, projectId, { state, note, diagnosis: null })
       const r = this.store.request(requestId)!
       if (!TERMINAL_REQUEST.has(r.status)) this.store.updateRequest(requestId, { status: 'blocked', note })
       this.store.putApproval({ id: `integration:${requestId}:${projectId}`, teamId: 'hq', subjectId: requestId, title: `통합 실패: ${project.name}`,
@@ -991,7 +1005,7 @@ export class Runner {
       const tasks = this.store.tasks(requestId)
       for (const t of tasks) if (t.status !== 'passed' && t.status !== 'cancelled') this.store.updateTask(t.id, { status: 'cancelled' })
       for (const a of this.store.liveAttempts()) if (tasks.some((t) => t.id === a.task_id)) { this.store.updateAttempt(a.id, { outcome: 'cancelled', reason: '요청 중단' }); if (a.pid) kill.push(a.pid) }
-      for (const a of this.store.openApprovals(Number.MAX_SAFE_INTEGER - 1)) {
+      for (const a of this.store.openApprovals(0)) {
         if (a.id === `plan:${requestId}` || a.id === `accept:${requestId}` || a.id.startsWith(`merge:${requestId}:`) || a.id.startsWith(`integration:${requestId}:`)
           || (a.kind === 'revise' && tasks.some((t) => a.id === `revise:${t.id}`))) this.store.supersede(a.id)
       }
@@ -1076,7 +1090,7 @@ export class Runner {
       && this.store.request(x.request_id)?.status === 'executing')
     if (!t || !this.ceoLock.tryAcquire()) return
     this.revising.add(t.id)
-    void this.runRevise(t).finally(() => { this.revising.delete(t.id); this.ceoLock.release(); this.kick() })
+    this.bg(this.runRevise(t).finally(() => { this.revising.delete(t.id); this.ceoLock.release() }))
   }
 
   private async runRevise(t: TaskRow): Promise<void> {
@@ -1122,6 +1136,74 @@ export class Runner {
       this.emitTask(t, `지시서 수정 적용: ${rev.title} (revision ${t.revision + 1})`)
       this.kick()
       return null
+    })
+  }
+
+  // ----- CEO diagnosis of blocked / integration items (§17) -----
+  private async diagnoseOne(): Promise<void> {
+    if (this.quota().mode === 'hold' || this.ceoLock.busy) return
+    const t = this.store.tasksByStatus(['blocked']).find((x) => x.diagnosis === null && !this.diagnosing.has(x.id))
+    const m = t ? null : this.store.requestsByStatus(['blocked', 'executing', 'accepted']).flatMap((r) => this.store.mergeRows(r.id))
+      .find((x) => ['conflict', 'failed'].includes(x.state) && x.diagnosis === null && !this.diagnosing.has(`${x.request_id}:${x.project}`))
+    if ((!t && !m) || !this.ceoLock.tryAcquire()) return
+    const key = t ? t.id : `${m!.request_id}:${m!.project}`
+    this.diagnosing.add(key)
+    const job = t ? this.diagnoseTask(t) : this.diagnoseIntegration(m!.request_id, m!.project)
+    this.bg(job.finally(() => { this.diagnosing.delete(key); this.ceoLock.release() }))
+  }
+
+  private checksEvidence(file: ChecksFile | null): string {
+    if (!file) return '(검사 기록 없음)'
+    const failed = file.checks.filter((c) => !c.pass)
+    const lines = failed.map((c) => `- [${c.id}] \`${c.command}\` → 종료 코드 ${c.exitCode ?? '시간 초과'}${c.baselineFailed ? ' (base에서도 실패)' : ''}\n\`\`\`\n${c.outputTail.split('\n').slice(-30).join('\n')}\n\`\`\``)
+    if (file.error) lines.unshift(`- 오류: ${file.error}`)
+    if (file.secrets.length) lines.push(`- 비밀값 패턴·금지 파일: ${file.secrets.map((x) => `${x.file}:${x.line} (${x.pattern})`).join(', ')}`)
+    return lines.join('\n') || '(실패한 검사 없음)'
+  }
+
+  private async diagnoseTask(t: TaskRow): Promise<void> {
+    const project = this.project(t.project)!
+    const atts = this.store.attempts(t.id)
+    const lastWork = atts.filter((a) => a.kind === 'work' && existsSync(join(hqDirOf(a), 'checks.json'))).at(-1)
+    const lastBlocking = atts.filter((a) => a.kind === 'review' && a.outcome === 'blocking').at(-1)
+    const verdict = lastBlocking ? readJson<Verdict>(join(hqDirOf(lastBlocking), 'verdict.json')) : null
+    const reportAtt = atts.filter((a) => a.kind === 'work').reverse().find((a) => readOut(outDirOf(a), 'report.md', REPORT_MAX) !== null)
+    const report = reportAtt ? readOut(outDirOf(reportAtt), 'report.md', REPORT_MAX) ?? '' : ''
+    const summary = /^##\s*요약\s*$([\s\S]*?)(?=^##\s|$(?![\s\S]))/m.exec(report)?.[1]?.trim() ?? '(보고서 없음)'
+    const evidence = [
+      { title: '작업 spec (PlanTask JSON)', body: '```json\n' + JSON.stringify(specOf(t), null, 2) + '\n```' },
+      { title: '멈춘 이유 (hq 판정)', body: t.note ?? '' },
+      { title: '시도별 판정', body: atts.map((a) => `- ${a.id} [${a.kind} · ${a.model}] ${a.status}${a.reason ? `: ${a.reason.slice(0, 500)}` : ''}`).join('\n') },
+      { title: '실패한 검사', body: this.checksEvidence(lastWork ? readJson<ChecksFile>(join(hqDirOf(lastWork), 'checks.json')) : null) },
+      { title: '검토 blocking', body: verdict?.blocking.map((b) => `- [${b.id}] ${b.summary} — ${b.evidence}`).join('\n') || '(없음)' },
+      { title: '작업자 보고서 요약', body: summary },
+    ]
+    const res = await runDiagnoseTurn({ claudeBin: this.cfg.claudeBin, hqRoot: this.hqRoot, project, kind: 'blocked', options: BLOCKED_OPTIONS, evidence,
+      onLine: (line) => { if (line.type === 'rate_limit_event') this.observe(line) } })
+    if (res.limited) return // retried after the hold
+    this.store.tx(() => {
+      const cur = this.store.task(t.id)
+      if (cur?.status === 'blocked' && cur.diagnosis === null && cur.updated_at === t.updated_at) this.store.updateTask(t.id, { diagnosis: JSON.stringify(res.result) })
+    })
+  }
+
+  private async diagnoseIntegration(requestId: string, projectId: string): Promise<void> {
+    const project = this.project(projectId)!
+    const m = this.store.mergeRow(requestId, projectId)!
+    const tasks = this.store.tasks(requestId).filter((t) => t.project === projectId && t.role === 'implement' && t.status === 'passed')
+    const checks = readJson<ChecksFile>(join(this.home, 'runs', requestId, `_integration-${projectId}`, 'hq', 'checks.json'))
+    const evidence = [
+      { title: '통합 실패 (hq 판정)', body: m.note ?? '' },
+      { title: '합친 작업', body: tasks.map((t) => `- ${t.key} ${t.title} @ ${t.head_sha}\n  owns: ${specOf(t).owns.join(', ')}`).join('\n') },
+      { title: '실패한 검사', body: m.state === 'failed' ? this.checksEvidence(checks) : '(충돌이라 검사 전)' },
+    ]
+    const options = ['다시 통합', '요청 중단']
+    const res = await runDiagnoseTurn({ claudeBin: this.cfg.claudeBin, hqRoot: this.hqRoot, project, kind: 'integration', options, evidence,
+      onLine: (line) => { if (line.type === 'rate_limit_event') this.observe(line) } })
+    if (res.limited) return
+    this.store.tx(() => {
+      const cur = this.store.mergeRow(requestId, projectId)
+      if (cur && cur.state === m.state && cur.diagnosis === null && cur.updated_at === m.updated_at) this.store.putMerge(requestId, projectId, { diagnosis: JSON.stringify(res.result) })
     })
   }
 

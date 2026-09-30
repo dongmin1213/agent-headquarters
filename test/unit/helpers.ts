@@ -47,7 +47,7 @@ export interface Harness {
   approve(requestId: string): Promise<string | null>
   decide(id: string, decision: string): Promise<string | null>
   waitFor(pred: () => boolean, what?: string, ms?: number): Promise<void>
-  close(): void
+  close(): Promise<void>
 }
 
 export function harness(o: { cfg?: Partial<HqConfig>; repoFiles?: Record<string, string>; setup?: string } = {}): Harness {
@@ -94,7 +94,13 @@ export function harness(o: { cfg?: Partial<HqConfig>; repoFiles?: Record<string,
       const atts = store.raw().prepare('select id, status, reason from attempts').all()
       throw new Error(`timeout waiting for ${what}\ntasks: ${JSON.stringify(dump, null, 1)}\nattempts: ${JSON.stringify(atts, null, 1)}`)
     },
-    close() { runner.stop(); for (const l of runner.live.values()) try { process.kill(-l.pid, 'SIGKILL') } catch { /* gone */ } store.close() },
+    async close() {
+      runner.stop()
+      for (const a of store.liveAttempts()) if (a.pid) try { process.kill(-a.pid, 'SIGKILL') } catch { /* gone */ }
+      for (const l of runner.live.values()) try { process.kill(-l.pid, 'SIGKILL') } catch { /* gone */ }
+      await runner.drain()
+      store.close()
+    },
   }
   return h
 }

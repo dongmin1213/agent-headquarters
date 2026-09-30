@@ -12,7 +12,7 @@ export interface TaskRow {
   review_model: string; spec: string; revision: number; status: string; attempts: number; limited_streak: number
   review_invalid: number; revise_turns: number; branch: string | null; worktree: string | null; base_sha: string | null
   head_sha: string | null; checks_state: string | null; resume_session: string | null; report_sha: string | null
-  note: string | null; updated_at: string
+  diagnosis: string | null; note: string | null; updated_at: string
 }
 export interface AttemptRow {
   id: string; task_id: string; kind: string; n: number; model: string; status: string; session_id: string; pid: number | null
@@ -22,19 +22,19 @@ export interface AttemptRow {
 export interface QuotaRow { window: string; utilization: number | null; resets_at: string | null; status: string | null; observed_at: string }
 export interface MergeRow {
   request_id: string; project: string; target: string | null; target_sha: string | null; integration_sha: string | null
-  state: string; result_sha: string | null; note: string | null; updated_at: string
+  state: string; result_sha: string | null; note: string | null; diagnosis: string | null; updated_at: string
 }
 export interface TaskQuestionRow { id: string; task_id: string; attempt_id: string | null; revision: number; question: string; options: string[]; default: string; answer: string | null; created_at: string }
 export interface ApprovalRow extends Approval { revision: number; kind: string; subjectId: string | null; state: string }
 
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 /** Cards fixed to a subject hash never expire (execution.md §12). */
 export const NO_EXPIRY = '9999-12-31T00:00:00.000Z'
 
 const TASK_COLS = new Set(['title', 'role', 'grade', 'model', 'review_model', 'spec', 'revision', 'status', 'attempts', 'limited_streak', 'review_invalid',
-  'revise_turns', 'branch', 'worktree', 'base_sha', 'head_sha', 'checks_state', 'resume_session', 'report_sha', 'note'])
+  'revise_turns', 'branch', 'worktree', 'base_sha', 'head_sha', 'checks_state', 'resume_session', 'report_sha', 'diagnosis', 'note'])
 const ATTEMPT_COLS = new Set(['model', 'status', 'session_id', 'pid', 'lstart', 'started_at', 'ended_at', 'cost_usd', 'input_tokens', 'output_tokens', 'outcome', 'reason'])
-const MERGE_COLS = new Set(['target', 'target_sha', 'integration_sha', 'state', 'result_sha', 'note'])
+const MERGE_COLS = new Set(['target', 'target_sha', 'integration_sha', 'state', 'result_sha', 'note', 'diagnosis'])
 type Val = string | number | null
 
 const kindOf = (id: string) => (/^(plan|accept|merge|revise|integration|team):/.exec(id)?.[1] ?? 'team')
@@ -88,7 +88,7 @@ export class Store {
           attempts integer not null default 0, limited_streak integer not null default 0,
           review_invalid integer not null default 0, revise_turns integer not null default 0,
           branch text, worktree text, base_sha text, head_sha text, checks_state text, resume_session text, report_sha text,
-          note text, updated_at text not null);
+          diagnosis text, note text, updated_at text not null);
         create index if not exists tasks_request on tasks (request_id);
         create table if not exists attempts (
           id text primary key, task_id text not null, kind text not null, n integer not null, model text not null,
@@ -98,7 +98,7 @@ export class Store {
         create table if not exists quota (window text primary key, utilization real, resets_at text, status text, observed_at text not null);
         create table if not exists merges (
           request_id text not null, project text not null, target text, target_sha text, integration_sha text,
-          state text not null, result_sha text, note text, updated_at text not null, primary key (request_id, project));
+          state text not null, result_sha text, note text, diagnosis text, updated_at text not null, primary key (request_id, project));
         create table if not exists task_questions (
           id text primary key, task_id text not null, attempt_id text, revision integer not null, question text not null,
           options text not null, default_option text not null, answer text, created_at text not null);
@@ -108,6 +108,11 @@ export class Store {
           select id, 0, team_id, case when id like 'plan:%' then 'plan' else 'team' end, null, title, body, options, subject_hash, expires_at, created_at,
             case when decision is null then 'open' else 'decided' end, decision, decided_at from approvals_v1;
           drop table approvals_v1;`)
+      }
+      // v2 → v3: diagnosis columns (execution.md §17 decision explanations).
+      for (const tbl of ['tasks', 'merges']) {
+        const have = (this.db.prepare(`select name from pragma_table_info('${tbl}')`).all() as { name: string }[]).map((c) => c.name)
+        if (!have.includes('diagnosis')) this.db.exec(`alter table ${tbl} add column diagnosis text`)
       }
       this.db.exec(`pragma user_version = ${SCHEMA_VERSION}`)
     })

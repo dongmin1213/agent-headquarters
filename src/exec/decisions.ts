@@ -15,23 +15,93 @@ function approvalRequestId(store: Store, a: ApprovalRow): string {
   return (rest ?? '').split(':')[0]
 }
 
+/** Fixed option texts (execution.md §17). */
+export const OPTION_HELP: Record<string, string> = {
+  retry: '같은 작업을 최상위 모델로 한 번 더 해요 · 사용량이 들어요',
+  skip: '이 작업과 여기에 의존하는 작업을 빼고 계속해요 · 나중에 새 요청으로 다시 할 수 있어요',
+  stop: '요청 전체를 멈춰요 · 만든 브랜치는 남겨 둬요',
+  수락: '통합본을 병합 대기로 넘겨요 · 병합은 따로 승인해요',
+  반려: '사유를 붙여 다시 작업시켜요',
+  병합: '대상 브랜치에 fast-forward로 반영해요',
+  보류: '지금은 병합하지 않고 둬요 · 나중에 다시 제시할 수 있어요',
+}
+const PLAN_HELP = { 승인: '계획대로 작업을 시작해요 · 사용량이 들어요', 반려: '계획을 버리고 이 요청을 끝내요' }
+const REVISE_HELP = { 승인: '고친 지시서로 이 작업을 다시 해요 · 사용량이 들어요', 반려: '수정안을 버리고 이 작업을 멈춤 상태로 둬요 · 다음 결정은 차단 카드에서 해요' }
+const INTEGRATION_HELP = { '다시 통합': '대상 브랜치의 최신 커밋 위에서 합치기와 검사를 다시 해요 · 사용량은 들지 않아요', '요청 중단': OPTION_HELP.stop }
+
+export const detailPath = (requestId: string, taskId: string | null) => `/ui/#request=${encodeURIComponent(requestId)}${taskId ? `&task=${encodeURIComponent(taskId)}` : ''}`
+
+const firstLine = (s: string | null) => (s ?? '').split('\n').find((l) => l.trim())?.trim().slice(0, 300) ?? ''
+
+type Explain = Pick<DecisionItem, 'situation' | 'cause' | 'causeConfirmed' | 'recommendation' | 'optionHelp'>
+
+function answerHelp(options: string[], def: string): Record<string, string> {
+  return Object.fromEntries(options.map((o) => [o, o === def ? '이 답으로 이어서 진행해요 (추천 기본값)' : '이 답으로 이어서 진행해요']))
+}
+
+/** A stored CEO diagnosis if there is a valid one for this occurrence, otherwise hq's own fact sentences. */
+function diagnosed(raw: string | null, options: string[], fallback: Explain): Explain {
+  if (!raw) return fallback
+  try {
+    const s = JSON.parse(raw) as { ok: boolean; d?: { situation: string; cause: string; causeConfirmed: boolean; recommendation: { option: string; reason: string } } }
+    if (!s.ok || !s.d || !options.includes(s.d.recommendation.option)) return fallback
+    return { ...fallback, situation: s.d.situation, cause: s.d.cause, causeConfirmed: s.d.causeConfirmed, recommendation: s.d.recommendation }
+  } catch { return fallback }
+}
+
 export function decisionItems(store: Store, now = Date.now()): DecisionItem[] {
   const items: DecisionItem[] = []
   for (const a of store.openApprovals(now)) {
     if (!['plan', 'revise', 'integration', 'accept', 'merge'].includes(a.kind)) continue
-    items.push({ kind: a.kind as DecisionItem['kind'], id: a.id, revision: a.revision, requestId: approvalRequestId(store, a),
-      taskId: a.kind === 'revise' ? a.id.slice('revise:'.length) : null, title: a.title, detail: a.body, options: a.options, subjectHash: a.subjectHash, createdAt: a.createdAt })
+    const requestId = approvalRequestId(store, a)
+    const taskId = a.kind === 'revise' ? a.id.slice('revise:'.length) : null
+    let ex: Explain
+    if (a.kind === 'plan') {
+      const plan = store.request(requestId)?.plan
+      const n = plan ? (JSON.parse(plan).tasks as unknown[]).length : 0
+      ex = { situation: `사장이 작업 ${n}개짜리 계획을 올렸어요 · 실행할 명령과 범위를 확인해 주세요`, cause: null, causeConfirmed: false, recommendation: null, optionHelp: PLAN_HELP }
+    } else if (a.kind === 'revise') {
+      const t = store.task(taskId!)
+      ex = { situation: `작업자가 ${t?.title ?? '작업'}을(를) 지시서대로 할 수 없다고 멈췄고, 사장이 지시서를 고쳤어요 · 범위나 검사 명령이 바뀌어 승인이 필요해요`,
+        cause: firstLine(t?.note ?? null) || null, causeConfirmed: true, recommendation: null, optionHelp: REVISE_HELP }
+    } else if (a.kind === 'integration') {
+      const project = a.id.split(':')[2]
+      const m = store.mergeRow(requestId, project)
+      ex = diagnosed(m?.diagnosis ?? null, a.options, { situation: `프로젝트 ${project}의 결과를 대상 브랜치 위에 합치다 문제가 생겼어요`,
+        cause: m?.note ?? firstLine(a.body), causeConfirmed: true, recommendation: null, optionHelp: INTEGRATION_HELP })
+    } else if (a.kind === 'accept') {
+      const passed = store.tasks(requestId).filter((t) => t.status === 'passed').length
+      ex = { situation: `작업 ${passed}개가 검사·검토를 통과했어요 · 결과를 확인하고 수락해 주세요`, cause: null, causeConfirmed: false, recommendation: null,
+        optionHelp: { 수락: OPTION_HELP.수락, 반려: OPTION_HELP.반려 } }
+    } else {
+      const project = a.id.split(':')[2]
+      const m = store.mergeRow(requestId, project)
+      const files = store.tasks(requestId).filter((t) => t.project === project && t.role === 'implement' && t.status === 'passed').length
+      ex = { situation: `${m?.target ?? '대상 브랜치'} (${m?.target_sha?.slice(0, 10) ?? '?'})에 작업 ${files}개의 통합본 ${m?.integration_sha?.slice(0, 10) ?? '?'}을(를) 반영할 준비가 됐어요`,
+        cause: m?.note ?? null, causeConfirmed: !!m?.note, recommendation: null, optionHelp: { 병합: OPTION_HELP.병합, 보류: OPTION_HELP.보류 } }
+    }
+    items.push({ kind: a.kind as DecisionItem['kind'], id: a.id, revision: a.revision, requestId, taskId, title: a.title, detail: a.body, ...ex,
+      detailPath: detailPath(requestId, taskId), options: a.options, subjectHash: a.subjectHash, createdAt: a.createdAt })
   }
   for (const r of store.requestsByStatus(['asking'])) for (const q of store.questions(r.id)) {
     if (q.answer !== null) continue
-    items.push({ kind: 'ceo_question', id: q.id, revision: 0, requestId: r.id, taskId: null, title: q.question, detail: q.reason, options: q.options, subjectHash: null, createdAt: r.updated_at })
+    items.push({ kind: 'ceo_question', id: q.id, revision: 0, requestId: r.id, taskId: null, title: q.question, detail: q.reason,
+      situation: `사장이 계획을 세우기 전에 물어볼 게 있어요: ${q.question}`, cause: q.reason, causeConfirmed: false,
+      recommendation: q.options.includes(q.default) ? { option: q.default, reason: '사장이 추천한 기본값이에요' } : null, optionHelp: answerHelp(q.options, q.default),
+      detailPath: detailPath(r.id, null), options: q.options, subjectHash: null, createdAt: r.updated_at })
   }
   for (const t of store.tasksByStatus(['question'])) for (const q of store.taskQuestions(t.id)) {
     if (q.answer !== null || q.revision !== t.revision) continue
-    items.push({ kind: 'worker_question', id: q.id, revision: t.revision, requestId: t.request_id, taskId: t.id, title: `${t.title}: ${q.question}`, detail: `기본값: ${q.default}`, options: q.options, subjectHash: null, createdAt: q.created_at })
+    items.push({ kind: 'worker_question', id: q.id, revision: t.revision, requestId: t.request_id, taskId: t.id, title: `${t.title}: ${q.question}`, detail: `기본값: ${q.default}`,
+      situation: `작업자가 ${t.title}을(를) 하다가 물어볼 게 있어요: ${q.question}`, cause: firstLine(t.note) || null, causeConfirmed: false,
+      recommendation: q.options.includes(q.default) ? { option: q.default, reason: '작업자가 제안한 기본값이에요' } : null, optionHelp: answerHelp(q.options, q.default),
+      detailPath: detailPath(t.request_id, t.id), options: q.options, subjectHash: null, createdAt: q.created_at })
   }
   for (const t of store.tasksByStatus(['blocked'])) {
-    items.push({ kind: 'blocked', id: t.id, revision: t.revision, requestId: t.request_id, taskId: t.id, title: `작업 ${t.title}이(가) 막혔어요`, detail: t.note ?? '', options: BLOCKED_OPTIONS, subjectHash: null, createdAt: t.updated_at })
+    const ex = diagnosed(t.diagnosis, BLOCKED_OPTIONS, { situation: `작업 ${t.title}이(가) 멈췄어요 · 어떻게 할지 정해 주세요`, cause: t.note, causeConfirmed: true, recommendation: null,
+      optionHelp: { retry: OPTION_HELP.retry, skip: OPTION_HELP.skip, stop: OPTION_HELP.stop } })
+    items.push({ kind: 'blocked', id: t.id, revision: t.revision, requestId: t.request_id, taskId: t.id, title: `작업 ${t.title}이(가) 막혔어요`, detail: t.note ?? '', ...ex,
+      detailPath: detailPath(t.request_id, t.id), options: BLOCKED_OPTIONS, subjectHash: null, createdAt: t.updated_at })
   }
   return items.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || a.createdAt.localeCompare(b.createdAt))
 }

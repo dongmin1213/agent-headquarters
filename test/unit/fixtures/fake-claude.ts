@@ -67,6 +67,15 @@ if (schema && prompt.includes('## 이번 턴: 지시서 수정')) {
   process.exit(0)
 }
 
+if (schema && prompt.includes('## 이번 턴: 진단')) {
+  const opts = /recommendation\.option: 다음 중 정확히 하나 \(([^)]*)\)/.exec(prompt)?.[1].split(', ') ?? ['retry']
+  const mode = mk('diag') ?? 'ok'
+  if (mode === 'fail') { emit({ type: 'result', subtype: 'error', is_error: true, session_id: sid, result: 'boom', usage: {} }); process.exit(1) }
+  result({ structured_output: { situation: '가짜 진단: 검사가 계속 실패했어요', cause: '검사 명령이 새 파일을 거부해요', causeConfirmed: true,
+    recommendation: { option: mode === 'badoption' ? 'maybe-later' : opts[opts.length > 1 ? 1 : 0], reason: '가짜 추천 이유' } } })
+  process.exit(0)
+}
+
 if (schema) { // CEO planning turn
   result({ structured_output: { questions: [{ question: '범위?', options: ['작게', '크게'], default: '작게', reason: '테스트' }], plan: null } })
   process.exit(0)
