@@ -243,7 +243,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
 
   // ---------- helpers ----------
   const allTasks = () => [...details.values()].flat()
-  /** The daemon builds this list (execution.md §17); the mock mirrors its order: plan → ceo_question → worker_question → revise → blocked → integration → accept → merge. */
+  /** The daemon builds this list (execution.md §17); the mock mirrors its order: plan → ceo_question → worker_question → revise → blocked → integration → accept → merge → team. */
   type Explain = Pick<DecisionItem, 'situation' | 'cause' | 'causeConfirmed' | 'recommendation' | 'optionHelp' | 'detailPath'>
   const HELP: Record<string, string> = {
     retry: '같은 작업을 같은 모델로 한 번 더 해요 · 사용량이 들어요',
@@ -302,7 +302,18 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
       kind: 'blocked' as const, id: t.id, revision: t.revision, requestId: t.requestId, taskId: t.id, title: `작업이 막혔어요: ${t.title}`, detail: t.note ?? '',
       ...explain(t.id, t.requestId, t.id, ['retry', 'skip', 'stop']), options: ['retry', 'skip', 'stop'], subjectHash: null, createdAt: t.updatedAt }))
     return [...fromApproval('plan:', 'plan'), ...ceoQ, ...workerQ, ...fromApproval('revise:', 'revise'), ...blocked, ...fromApproval('integration:', 'integration'),
-      ...fromApproval('accept:', 'accept'), ...fromApproval('merge:', 'merge')]
+      ...fromApproval('accept:', 'accept'), ...fromApproval('merge:', 'merge'), ...teamItems(open)]
+  }
+  /** Team cards (posted by team commands): same shape the daemon builds in src/exec/decisions.ts. */
+  const TEAM_NAMES: Record<string, string> = { blog: '블로그 팀' }
+  const teamHelp = (o: string) => o === '보류' ? '지금은 고르지 않아요 · 팀이 나중에 다시 물어요' : o === '반려' ? '팀이 이 항목을 진행하지 않아요' : '이 선택으로 팀이 다음 단계를 진행해요'
+  function teamItems(open: Approval[]): DecisionItem[] {
+    return open.filter((a) => a.id.startsWith('team:')).map((a) => {
+      const name = TEAM_NAMES[a.teamId] ?? a.teamId
+      return { kind: 'team' as const, teamId: a.teamId, id: a.id, revision: 0, requestId: '', taskId: null, title: `${name} · ${a.title}`, detail: a.body,
+        situation: `${/팀$/.test(name) ? name : `${name} 팀`}이 회장님 결정을 기다려요`, cause: null, causeConfirmed: false, recommendation: null,
+        optionHelp: Object.fromEntries(a.options.map((o) => [o, teamHelp(o)])), detailPath: null, options: a.options, subjectHash: a.subjectHash, createdAt: a.createdAt }
+    })
   }
 
   function snapshot(): Snapshot {

@@ -5,7 +5,7 @@ import type { DecisionItem, Headline, TaskView, WorkerView } from '../types.ts'
 import type { QuotaState } from './quota.ts'
 import { lastActivityOf } from './stream.ts'
 
-const ORDER: DecisionItem['kind'][] = ['system', 'plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge']
+const ORDER: DecisionItem['kind'][] = ['system', 'plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge', 'team']
 export const BLOCKED_OPTIONS = ['retry', 'skip', 'stop']
 
 function approvalRequestId(store: Store, a: ApprovalRow): string {
@@ -29,6 +29,7 @@ const PLAN_HELP = { 승인: '계획대로 작업을 시작해요 · 사용량이
 const REVISE_HELP = { 승인: '고친 지시서로 이 작업을 다시 해요 · 사용량이 들어요', 반려: '수정안을 버리고 이 작업을 멈춤 상태로 둬요 · 다음 결정은 차단 카드에서 해요' }
 const INTEGRATION_HELP = { '다시 통합': '대상 브랜치의 최신 커밋 위에서 합치기와 검사를 다시 해요 · 사용량은 들지 않아요', '해당 작업 재작업': '문제가 된 작업을 대상 브랜치의 최신 커밋 위에서 처음부터 다시 해요 · 사용량이 들어요', '요청 중단': OPTION_HELP.stop }
 const SYSTEM_HELP = { '다시 확인': '로그인 후 누르면 다음 작업부터 다시 시도해요' }
+const teamOptionHelp = (o: string) => o === '보류' ? '지금은 고르지 않아요 · 팀이 나중에 다시 물어요' : o === '반려' ? '팀이 이 항목을 진행하지 않아요' : '이 선택으로 팀이 다음 단계를 진행해요'
 
 export const detailPath = (requestId: string, taskId: string | null) => `/ui/#request=${encodeURIComponent(requestId)}${taskId ? `&task=${encodeURIComponent(taskId)}` : ''}`
 
@@ -50,9 +51,16 @@ function diagnosed(raw: string | null, options: string[], fallback: Explain): Ex
   } catch { return fallback }
 }
 
-export function decisionItems(store: Store, now = Date.now()): DecisionItem[] {
+export function decisionItems(store: Store, now = Date.now(), teamNames: Record<string, string> = {}): DecisionItem[] {
   const items: DecisionItem[] = []
   for (const a of store.openApprovals(now)) {
+    if (a.kind === 'team') {
+      const name = teamNames[a.teamId] ?? a.teamId
+      items.push({ kind: 'team', teamId: a.teamId, id: a.id, revision: a.revision, requestId: '', taskId: null, title: `${name} · ${a.title}`, detail: a.body,
+        situation: `${/팀$/.test(name) ? name : `${name} 팀`}이 회장님 결정을 기다려요`, cause: null, causeConfirmed: false, recommendation: null,
+        optionHelp: Object.fromEntries(a.options.map((o) => [o, teamOptionHelp(o)])), detailPath: null, options: a.options, subjectHash: a.subjectHash, createdAt: a.createdAt })
+      continue
+    }
     if (!['system', 'plan', 'revise', 'integration', 'accept', 'merge'].includes(a.kind)) continue
     const requestId = approvalRequestId(store, a)
     const taskId = a.kind === 'revise' ? a.id.slice('revise:'.length) : null

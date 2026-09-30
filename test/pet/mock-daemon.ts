@@ -62,6 +62,13 @@ const decisions: DecisionItem[] = [
   decision({ kind: 'merge', id: 'merge:req-dark0001:hq', requestId: 'req-dark0001', title: 'hq · 다크 모드 — 병합 승인',
     situation: 'main(abc1234)에 통합본(def5678)을 반영해요 · 파일 6개 변경.', options: ['병합', '보류'], subjectHash: 'h-merge',
     optionHelp: { 병합: '대상 브랜치에 fast-forward로 반영해요', 보류: '지금은 병합하지 않고 둬요 · 나중에 다시 제시할 수 있어요' } }),
+  // Team card (posted by a team command via POST /api/approvals): decided through POST /api/approvals/:id.
+  decision({ kind: 'team', teamId: 'revenue', id: 'team:revenue:topic-1', requestId: '', title: '수익 자동화 · 다음 영상 주제를 골라 주세요', detailPath: null,
+    situation: '수익 자동화 팀이 회장님 결정을 기다려요', options: ['A안', '보류', '반려'], subjectHash: 'h-team',
+    optionHelp: { A안: '이 선택으로 팀이 다음 단계를 진행해요', 보류: '지금은 고르지 않아요 · 팀이 나중에 다시 물어요', 반려: '팀이 이 항목을 진행하지 않아요' } }),
+  // A kind this pet build does not know: must still decode and render generically.
+  decision({ kind: 'future_kind' as DecisionItem['kind'], id: 'future:1', requestId: '', title: '새 종류의 결정', detailPath: null,
+    situation: '아직 모르는 종류도 카드로 보여야 해요', options: ['확인'], subjectHash: 'h-future' }),
 ]
 
 const snapshot: Snapshot = {

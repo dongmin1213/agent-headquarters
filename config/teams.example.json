@@ -16,11 +16,11 @@
     "name": "수익자동화",
     "pack": "digimon",
     "command": [
-      "node",
-      "teams/demo-revenue.ts"
+      "~/code/pipeline/.venv/bin/python",
+      "hq_team.py"
     ],
-    "cwd": ".",
+    "cwd": "~/code/pipeline",
     "everyMinutes": 30,
-    "enabled": true
+    "enabled": false
   }
 ]

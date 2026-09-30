@@ -3,6 +3,7 @@ node_modules/
 .DS_Store
 # machine-specific project list (see config/projects.example.json)
 config/projects.json
+config/teams.json
 # built app and third-party sprites (fetched locally by scripts/fetch-packs.sh; not redistributed)
 pet/HQPet.app/
 pet/packs/

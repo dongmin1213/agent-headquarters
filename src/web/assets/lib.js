@@ -186,7 +186,7 @@ export function windowLabel(name) { return WINDOW_NAMES[name] ?? String(name ?? 
 /** Decision kinds in the order the daemon sends them (execution.md §17), with their card label and tone. */
 export const DECISION_KIND = {
   plan: ['계획 승인', 'info'], ceo_question: ['사장 질문', 'warn'], worker_question: ['작업자 질문', 'warn'], revise: ['지시서 수정 승인', 'warn'],
-  blocked: ['회로 차단', 'bad'], integration: ['통합 실패', 'bad'], accept: ['결과 수락', 'ok'], merge: ['병합 승인', 'info'],
+  blocked: ['회로 차단', 'bad'], integration: ['통합 실패', 'bad'], accept: ['결과 수락', 'ok'], merge: ['병합 승인', 'info'], team: ['팀 결정', 'info'],
 }
 /** Fixed display labels for `blocked` card options, which are wire values retry|skip|stop (execution.md §17). */
 export const BLOCKED_LABEL = { retry: '한 번 더', skip: '이 작업 건너뛰기', stop: '요청 중단' }

@@ -110,6 +110,15 @@ hq projects add ~/code/web --setup "npm ci --prefer-offline"
 ### 펫 말풍선 글자 크기
 `~/.config/hq/pet.json`에 `{"bubbleFontSize": 12}` 형식으로 씁니다. 기본값은 10이고 범위는 8~24입니다. 파일이나 키가 없으면 10을 쓰고, 값이 잘못되었거나 JSON이 깨져 있으면 10을 쓰면서 로그에 `pet.json:` 경고를 남깁니다. 펫을 다시 켜야 반영되며, 파일 경로는 `HQ_PET_CONFIG`로 바꿀 수 있습니다.
 
+### 반복 팀 (`config/teams.json`)
+정해진 간격으로 돌아가는 팀(예: 콘텐츠 파이프라인)을 등록합니다. 개인 경로가 들어가므로 git에서 제외되며, 없으면 `config/teams.example.json`을 씁니다.
+```json
+[{ "id": "revenue", "name": "수익자동화", "pack": "digimon", "command": ["~/code/pipeline/.venv/bin/python", "hq_team.py"], "cwd": "~/code/pipeline", "everyMinutes": 30, "enabled": true }]
+```
+- 팀 명령은 `STATUS: <문장>` 줄로 진행 상황을 알리고(펫 말풍선), 종료 코드로 상태를 알립니다: `0` 한가·완료, `3` 회장 승인 대기, `75` 사용 한도, 그 밖에는 오류.
+- 승인이 필요하면 `HQ_URL`·`HQ_TOKEN`·`HQ_TEAM` 환경 변수로 `POST /api/approvals`에 카드를 올리고(id는 `team:<팀 id>:`로 시작), 다음 실행 때 `GET /api/approvals/<id>`로 결정을 읽습니다.
+- 팀은 회장이 직접 등록한 신뢰된 명령이라 작업자와 달리 샌드박스 없이 실행됩니다. hq가 한도 보류 중이면 실행하지 않습니다.
+
 ## 6. 문제 해결 (`hq doctor` 항목별)
 | 항목 | 상태 | 해결 |
 | --- | --- | --- |

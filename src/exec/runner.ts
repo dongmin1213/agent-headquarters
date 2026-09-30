@@ -46,6 +46,8 @@ export interface RunnerDeps {
   tokenDir?: string
   /** Shared with the engine so CEO turns never overlap. */
   ceoLock?: TurnLock
+  /** Team id → display name, for team decision titles. */
+  teamNames?: Record<string, string>
 }
 
 export interface Live {
@@ -94,6 +96,7 @@ export class Runner {
   readonly home: string
   readonly tokenDir: string
   readonly ceoLock: TurnLock
+  readonly teamNames: Record<string, string>
   readonly live = new Map<string, Live>()
   readonly launching = new Set<string>()
   readonly checking = new Set<string>()
@@ -112,6 +115,7 @@ export class Runner {
   constructor(d: RunnerDeps) {
     this.store = d.store; this.bus = d.bus; this.cfg = d.cfg; this.projects = d.projects; this.hqRoot = d.hqRoot; this.hqPort = d.hqPort
     this.notify = d.notify; this.now = d.now; this.ceoLock = d.ceoLock ?? new TurnLock()
+    this.teamNames = d.teamNames ?? {}
     mkdirSync(d.cfg.home, { recursive: true })
     this.home = real(d.cfg.home)
     this.tokenDir = d.tokenDir ?? join(homedir(), '.config/hq')
@@ -1519,8 +1523,8 @@ export class Runner {
   // ----- notifications (§17: once per decision id + revision) -----
   private notifyDecisions(): void {
     const titles: Record<DecisionItem['kind'], string> = { system: 'hq가 멈췄어요 — 확인이 필요해요', plan: '사장이 계획을 올렸어요', ceo_question: '사장이 질문했어요', worker_question: '작업자가 질문했어요',
-      revise: '지시서 수정안 승인이 필요해요', blocked: '작업이 막혔어요 — 판단이 필요해요', integration: '통합에 실패했어요', accept: '결과 수락을 기다려요', merge: '병합 승인을 기다려요' }
-    for (const d of decisionItems(this.store, this.now())) {
+      revise: '지시서 수정안 승인이 필요해요', blocked: '작업이 막혔어요 — 판단이 필요해요', integration: '통합에 실패했어요', accept: '결과 수락을 기다려요', merge: '병합 승인을 기다려요', team: '팀 결정이 필요해요' }
+    for (const d of decisionItems(this.store, this.now(), this.teamNames)) {
       const k = `notified:${d.id}:${d.revision}`
       if (this.store.get(k)) continue
       this.store.set(k, this.iso())
@@ -1530,7 +1534,7 @@ export class Runner {
 
   // ----- screen data -----
   views(): { workers: WorkerView[]; headline: Headline; quota: QuotaView | null; decisions: DecisionItem[] } {
-    const decisions = decisionItems(this.store, this.now())
+    const decisions = decisionItems(this.store, this.now(), this.teamNames)
     const q = this.quota()
     const workers = workerViews(this.store, (a) => this.live.get(a.id)?.tail.lastActivity ?? lastActivityOf(hqDirOf(a)), q.mode === 'hold' ? q.until : null)
     const failures = this.store.requestsByStatus(['blocked']).map((r) => ({ title: r.text.replace(/\s+/g, ' ').slice(0, 30), reason: r.note ?? '' }))
