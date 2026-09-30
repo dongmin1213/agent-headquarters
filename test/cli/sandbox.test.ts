@@ -6,10 +6,12 @@ import { sandboxSmoke, smokeProfile } from '../../src/cli/sandbox.ts'
 import { tmp } from './helpers.ts'
 import { NESTED_SKIP, nestedSandbox } from '../nested.ts'
 
-test('profile denies the secret read and all writes except the allowed dir', () => {
-  const p = smokeProfile('/t/secret.txt', '/t/allowed')
-  assert.match(p, /\(deny file-read\* \(literal "\/t\/secret\.txt"\)\)/)
-  assert.match(p, /\(deny file-write\*\)\n\(allow file-write\* \(subpath "\/t\/allowed"\)/)
+test('smoke profile is the worker profile for a fake home: home reads, outside signals and mach-lookup denied', () => {
+  const p = smokeProfile('/t', '/t/allowed')
+  assert.match(p, /\(deny file-read-data \(subpath "\/t\/home"\)/)
+  assert.match(p, /\(deny signal\)\n\(allow signal \(target same-sandbox\)\)/)
+  assert.match(p, /\(deny mach-lookup\)/)
+  assert.match(p, /\(allow file-read-data file-write\* \(subpath "\/t\/allowed"\)\)/)
 })
 
 test('real Seatbelt smoke test passes on macOS', { skip: (process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec')) || (nestedSandbox && NESTED_SKIP) }, async () => {
@@ -24,6 +26,7 @@ test('smoke test detects a sandbox that does not confine (fake sandbox-exec that
   assert.equal(r.ok, false)
   assert.match(r.detail, /비밀 파일 읽기가 막히지 않음/)
   assert.match(r.detail, /허용 밖 쓰기가 막히지 않음/)
+  assert.match(r.detail, /밖 프로세스에 시그널이 막히지 않음/)
 })
 
 test('smoke test reports a sandbox-exec that cannot run', async () => {

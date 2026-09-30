@@ -1,14 +1,15 @@
 // Spawning and supervising detached, sandboxed `claude -p` processes (execution.md §6 §7 §13).
 // The process outlives the daemon: stdin is the prompt file, stdout/stderr go straight to hq/ log files.
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
-import { closeSync, mkdirSync, openSync } from 'node:fs'
+import { closeSync, mkdirSync, openSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import type { HqConfig } from '../config.ts'
 import { atomicJson, atomicWrite, readJson } from './fsx.ts'
-import { childEnv, sandboxProfile, wrap, type SandboxOpts } from './sandbox.ts'
+import { cacheEnv, childEnv, isCacheDir, makeCacheDir, sandboxProfile, wrap, type SandboxOpts } from './sandbox.ts'
 
 export type Role = 'implement' | 'collect' | 'review'
-export interface ProcessInfo { pid: number; startedAt: string; sessionId: string; lstart: string | null }
+/** `cacheDir`: the per-launch package-manager cache (§6.2), removed once the attempt's process group is gone. */
+export interface ProcessInfo { pid: number; startedAt: string; sessionId: string; lstart: string | null; cacheDir?: string }
 
 const modelArg = (cfg: HqConfig, m: string) => cfg.models[m as keyof HqConfig['models']] ?? m
 
@@ -91,7 +92,8 @@ export async function launch(o: { claudeBin: string; argv: string[]; cwd: string
   atomicWrite(profile, sandboxProfile(o.sandbox))
   const argv = wrap([o.claudeBin, ...o.argv], profile)
   atomicJson(join(o.hqDir, 'spec.json'), { argv: argv.map((a) => (a.length > 2000 ? a.slice(0, 2000) + '…' : a)), cwd: o.cwd, ...o.spec })
-  const env = childEnv(o.outDir ? { HQ_ATTEMPT_OUT: o.outDir } : {})
+  const cacheDir = makeCacheDir()
+  const env = childEnv({ ...cacheEnv(cacheDir), ...(o.outDir ? { HQ_ATTEMPT_OUT: o.outDir } : {}) })
   const fin = openSync(join(o.hqDir, 'prompt.md'), 'r')
   const fout = openSync(join(o.hqDir, 'stream.jsonl'), 'a')
   const ferr = openSync(join(o.hqDir, 'stderr.log'), 'a')
@@ -100,13 +102,18 @@ export async function launch(o: { claudeBin: string; argv: string[]; cwd: string
   const pid = await new Promise<number>((resolve, reject) => {
     if (child.pid) { child.once('error', () => {}); return resolve(child.pid) }
     child.once('error', reject)
-  })
+  }).catch((e) => { removeCacheDir(cacheDir); throw e })
   child.unref()
   // ps may be unavailable (e.g. setuid exec denied inside a sandbox); the worker is already running and must be tracked.
   // A null lstart falls back to startedAt in sameProcessAlive.
-  const info: ProcessInfo = { pid, startedAt: new Date().toISOString(), sessionId: o.sessionId, lstart: await safeLstart(ps, pid) }
+  const info: ProcessInfo = { pid, startedAt: new Date().toISOString(), sessionId: o.sessionId, lstart: await safeLstart(ps, pid), cacheDir }
   atomicJson(join(o.hqDir, 'process.json'), info)
   return { info, child }
+}
+
+/** Deletes a per-launch cache folder; anything that is not one (see isCacheDir) is left alone. */
+export function removeCacheDir(dir: string | undefined): void {
+  if (dir && isCacheDir(dir)) rmSync(dir, { recursive: true, force: true })
 }
 
 export const readProcessInfo = (hqDir: string) => readJson<ProcessInfo>(join(hqDir, 'process.json'))

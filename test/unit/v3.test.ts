@@ -11,7 +11,7 @@ import { runSandboxed } from '../../src/exec/checks.ts'
 import { decisionItems } from '../../src/exec/decisions.ts'
 import { atomicWrite } from '../../src/exec/fsx.ts'
 import { checkVerdict } from '../../src/exec/review.ts'
-import { sandboxProfile } from '../../src/exec/sandbox.ts'
+import { claudeProjectDir, real, sandboxProfile } from '../../src/exec/sandbox.ts'
 import { acceptKnownToMerged, commitFile, harness, req, sh, task, tmp, tsk, type Harness } from './helpers.ts'
 import { NESTED_SKIP, nestedSandbox, useFakeSandboxIfNested } from '../nested.ts'
 
@@ -80,7 +80,7 @@ test('v3-2. metadata lstat allowed: node import and npm test succeed in a verifi
   assert.match(npm.outputTail, /x-ok/)
 })
 
-test('v3-3. ~/.claude control files are write-protected (fake HOME); runtime dirs and ~/.claude.json stay writable; secrets unreadable', { skip: nestedSandbox && NESTED_SKIP }, async () => {
+test('v3-3. ~/.claude control files are write-protected (fake HOME); only the own transcript folder is writable; secrets unreadable', { skip: nestedSandbox && NESTED_SKIP }, async () => {
   const dir = tmp('hq-home-')
   const home = join(dir, 'fakehome')
   const wt = join(dir, 'wt')
@@ -95,8 +95,10 @@ test('v3-3. ~/.claude control files are write-protected (fake HOME); runtime dir
     assert.equal(r.pass, false, `${f} must not be writable`)
   }
   assert.equal(readFileSync(join(home, '.claude/settings.json'), 'utf8'), '{}')
-  assert.equal((await run(`echo x > '${join(home, '.claude/projects/s.jsonl')}'`)).pass, true, 'projects/ writable')
-  assert.equal((await run(`echo x > '${join(home, '.claude.json')}'`)).pass, true, '.claude.json writable')
+  assert.equal((await run(`echo x > '${join(home, '.claude/projects/s.jsonl')}'`)).pass, false, 'projects/ root not writable')
+  const own = join(home, '.claude/projects', claudeProjectDir(real(wt)).name)
+  assert.equal((await run(`mkdir -p '${own}' && echo x > '${own}/s.jsonl'`)).pass, true, 'own projects/<cwd> writable')
+  assert.equal((await run(`echo x > '${join(home, '.claude.json')}'`)).pass, false, '.claude.json not writable (CLI runs without it, §6.2)')
   assert.equal((await run(`cat '${join(home, '.ssh/id_ed25519')}'`)).pass, false, '~/.ssh unreadable')
   assert.equal((await run('/usr/bin/osascript -e "return 1"')).pass, false, 'osascript denied')
 })
