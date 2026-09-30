@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { daemonLabel, installMarker, lockFile, makeCtx, markerContent, petApp, petLabel, plistPath, type Ctx } from '../../src/cli/ctx.ts'
 import type { Probes } from '../../src/cli/doctor.ts'
 import { buildPlists, install, purgePlan, uninstall } from '../../src/cli/install.ts'
-import { freePort, spawnMain, testCtx, tmp, writeToken } from './helpers.ts'
+import { fakeDaemon, freePort, spawnMain, testCtx, tmp, writeToken } from './helpers.ts'
 import { NESTED_PS_SKIP, nestedSandbox } from '../nested.ts'
 
 const okProbes: Probes = {
@@ -236,4 +236,85 @@ test('purge aborts (deletes no data) when the daemon cannot be confirmed stopped
     assert.ok(existsSync(ctx.tokenFile))
     assert.equal(d.exitCode, null)
   } finally { d.kill('SIGKILL') }
+})
+
+// ---- launchd re-registration race (bootout → bootstrap "Bootstrap failed: 5") ----
+
+const FAST = { pollMs: 5, goneMs: 2000, retryMs: 5 }
+
+/**
+ * Fake launchctl with our jobs loaded. After a bootout, `print` still shows the job `lingerPrints` more times, then fails.
+ * `bootstrapFails(label, n)` decides whether the n-th bootstrap of that label fails with the code-5 race stderr.
+ */
+async function raceCtx(o: { port: number; lingerPrints: number; bootstrapFails: (label: string, n: number) => boolean }) {
+  const calls: string[] = []
+  const state = new Map<string, number>() // label → prints left while loaded (Infinity = loaded, 0 = gone)
+  const boots = new Map<string, number>()
+  let self: Ctx
+  const ctx = self = testCtx({ port: o.port, dryRun: false, run: async (cmd, args) => {
+    calls.push([cmd, ...args].join(' '))
+    if (cmd !== 'launchctl') return { code: 0, stdout: '', stderr: '' }
+    const label = args[0] === 'bootstrap' ? args[2].split('/').pop()!.replace(/\.plist$/, '') : args[1].split('/').pop()!
+    const left = state.get(label) ?? Infinity
+    if (args[0] === 'print') {
+      if (left <= 0) return { code: 113, stdout: '', stderr: 'Could not find service' }
+      state.set(label, left - 1)
+      return { code: 0, stdout: `${args[1]} = {\n\tpath = ${plistPath(self, label)}\n}\n`, stderr: '' }
+    }
+    if (args[0] === 'bootout') { state.set(label, o.lingerPrints); return { code: 0, stdout: '', stderr: '' } }
+    if (args[0] === 'bootstrap') {
+      const n = (boots.get(label) ?? 0) + 1; boots.set(label, n)
+      if (o.bootstrapFails(label, n)) return { code: 5, stdout: '', stderr: 'Bootstrap failed: 5: Input/output error\n' }
+      state.set(label, Infinity)
+    }
+    return { code: 0, stdout: '', stderr: '' }
+  } })
+  mkdirSync(join(ctx.root, 'pet/HQPet.app/Contents/MacOS'), { recursive: true }); writeFileSync(join(ctx.root, 'pet/HQPet.app/Contents/MacOS/hqpet'), '')
+  const bootstraps = (label: string) => calls.filter((c) => c.startsWith(`launchctl bootstrap gui/${ctx.uid} ${plistPath(ctx, label)}`))
+  return { ctx, calls, bootstraps }
+}
+
+test('install waits after bootout until launchctl print fails, then bootstraps once', async (t) => {
+  const d = await fakeDaemon('tok-race', {}); t.after(() => d.server.close())
+  const { ctx, calls, bootstraps } = await raceCtx({ port: d.port, lingerPrints: 2, bootstrapFails: () => false })
+  writeToken(ctx, 'tok-race')
+  assert.equal(await install(ctx, { sprites: false, probes: okProbes, launchd: FAST }), 0, ctx.text())
+  const dl = daemonLabel(ctx), target = `launchctl print gui/${ctx.uid}/${dl}`
+  const out = calls.indexOf(`launchctl bootout gui/${ctx.uid}/${dl}`), boot = calls.indexOf(bootstraps(dl)[0])
+  assert.equal(bootstraps(dl).length, 1, calls.join('\n'))
+  assert.equal(calls.slice(out + 1, boot).filter((c) => c === target).length, 3, 'print loaded, loaded, gone → then bootstrap')
+  assert.equal(bootstraps(petLabel(ctx)).length, 1)
+})
+
+test('install retries a bootstrap that fails with the code-5 race and succeeds on the 3rd attempt', async (t) => {
+  const d = await fakeDaemon('tok-race', {}); t.after(() => d.server.close())
+  const { ctx, calls, bootstraps } = await raceCtx({ port: d.port, lingerPrints: 0, bootstrapFails: (l, n) => l === daemonLabel(ctx) && n <= 2 })
+  writeToken(ctx, 'tok-race')
+  assert.equal(await install(ctx, { sprites: false, probes: okProbes, launchd: FAST }), 0, ctx.text())
+  assert.equal(bootstraps(daemonLabel(ctx)).length, 3, calls.join('\n'))
+  assert.equal(bootstraps(petLabel(ctx)).length, 1)
+  assert.doesNotMatch(ctx.errors.join('\n'), /다시 등록하지 못했어요/)
+})
+
+test('install reports and exits 1 when the daemon bootstrap keeps failing; the pet is not bootstrapped with the daemon down', async () => {
+  const { ctx, calls, bootstraps } = await raceCtx({ port: await freePort(), lingerPrints: 0, bootstrapFails: () => true })
+  assert.equal(await install(ctx, { sprites: false, probes: okProbes, launchd: FAST }), 1, ctx.text())
+  assert.equal(bootstraps(daemonLabel(ctx)).length, 4, calls.join('\n'))
+  assert.equal(bootstraps(petLabel(ctx)).length, 0, calls.join('\n'))
+  const plist = plistPath(ctx, daemonLabel(ctx))
+  assert.ok(ctx.errors.join('\n').includes(`데몬을 다시 등록하지 못했어요: Bootstrap failed: 5: Input/output error · 잠시 뒤 hq install을 다시 실행하거나 launchctl bootstrap gui/${ctx.uid} ${plist}를 실행해 주세요`), ctx.errors.join('\n'))
+  assert.doesNotMatch(ctx.text(), /6\/6/)
+})
+
+test('dry-run install prints bootout/bootstrap without polling launchctl print or waiting', async () => {
+  const calls: string[] = []
+  const ctx = testCtx({ port: await freePort(), run: async (cmd, args) => { calls.push([cmd, ...args].join(' ')); return { code: 113, stdout: '', stderr: '' } } })
+  const t0 = Date.now()
+  assert.equal(await install(ctx, { sprites: false, probes: okProbes }), 0, ctx.text()) // default timings: any wait would take ≥ 250 ms
+  assert.ok(Date.now() - t0 < 2000)
+  // Only the ownership checks read print (daemon: step 4 + step 5 + bootstrap; pet: step 5 + bootstrap) — no post-bootout polling.
+  for (const [l, n] of [[daemonLabel(ctx), 3], [petLabel(ctx), 2]] as const) {
+    assert.ok(ctx.text().includes(`[dry-run] launchctl bootout gui/${ctx.uid}/${l}`))
+    assert.equal(calls.filter((c) => c === `launchctl print gui/${ctx.uid}/${l}`).length, n, calls.join('\n'))
+  }
 })
