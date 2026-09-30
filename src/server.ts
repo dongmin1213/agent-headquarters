@@ -59,8 +59,9 @@ export function snapshot(d: ServerDeps): Snapshot {
   const recent = d.store.requests(10)
   const active = d.store.requestsByStatus(['queued', 'thinking', 'asking', 'planned', 'executing', 'blocked', 'awaiting_acceptance', 'accepted', 'merging'])
   const ids = [...new Set([...active.map((r) => r.id), ...recent.map((r) => r.id)])]
-  const v = d.runner.views()
-  return { updatedAt: new Date().toISOString(), lastEventId: d.store.lastEventId(), teams: d.scheduler.views(), approvals: d.store.openApprovals(),
+  const teams = d.scheduler.views()
+  const v = d.runner.views(teams.map((t) => ({ name: t.name, state: t.state, bubble: t.bubble })))
+  return { updatedAt: new Date().toISOString(), lastEventId: d.store.lastEventId(), teams, approvals: d.store.openApprovals(),
     requests: ids.map((id) => requestView(d.store, d.runner, id)!).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
     projects: d.projects.map((p) => ({ id: p.id, name: p.name })), limit: { blockedUntil: d.runner.holdUntil() },
     workers: v.workers, headline: v.headline, quota: v.quota, decisions: v.decisions }

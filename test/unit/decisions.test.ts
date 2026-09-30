@@ -30,6 +30,21 @@ test('18. headline sentences', () => {
   assert.equal(buildHeadline({ ...base, workers: [w({ state: 'blocked' })] }).text, '지금 하실 일은 없어요', 'blocked worker is not "running"')
 })
 
+test('18. headline shows recurring teams working / in error', () => {
+  const team = (o: Partial<{ name: string; state: string; bubble: string }>) => ({ name: '수익자동화', state: 'working', bubble: '리서치·대본 작성 중: 웅진그룹', ...o })
+  assert.equal(buildHeadline({ ...base, teams: [team({})] }).text, '수익자동화: 리서치·대본 작성 중: 웅진그룹')
+  assert.equal(buildHeadline({ ...base, teams: [team({}), team({ name: '뉴스', bubble: '수집 중' })] }).text, '수익자동화: 리서치·대본 작성 중: 웅진그룹 외 1팀')
+  assert.equal(buildHeadline({ ...base, teams: [team({}), team({ state: 'error', bubble: '업로드 실패\n' + 'x'.repeat(100) })] }).text, `수익자동화 팀 오류: ${('업로드 실패\n' + 'x'.repeat(100)).slice(0, 80)}`)
+  assert.equal(buildHeadline({ ...base, teams: [team({ name: '뉴스팀', state: 'error', bubble: '끊김' })] }).text, '뉴스팀 오류: 끊김')
+  assert.equal(buildHeadline({ ...base, teams: [team({ state: 'idle' }), team({ state: 'sleeping' })] }).text, '지금 하실 일은 없어요')
+  const d = { title: '계획 승인: X' } as DecisionItem
+  assert.deepEqual(buildHeadline({ ...base, decisions: [d], teams: [team({})] }), { text: '회장님 결정 1건: 계획 승인: X', needsYou: 1 })
+  assert.equal(buildHeadline({ ...base, failures: [{ title: '요청 A', reason: '통합 충돌' }], teams: [team({ state: 'error' })] }).text, '막혔어요 · 요청 A: 통합 충돌')
+  assert.equal(buildHeadline({ ...base, workers: [w({})], teams: [team({})] }).text, '로그인 고치기 구현 중 · sonnet · 다음: 검증')
+  assert.equal(buildHeadline({ ...base, teams: [] }).text, '지금 하실 일은 없어요')
+  assert.equal(buildHeadline({ ...base, teams: [team({})] }).needsYou, 0)
+})
+
 test('18. decision items: kind order plan → ceo_question → worker_question → revise → blocked → integration → accept → merge, oldest first', async () => {
   const h = harness()
   try {
