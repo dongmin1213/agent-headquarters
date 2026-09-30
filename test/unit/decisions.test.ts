@@ -71,3 +71,33 @@ test('18. decision items: kind order plan → ceo_question → worker_question �
     assert.ok(snap.workers.some((x) => x.state === 'blocked' && x.bubble === '멈춤 · 사장에게 보고'))
   } finally { await h.close() }
 })
+
+test('18. team approvals are decision items (내 차례, headline, notifications)', async () => {
+  const h = harness()
+  try {
+    const s = h.store
+    s.putApproval({ id: 'team:revenue:topic-1', teamId: 'revenue', title: '다음 영상 주제를 골라 주세요', body: '후보 3개', options: ['A안', '보류', '반려'], subjectHash: 'ht1' })
+    s.putApproval({ id: 'team:other:x', teamId: 'other', title: '다른 팀 질문', body: '', options: ['예'], subjectHash: 'ht2' })
+    s.putApproval({ id: 'team:revenue:done', teamId: 'revenue', title: '이미 결정됨', body: '', options: ['예'], subjectHash: 'ht3' })
+    assert.ok(s.decide('team:revenue:done', '예', 'ht3', h.clock.t))
+    s.putApproval({ id: 'team:revenue:old', teamId: 'revenue', title: '만료됨', body: '', options: ['예'], subjectHash: 'ht4', expiresAt: new Date(h.clock.t - 1000).toISOString() })
+    const items = decisionItems(s, h.clock.t, { revenue: '수익자동화', other: '시험 팀' })
+    assert.deepEqual(items.map((d) => d.id).sort(), ['team:other:x', 'team:revenue:topic-1'], 'decided and expired cards are excluded')
+    const rev = items.find((d) => d.teamId === 'revenue')!, other = items.find((d) => d.teamId === 'other')!
+    assert.deepEqual(rev, {
+      kind: 'team', teamId: 'revenue', id: 'team:revenue:topic-1', revision: rev.revision, requestId: '', taskId: null,
+      title: '수익자동화 · 다음 영상 주제를 골라 주세요', detail: '후보 3개', situation: '수익자동화 팀이 회장님 결정을 기다려요',
+      cause: null, causeConfirmed: false, recommendation: null,
+      optionHelp: { A안: '이 선택으로 팀이 다음 단계를 진행해요', 보류: '지금은 고르지 않아요 · 팀이 나중에 다시 물어요', 반려: '팀이 이 항목을 진행하지 않아요' },
+      detailPath: null, options: ['A안', '보류', '반려'], subjectHash: 'ht1', createdAt: rev.createdAt,
+    })
+    assert.equal(other.situation, '시험 팀이 회장님 결정을 기다려요', 'a name ending in 팀 is not doubled')
+    assert.ok(decisionItems(s, h.clock.t).some((d) => d.title === 'revenue · 다음 영상 주제를 골라 주세요'), 'unknown team falls back to its id')
+    const snap = h.runner.views()
+    assert.equal(snap.headline.needsYou, 2)
+    assert.equal(snap.headline.text, `회장님 결정 2건: ${snap.decisions[0].title}`)
+    assert.deepEqual(snap.decisions.map((d) => d.kind), ['team', 'team'])
+    await h.runner.tick()
+    assert.equal(h.notes.filter(([t]) => t === '팀 결정이 필요해요').length, 2, 'one notification per team card')
+  } finally { await h.close() }
+})

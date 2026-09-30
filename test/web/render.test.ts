@@ -97,7 +97,8 @@ test('labels and formatting', () => {
   assert.equal(lib.windowLabel('five_hour'), '5시간')
   assert.equal(lib.windowLabel('some_new_window'), 'some_new_window')
   for (const m of ['normal', 'save', 'hold', 'unobserved']) assert.ok(lib.QUOTA_MODE[m], m)
-  for (const k of ['plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge']) assert.ok(lib.DECISION_KIND[k], k)
+  for (const k of ['plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge', 'team']) assert.ok(lib.DECISION_KIND[k], k)
+  assert.deepEqual(lib.DECISION_KIND.team, ['팀 결정', 'info'])
   assert.equal(lib.shortSha(null), '미확인')
   assert.equal(lib.shortSha('0123456789abcdef'), '0123456')
   assert.equal(lib.formatDuration(125_000), '2분 5초')
@@ -116,7 +117,7 @@ test('mock fixtures follow v2 shapes: every task status, every decision kind in 
   const snap = JSON.parse(snapRes)
   const statuses = new Set(snap.requests.flatMap((r: { tasks: { status: string }[] }) => r.tasks.map((t) => t.status)))
   for (const s of ['pending', 'running', 'verifying', 'reviewing', 'passed', 'rework', 'revising', 'question', 'held', 'blocked', 'cancelled']) assert.ok(statuses.has(s), s)
-  const order = ['plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge']
+  const order = ['plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge', 'team']
   const kinds = snap.decisions.map((d: { kind: string }) => d.kind)
   for (const k of order) assert.ok(kinds.includes(k), k)
   assert.deepEqual(kinds, [...kinds].sort((a: string, b: string) => order.indexOf(a) - order.indexOf(b)), 'daemon order')
@@ -129,11 +130,15 @@ test('mock fixtures follow v2 shapes: every task status, every decision kind in 
     assert.ok(d.cause === null || typeof d.cause === 'string')
     if (d.recommendation) assert.ok(d.options.includes(d.recommendation.option) && d.recommendation.reason, `${d.kind} recommendation is an option`)
     for (const o of d.options) assert.ok(d.optionHelp[o], `${d.kind} optionHelp[${o}]`)
+    if (d.kind === 'team') { assert.equal(d.detailPath, null); assert.equal(d.requestId, ''); continue }
     const f = lib.parseFragment(d.detailPath!.replace(/^\/ui\//, ''))
     assert.equal(f.request, d.requestId)
     if (d.taskId) assert.equal(`${d.requestId}.${f.task}`, d.taskId)
   }
   const ds = snap.decisions as D[]
+  const team = ds.find((d) => d.kind === 'team')!
+  assert.match(team.situation, /회장님 결정을 기다려요$/)
+  assert.deepEqual(team.options, ['발행', '보류', '폐기'])
   assert.ok(ds.some((d) => d.recommendation), 'one with a recommendation')
   assert.ok(ds.some((d) => !d.recommendation), 'one without')
   assert.ok(ds.some((d) => d.cause && !d.causeConfirmed), 'one cause marked 추정')

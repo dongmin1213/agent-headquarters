@@ -4,6 +4,8 @@ import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer, request, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { createWebUi, SECURITY_HEADERS, SESSION_IDLE_MS, SESSION_MAX_MS, type WebUi } from '../../src/web/index.ts'
 import { createMockApi, type MockApi } from './mock-api.ts'
 
@@ -170,6 +172,24 @@ test('POST works with only the session Bearer (no CSRF, no Origin needed)', asyn
   const stale = await raw('POST', path, { ...bearer(token), 'content-type': 'application/json' }, JSON.stringify({ decision: '보류', subjectHash: d.subjectHash }))
   assert.equal(stale.status, 409)
   assert.match(JSON.parse(stale.body).error, /[가-힣]/, '409 carries a Korean reason')
+})
+
+test('a team decision card posts to /api/approvals/<id> with its subjectHash', async () => {
+  const token = await login()
+  const state = JSON.parse((await raw('GET', '/ui-api/state', bearer(token))).body)
+  const d = state.decisions.find((x: { kind: string }) => x.kind === 'team')
+  assert.ok(d, 'team card is in decisions')
+  assert.equal(state.headline.needsYou, state.decisions.length)
+  // The card's option buttons call post(`/approvals/${enc(d.id)}`, { decision, subjectHash }) for every approval-backed kind, team included.
+  const app = readFileSync(join(import.meta.dirname, '../../src/web/assets/app.js'), 'utf8')
+  assert.match(app, /post\(`\/approvals\/\$\{enc\(d\.id\)\}`, \{ decision: opt, subjectHash: d\.subjectHash \}/)
+  const n = mock.calls.length
+  const ok = await raw('POST', `/ui-api/approvals/${encodeURIComponent(d.id)}`, { ...bearer(token), 'content-type': 'application/json' }, JSON.stringify({ decision: d.options[0], subjectHash: d.subjectHash }))
+  assert.equal(ok.status, 200)
+  assert.equal(mock.calls[n].url, `/api/approvals/${encodeURIComponent(d.id)}`)
+  assert.deepEqual(JSON.parse(mock.calls[n].body), { decision: '발행', subjectHash: 'h-blog-0930' })
+  const after = JSON.parse((await raw('GET', '/ui-api/state', bearer(token))).body)
+  assert.ok(!after.decisions.some((x: { id: string }) => x.id === d.id), 'decided card leaves the list')
 })
 
 test('only allowlisted /ui-api routes are proxied; everything else is 404', async () => {

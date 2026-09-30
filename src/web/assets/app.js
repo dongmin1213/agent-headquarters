@@ -433,7 +433,7 @@ function decisionCard(d) {
       } }, busy ? '보내는 중…' : '반려 보내기'),
       h('button', { class: 'btn', type: 'button', disabled: busy, onclick: () => { ui.rejectOpen.delete(key); ui.errors.delete(key); rerenderDecisions() } }, '취소'))
   } else {
-    // plan, accept, merge, revise, integration: approval-backed cards.
+    // plan, accept, merge, revise, integration, team (and unknown kinds): approval-backed cards.
     opts.forEach((opt, i) => {
       const danger = /반려|폐기|거절|중단/.test(opt)
       actions.push(h('button', {

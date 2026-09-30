@@ -990,6 +990,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         if items.isEmpty { body.addArrangedSubview(text("지금 하실 결정은 없어요.", color: Palette.muted)); return body }
         for (i, d) in items.enumerated() {
             let card = vstack(spacing: 8)
+            if let chip = Pet.kindLabels[d.kind] { card.addArrangedSubview(text(chip, size: 11.5, weight: .semibold, color: Palette.muted)) }
             card.addArrangedSubview(text(d.title ?? d.kind, size: 14, weight: .bold, width: Pet.cardText))
             let situation = (d.situation?.isEmpty == false ? d.situation : d.detail) ?? ""
             if !situation.isEmpty { card.addArrangedSubview(text(situation, width: Pet.cardText)) }
@@ -1112,6 +1113,8 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     }
     /// Blocked-card options are the wire values retry | skip | stop; labels are fixed here.
     static let blockedLabels = ["retry": "한 번 더", "skip": "이 작업 건너뛰기", "stop": "요청 중단"]
+    /// Small label above a 내 차례 card; kinds without one (and unknown kinds) render without it.
+    static let kindLabels = ["team": "팀 결정"]
 
     func decisionAt(_ v: NSView) -> (Int, DecisionItem, String?)? {
         guard !offline, let raw = v.identifier?.rawValue else { return nil }
@@ -1140,7 +1143,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
             post("api/requests/\(seg(d.requestId ?? ""))/answer", body: ["questionId": d.id, "answer": a], decision: i)
         case "worker_question":
             post("api/tasks/\(seg(d.taskId ?? ""))/answer", body: ["questionId": d.id, "answer": a, "revision": d.revision ?? 0], decision: i)
-        default:   // plan, accept, merge, revise, integration: approval-backed
+        default:   // plan, accept, merge, revise, integration, team: approval-backed
             post("api/approvals/\(seg(d.id))", body: ["decision": a, "subjectHash": d.subjectHash ?? ""], decision: i)
         }
     }
