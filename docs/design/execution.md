@@ -88,11 +88,15 @@ schema_version: pragma user_version
 
 ### 6.2 Seatbelt 프로필
 작업자·검토자·collect·setup·check 명령은 모두 `sandbox-exec -f <profile>`로 감싼다.
-- 내용 읽기·쓰기 거부(`file-read-data`, `file-write*`): `~/.config/hq`(또는 `HQ_TOKEN_FILE`의 폴더), `$HQ_HOME`의 `hq.db*`·`runs/`(자기 `out/` 제외)·`logs/`·다른 요청의 `work/`, `~/.ssh`, `~/.aws`, `~/.config/gh`, `~/.netrc`, `~/.docker/config.json`, 등록된 모든 프로젝트의 `.env*`. (`~/Library/Keychains`는 거부하지 않는다: 구독 로그인 토큰이 로그인 키체인에 있어 거부하면 CLI가 인증하지 못함을 실측. 키체인 파일은 암호화돼 있고 항목 접근은 macOS가 통제한다 — 한계로 둔다.)
-- **메타데이터 읽기(`file-read-metadata`)는 허용**: Node 등은 경로의 모든 조상 폴더를 lstat한다. 실사용 시험에서 조상 폴더 메타데이터까지 막아 모든 검사가 EPERM으로 실패했다.
-- 쓰기 허용 목록: 자기 작업 복제본 또는 자기 검증·검토 worktree, 자기 `out/`, `/private/tmp`, `/private/var/folders`, `/dev`, `sandbox.extraWritable`, 그리고 Claude CLI 실행에 필요한 `~/.claude/projects/`만(실측 최소 집합: 한 줄 응답·Bash·Write·Edit은 쓰기 없이 동작, `--resume`만 `projects/` 필요). `~/.claude/settings*.json`, `CLAUDE.md`, `skills/ agents/ commands/ plugins/ hooks/`는 쓰기 거부(사용자 세션에 훅을 심는 경로 차단). `~/.claude.json`은 CLI가 매 실행 쓰므로 허용하되 한계로 문서화(사용자 범위 MCP 추가 가능) — 다음 단계에서 `CLAUDE_CONFIG_DIR` + 토큰 인증으로 대체 검토.
+> v4(§22) 기준. 정확한 목록은 코드(`src/exec/sandbox.ts`의 `HOME_READABLE`·`MACH_SERVICES`)와 `docs/SETUP.md`가 기준이며, 시험이 둘의 일치를 확인한다.
+- **홈 내용 읽기는 기본 거부**, 허용 목록만 연다: `~/Library/Keychains`(구독 인증에 필수, 실측), 툴체인(`~/.local/bin`·`~/.local/share/claude`), `~/.gitconfig`·`~/.config/git`, `~/.npm`(읽기만), 자기 `~/.claude/projects/<cwd 인코딩>/`. `~/.claude.json`·다른 프로젝트 기록·설정은 읽기·쓰기 모두 거부. `$HQ_HOME`·원본 프로젝트 checkout·토큰 폴더는 자기 경로를 뺀 전부 거부.
+- **메타데이터 읽기(`file-read-metadata`)는 허용**: Node 등은 경로의 모든 조상 폴더를 lstat한다.
+- **쓰기 허용**: 자기 작업 복제본 또는 자기 검증·검토 worktree, 자기 `out/`, `/private/tmp`, 자기 T 임시 폴더, `/dev`, 시도별 캐시 폴더(`npm_config_cache`·`XDG_CACHE_HOME`·`PIP_CACHE_DIR`), 자기 `~/.claude/projects/<cwd 인코딩>/`(그 안 `memory/` 제외).
+- **mach-lookup 허용 목록**: `com.apple.SecurityServer`(구독 인증), `com.apple.system.opendirectoryd.libinfo`(사용자 조회). 나머지 거부 — LaunchServices를 통한 샌드박스 밖 실행 차단.
+- **시그널**: 같은 샌드박스 안의 프로세스에만.
 - 실행 거부: `/usr/bin/open`, `/usr/bin/osascript`, `appleevent-send`, `launchctl`.
 - 네트워크: `localhost`/`127.0.0.1`의 hq 포트 거부.
+- 남는 한계: 로그인 키체인의 다른 항목, `~/.gitconfig` 안의 토큰, 작업자끼리 공유하는 임시 폴더, `setsid`로 그룹을 빠져나간 자식.
 - 예외: 자기 시도의 `hq/prompt.md`·`stream.jsonl`·`stderr.log`는 메타데이터만(stdio 파일).
 - 환경변수는 허용 목록만: `PATH HOME USER LANG LC_ALL TERM TMPDIR SHELL HQ_ATTEMPT_OUT` + git 보조(`GIT_TERMINAL_PROMPT=0`, push 기본값 무력화). `ANTHROPIC_*`, `OPENAI_*`, `HQ_TOKEN`, `SSH_AUTH_SOCK` 제거.
 - 권한 플래그(가드레일): 모든 역할에 `--tools <목록>` + `--setting-sources "" --strict-mcp-config --disable-slash-commands`.
@@ -199,7 +203,7 @@ stream.jsonl → activity.jsonl `{at, kind: message|tool|error|usage, text}`. �
 | `GET /api/requests/:id/diff?task=<key>` | `{files:[{path,added,removed}], diff, truncated}` base..head, 2MB |
 | `POST /api/requests` / `POST /api/requests/:id/answer` | 기존 (answer는 questionId가 그 요청 소유일 때만) |
 | `POST /api/tasks/:id/answer` | `{questionId, answer, revision}` |
-| `POST /api/tasks/:id/decide` | `{decision: retry|skip|stop, revision}` |
+| `POST /api/tasks/:id/decide` | `{decision: retry|skip|stop|release, revision}` |
 | `POST /api/requests/:id/reject` | `{reason, tasks?: string[]}` |
 | `POST /api/requests/:id/cancel` | 중단 |
 | `POST /api/requests/:id/merge` | 보류된 병합 다시 제시 |

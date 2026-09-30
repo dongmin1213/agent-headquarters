@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Probes } from '../../src/cli/doctor.ts'
-import { doctorCommand, runDoctor } from '../../src/cli/doctor.ts'
+import { doctorCommand, riskySandboxPaths, runDoctor } from '../../src/cli/doctor.ts'
 import { daemonLabel, petLabel, plistPath } from '../../src/cli/ctx.ts'
 import { testCtx, writeToken, type TestCtx } from './helpers.ts'
 
@@ -229,4 +229,22 @@ test('team with sandbox "none" → warn with the opt-out text and fix; sandboxed
   // No teams.json → the committed example (no opt-out) is used: nothing to warn about.
   const clean = healthy()
   assert.equal(await doctorCommand(clean, { json: false, probes: probes() }), 0, clean.text())
+})
+
+test('team sandbox opening sensitive paths (~, ~/Library, ~/.config, LaunchAgents, shell rc, ~/.claude, ~/.codex) → warn; narrow paths do not', async () => {
+  const ctx = healthy()
+  writeFileSync(join(ctx.root, 'config/teams.json'), JSON.stringify([
+    { id: 'wide', name: '넓은 팀', pack: 'digimon', command: ['x'], cwd: '~/code/pipeline', everyMinutes: 30, enabled: true,
+      sandbox: { readable: ['~', '~/.config', '~/.zshrc', '~/.codex/auth.json', '/'], writable: ['~/Library/LaunchAgents', '~/.claude/', '~/.config/higgsfield'] } },
+    { id: 'narrow', name: '좁은 팀', pack: 'digimon', command: ['x'], cwd: '~/code/pipeline', everyMinutes: 30, enabled: true,
+      sandbox: { readable: ['~/.config/git', 'data', '~/Library/Caches/foo'], writable: ['~/.config/higgsfield', '~/.claude/projects/x'] } },
+  ]))
+  const code = await doctorCommand(ctx, { json: false, probes: probes() })
+  assert.equal(code, 6, ctx.text())
+  assert.match(ctx.text(), /\[경고\] 팀 넓은 팀: 샌드박스 설정이 민감한 경로를 열어요 \(~, ~\/\.config, ~\/\.zshrc, ~\/\.codex\/auth\.json, \/, ~\/Library\/LaunchAgents, ~\/\.claude\/\)/)
+  assert.doesNotMatch(ctx.text(), /팀 좁은 팀/)
+  assert.deepEqual(riskySandboxPaths({ cwd: '.', sandbox: { readable: ['~/Library'], writable: ['~/.bashrc', '~/.zprofile', '~/.profile'] } }, ctx.root, '/Users/x'), ['~/Library', '~/.bashrc', '~/.zprofile', '~/.profile'])
+  assert.deepEqual(riskySandboxPaths({ cwd: '.', sandbox: { readable: ['/Users/x/Library'], writable: ['/Users/x/.bashrc', '/Users/x/.zprofile', '/Users/x/.profile'] } }, ctx.root, '/Users/x'),
+    ['/Users/x/Library', '/Users/x/.bashrc', '/Users/x/.zprofile', '/Users/x/.profile'])
+  assert.deepEqual(riskySandboxPaths({ cwd: '.', sandbox: 'none' }, ctx.root), [])
 })

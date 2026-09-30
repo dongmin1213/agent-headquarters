@@ -1,13 +1,13 @@
 [
   {
     "id": "smoke",
-    "name": "시험 팀",
+    "name": "시험 팀 (예시 전용)",
     "pack": "digimon",
     "command": [
       "node",
-      "teams/smoke.ts"
+      "smoke.ts"
     ],
-    "cwd": ".",
+    "cwd": "~/code/hq-smoke",
     "everyMinutes": 60,
     "enabled": false
   },

@@ -167,9 +167,78 @@ test('unknown identity (ps failing) → not signalled even when cancelled; after
     assert.equal(t.status, 'blocked')
     assert.equal(t.note, UNKNOWN_NOTE(o.pid!))
     assert.deepEqual({ ...JSON.parse(t.lingering!), since: 'x' }, { pid: o.pid, lstart: 'Wed Sep 30 00:00:00 2026', since: 'x' })
-    const card = decisionItems(h.store, h.clock.t).find((d) => d.kind === 'blocked' && d.taskId === tid)!
+    let card = decisionItems(h.store, h.clock.t).find((d) => d.kind === 'blocked' && d.taskId === tid)!
     assert.ok(card.detail.includes(`pid ${o.pid}`), 'card shows the pid')
-    assert.ok(card.detail.includes(KILL_HINT(o.pid!)), 'card shows the manual stop hint')
+    assert.deepEqual(card.options, ['retry', 'release', 'skip', 'stop'])
+    // The next poll looks at the pid with ps (read-only): a /bin/sleep is not our worker → no kill hint.
+    await step(r)
+    card = decisionItems(h.store, h.clock.t).find((d) => d.kind === 'blocked' && d.taskId === tid)!
+    assert.ok(card.detail.includes(`이전 작업자 프로세스 (ps -o pid=,lstart=,command= -p ${o.pid}):`), card.detail)
+    if (!nestedSandbox) assert.match(card.detail, new RegExp(`${o.pid} .*sleep 30`), 'the ps line')
+    assert.ok(!card.detail.includes(KILL_HINT(o.pid!)), 'no kill hint for a process that does not look like a worker')
+    assert.equal(pidAlive(o.pid!), true)
+  } finally { reap(o.pid); await h.close() }
+})
+
+/** Blocked + lingering on `o` (identity unconfirmable through a failing lstart probe), with the given ps-info probe. */
+async function lingeringBlocked(h: Harness, pid: number, session: string, info?: Probe['info']): Promise<{ r: Runner; tid: string }> {
+  const { tid, aid } = await runningAttempt(h, pid, 'Wed Sep 30 00:00:00 2026')
+  h.store.updateAttempt(aid, { session_id: session })
+  const r = restart(h, { ...FAILING_PS, ...(info ? { info } : {}) })
+  await r.recover()
+  await unknownPolls(r, aid, 5)
+  h.clock.t += 30_000
+  await step(r)
+  assert.equal(tsk(h, tid).status, 'blocked')
+  await step(r) // checkLingering looks at the pid
+  return { r, tid }
+}
+const blockedCard = (h: Harness, tid: string) => decisionItems(h.store, h.clock.t).find((d) => d.kind === 'blocked' && d.taskId === tid)!
+
+test('lingering pid whose command line is our worker (claude bin + --session-id of its attempt) → kill hint; release clears it without a signal and retries', { skip: nestedSandbox && NESTED_PS_SKIP }, async () => {
+  const h = harness()
+  const session = randomUUID()
+  // `sh -c 'sleep 30; :' <bin> --session-id <s>`: argv shows the claude binary name and the attempt's session.
+  const o = owner(['-c', 'sleep 30; :', 'fake-claude.ts', '--session-id', session], '/bin/sh')
+  try {
+    await sleep(100)
+    const { r, tid } = await lingeringBlocked(h, o.pid!, session)
+    const card = blockedCard(h, tid)
+    assert.ok(card.detail.includes(`--session-id ${session}`), card.detail)
+    assert.ok(card.detail.includes(KILL_HINT(o.pid!)), 'kill hint for our worker')
+    assert.equal(card.optionHelp.release, '이전 작업자를 끝난 것으로 보고 새 시도를 허용해요 · 신호는 보내지 않아요')
+    assert.equal(r.decideTask(tid, 'release', tsk(h, tid).block_count), null)
+    const t = tsk(h, tid)
+    assert.equal(t.lingering, null)
+    assert.equal(t.status, 'rework')
+    assert.equal(h.store.get(`lingering.ps:${tid}`), null)
+    await sleep(100)
+    assert.equal(pidAlive(o.pid!), true, 'never signalled')
+  } finally { reap(o.pid); await h.close() }
+})
+
+test('lingering pid: same binary name but another session → no kill hint; ps failing → 확인할 수 없음 and no hint; release without lingering → refused', { skip: nestedSandbox && NESTED_PS_SKIP }, async () => {
+  const h = harness()
+  const o = owner(['-c', 'sleep 30; :', 'fake-claude.ts', '--session-id', randomUUID()], '/bin/sh')
+  try {
+    await sleep(100)
+    const { r, tid } = await lingeringBlocked(h, o.pid!, randomUUID())
+    let card = blockedCard(h, tid)
+    assert.ok(!card.detail.includes(KILL_HINT(o.pid!)), card.detail)
+    assert.ok(card.detail.includes('작업자 명령으로 보이지 않아 종료 방법은 안내하지 않아요'))
+    // ps cannot run → the card says so and never offers kill.
+    r.stop()
+    const r2 = restart(h, { ...FAILING_PS, info: async () => null })
+    await step(r2)
+    card = blockedCard(h, tid)
+    assert.match(card.detail, new RegExp(`-p ${o.pid}\\):\n확인할 수 없음`))
+    assert.ok(!card.detail.includes(KILL_HINT(o.pid!)))
+    assert.deepEqual(card.options, ['retry', 'release', 'skip', 'stop'])
+    // Without a lingering record the option is gone and refused.
+    h.store.updateTask(tid, { lingering: null })
+    assert.deepEqual(blockedCard(h, tid).options, ['retry', 'skip', 'stop'])
+    assert.match(r2.decideTask(tid, 'release', tsk(h, tid).block_count)!, /release는 이전 작업자가 남아 있을 때만/)
+    assert.equal(tsk(h, tid).status, 'blocked')
   } finally { reap(o.pid); await h.close() }
 })
 

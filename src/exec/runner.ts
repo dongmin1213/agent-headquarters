@@ -5,7 +5,7 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import type { Bus } from '../bus.ts'
 import { reviewModelOf, validateTasks, type Acceptance, type CeoPlan, type PlanTask, type Project } from '../ceo.ts'
@@ -14,7 +14,7 @@ import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../sto
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
 import { baseline, checksProfile, envFailure, runChecks, runSandboxed, setupChangedReason, trackedChanges, type BaseResult, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
 import { DONE_MAX, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
-import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, lingeringOf, lingeringWait, outDirOf, workerViews, type HeadlineInput, type Lingering } from './decisions.ts'
+import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, lingeringOf, lingeringPsKey, lingeringWait, outDirOf, RELEASE, workerViews, type HeadlineInput, type Lingering, type LingeringPs } from './decisions.ts'
 import { runDiagnoseTurn } from './diagnose.ts'
 import { atomicJson, atomicWrite, readJson, readText, sha256 } from './fsx.ts'
 import { currentBranch, isRepo, revParse, withRepo } from './git.ts'
@@ -27,7 +27,7 @@ import { canAutoApply, reviseDiff, reviseProblem, runReviseTurn } from './revise
 import { checkVerdict, ladderUp, VERDICT_SCHEMA } from './review.ts'
 import { claudeBinReadable, real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
 import { extractBashRuns, lastActivityOf, StreamTail } from './stream.ts'
-import { claudeArgs, defaultProbe, findOrphan, identify, killGroup, launch, LaunchAborted, pidAlive, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
+import { claudeArgs, defaultProbe, findOrphan, identify, killGroup, launch, LaunchAborted, looksLikeWorker, pidAlive, psInfo, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
 import { reconcile as reconcileInvariants, recover as recoverState, type Violation } from './reconcile.ts'
 
 export type Notify = (title: string, body: string) => void
@@ -623,10 +623,27 @@ export class Runner {
       const l = lingeringOf(t)
       let gone = !l || !pidAlive(l.pid)
       if (!gone && l!.lstart) gone = ['gone', 'other'].includes(await identify(l!.pid, l!.lstart, this.probe.lstart))
-      if (!gone) continue
-      if (!this.store.tx(() => { const cur = this.store.task(t.id); if (cur?.lingering !== t.lingering) return false; this.store.updateTask(t.id, { lingering: null }); return true })) continue
+      if (!gone) { await this.lookAtLingering(t, l!); continue }
+      if (!this.store.tx(() => {
+        const cur = this.store.task(t.id); if (cur?.lingering !== t.lingering) return false
+        this.store.updateTask(t.id, { lingering: null }); this.store.set(lingeringPsKey(t.id), null); return true
+      })) continue
       this.emitTask(t, `이전 작업자(pid ${l?.pid ?? '?'})가 끝났어요: ${t.title}`)
     }
+  }
+
+  /**
+   * The blocked card shows what the lingering pid is now (`ps` line) and offers `kill` only when that line looks like
+   * this task's worker (claude binary + its worktree or one of its attempt sessions). Read-only: nothing is signalled.
+   */
+  private async lookAtLingering(t: TaskRow, l: Lingering): Promise<void> {
+    let ps: string | null = null
+    try { ps = await (this.probe.info ?? psInfo)(l.pid) } catch { ps = null }
+    const sessions = this.store.attempts(t.id).filter((a) => a.pid === l.pid || !a.pid).map((a) => a.session_id)
+    const ours = ps !== null && looksLikeWorker(ps, { bin: basename(this.cfg.claudeBin), paths: t.worktree ? [t.worktree] : [], sessions })
+    const rec: LingeringPs = { lingering: t.lingering!, ps: ps?.slice(0, 2000) ?? null, ours }
+    const v = JSON.stringify(rec)
+    this.store.tx(() => { if (this.store.task(t.id)?.lingering === t.lingering && this.store.get(lingeringPsKey(t.id)) !== v) this.store.set(lingeringPsKey(t.id), v) })
   }
 
   private usage(result: Record<string, unknown> | null) {
@@ -1669,11 +1686,19 @@ export class Runner {
     if (!t || t.status !== 'blocked') return '차단된 작업이 아닙니다'
     if (t.block_count !== revision) return `오래된 revision입니다 (현재 ${t.block_count})`
     if (decision === 'stop') return this.cancelRequest(t.request_id)
-    if (decision !== 'retry' && decision !== 'skip') return 'decision은 retry | skip | stop 중 하나여야 합니다'
+    if (decision !== 'retry' && decision !== 'skip' && decision !== RELEASE) return 'decision은 retry | skip | stop | release 중 하나여야 합니다'
+    const ling = lingeringOf(t)
+    if (decision === RELEASE && !ling) return 'release는 이전 작업자가 남아 있을 때만 쓸 수 있습니다'
     this.store.tx(() => {
-      if (decision === 'retry') {
+      if (decision === RELEASE) {
+        // The chairman vouches that the earlier worker is gone: forget it without any signal, then retry.
+        this.store.updateTask(t.id, { lingering: null })
+        this.store.set(lingeringPsKey(t.id), null)
+      }
+      if (decision === 'retry' || decision === RELEASE) {
+        const said = decision === RELEASE ? `회장: 이전 작업자(pid ${ling!.pid})를 끝난 것으로 보고 진행 (신호 없음)` : '회장: 한 번 더 (같은 모델)'
         this.store.updateTask(t.id, { status: 'rework', attempts: Math.max(0, this.cfg.maxAttempts - 1), limited_streak: 0,
-          review_invalid: 0, resume_session: null, note: `회장: 한 번 더 (같은 모델)\n이전 사유: ${t.note ?? ''}`.slice(0, 2000) })
+          review_invalid: 0, resume_session: null, note: `${said}\n이전 사유: ${t.note ?? ''}`.slice(0, 2000) })
       } else {
         for (const x of [t, ...this.dependents(t)]) if (x.status !== 'passed' && x.status !== 'cancelled')
           this.store.updateTask(x.id, { status: 'cancelled', generation: x.generation + 1, note: x.id === t.id ? '회장: 이 작업 건너뛰기' : `선행 작업 ${t.key} 건너뜀` })

@@ -11,7 +11,7 @@ import { join } from 'node:path'
 import { createServer } from 'node:net'
 import { runSandboxed } from '../../src/exec/checks.ts'
 import { atomicWrite } from '../../src/exec/fsx.ts'
-import { cacheEnv, childEnv, claudeProjectDir, real, sandboxProfile, tempRoots, type SandboxOpts } from '../../src/exec/sandbox.ts'
+import { cacheEnv, childEnv, claudeProjectDir, HOME_READABLE, MACH_SERVICES, real, sandboxProfile, tempRoots, type SandboxOpts } from '../../src/exec/sandbox.ts'
 import { claudeArgs, killGroup, launch, removeCacheDir } from '../../src/exec/worker.ts'
 import { DEFAULTS } from '../../src/config.ts'
 import { makeRepo, sh, tmp } from './helpers.ts'
@@ -259,4 +259,16 @@ test('live contract: real claude -p (haiku) works in the profile and writes only
     assert.equal(existsSync(join(own, 'memory', 'MEMORY.md')), false, 'no memory written')
     for (const c of [a.cacheDir, b.cacheDir]) removeCacheDir(c)
   } finally { rmSync(own, { recursive: true, force: true }); s.server.close() }
+})
+
+test('docs/SETUP.md worker sandbox section names every HOME_READABLE entry and every MACH_SERVICES name (no drift)', () => {
+  const doc = readFileSync(join(import.meta.dirname, '../../docs/SETUP.md'), 'utf8')
+  const start = doc.indexOf('### 작업자 샌드박스')
+  assert.ok(start >= 0, 'section found')
+  const section = doc.slice(start, doc.indexOf('\n### ', start + 1))
+  assert.match(section, /v4/)
+  for (const [p] of HOME_READABLE) assert.ok(section.includes(`\`~/${p.replace(/\/$/, '')}\``), `SETUP.md misses ~/${p}`)
+  for (const [n] of MACH_SERVICES) assert.ok(section.includes(`\`${n}\``), `SETUP.md misses ${n}`)
+  // v3 wording is gone.
+  assert.doesNotMatch(section, /그 밖의 파일\*\*은 읽을 수는 있지만|\/private\/var\/folders`\)/)
 })

@@ -100,13 +100,28 @@ setup이 만든 추적되지 않는 파일·무시된 파일(검증 worktree 기
 모르는 키가 있으면 데몬이 시작을 거부하고 `hq doctor`가 `설정` 항목에서 그 오류 문장을 그대로 보여 줍니다.
 
 ### 작업자 샌드박스 (무엇을 만질 수 있나)
-작업자·검토자와 `setup`·검증 명령은 모두 macOS 샌드박스(`sandbox-exec`) 안에서 돌아갑니다. `hq doctor`는 실제로 작은 샌드박스를 만들어 "비밀 파일 읽기 거부 · 허용 폴더 쓰기 성공 · 그 밖 쓰기 거부"가 되는지 시험합니다.
-- **쓸 수 있는 곳**: 자기 작업 worktree, 자기 제출 폴더(`out/`: 보고서와 완료 파일만), 프로젝트의 `.git`(커밋하려면 필요), `~/.claude`(Claude 자체 설정), 임시 폴더(`/private/tmp`, `/private/var/folders`), `sandbox.extraWritable`에 적은 캐시 폴더.
-- **읽지도 쓰지도 못하는 곳**: `~/.config/hq`(API 토큰), `$HQ_HOME` 전체(DB, 다른 작업의 worktree와 증거). 자기 worktree와 자기 `out/`만 예외입니다.
-- **그 밖의 파일**은 읽을 수는 있지만 쓸 수 없습니다.
-- **네트워크**: hq 데몬 포트(`127.0.0.1:7777`)에는 접속할 수 없습니다. 작업자가 스스로 승인하는 일을 막기 위해서입니다.
+작업자·검토자와 `setup`·검증 명령은 모두 macOS 샌드박스(`sandbox-exec`, 규칙 v4) 안에서 돌아갑니다. 규칙은 `src/exec/sandbox.ts` 한 곳에서 만들어지고, 아래 목록은 그 파일의 `HOME_READABLE`·`MACH_SERVICES`와 같습니다(`test/unit/sandbox.test.ts`가 이 문서가 두 목록을 빠짐없이 적는지 확인합니다). `hq doctor`는 가짜 홈으로 실제 샌드박스를 만들어 홈 비밀 읽기 거부·허용 폴더 쓰기·그 밖 쓰기 거부·바깥 프로세스 신호 거부를 시험합니다.
+- **읽기**: 홈 폴더(`~`)는 기본적으로 **내용을 읽을 수 없습니다**(`~/Documents`, 셸 rc 파일, `~/.config`의 다른 도구 설정, `~/.codex`, 브라우저 프로필, `~/Library/Application Support` 등). 다음만 읽을 수 있습니다.
+  - `~/Library/Keychains`: 필수. 구독 로그인 토큰이 로그인 키체인에 있습니다(항목 자체는 securityd의 접근 제어를 받음).
+  - `~/.local/bin`, `~/.local/share/claude`: `claude` 실행 파일과 그 버전 폴더.
+  - `~/.gitconfig`, `~/.config/git`: git 사용자 설정과 전역 ignore.
+  - `~/.npm`: npm 캐시(읽기만, 쓰기는 실행별 캐시로 감).
+  - 자기 작업 폴더와 `out/`, hq 미러(읽기만), `sandbox.extraWritable`, 절대 경로로 지정한 `claudeBin`의 폴더, 자기 `~/.claude/projects/<cwd를 바꾼 이름>/`.
+  - `~/.claude`의 나머지(다른 프로젝트 기록, 설정, 메모리)와 `~/.claude.json`은 읽을 수 없습니다. `$HQ_HOME`과 등록된 프로젝트 원본 폴더도 읽을 수 없습니다(작업자는 hq 미러에서 만든 자기 clone만 씁니다).
+- **쓰기**: 자기 clone(작업 폴더), 자기 제출 폴더(`out/`: 보고서와 완료 파일만), 임시 폴더(`/private/tmp`와 이 사용자의 임시 폴더 `/var/folders/<x>/<y>/T`. 옆의 `C/` 캐시 폴더는 제외), `/dev`, `sandbox.extraWritable`, 자기 `~/.claude/projects/<cwd>/`(그 안의 `memory/`는 제외: 다음 세션에 읽히는 지시를 심지 못하게). `~/.claude`의 다른 곳, `~/.claude.json`, 설정·`CLAUDE.md`·skills·agents·commands·plugins·hooks는 쓸 수 없습니다.
+- **어떤 설정으로도 열리지 않는 곳**: `~/.config/hq`(API 토큰), `$HQ_HOME`의 DB·`runs`·`logs`·`work`, `~/.ssh`·`~/.aws`·`~/.config/gh`·`~/.netrc`·`~/.docker/config.json`, 등록된 프로젝트의 `.env*` 파일.
+- **실행별 캐시**: `npm_config_cache`·`XDG_CACHE_HOME`·`PIP_CACHE_DIR`은 실행마다 새로 만든 임시 폴더를 가리키고, 작업자 프로세스 그룹이 끝나면 지웁니다. 샌드박스 안에서 만든 캐시를 나중에 샌드박스 밖 프로그램이 읽는 일을 막기 위해서입니다.
+- **신호**: 같은 샌드박스 안의 프로세스에만 신호를 보낼 수 있습니다(hq, 사용자 셸, 다른 작업자에게는 못 보냄).
+- **macOS 서비스(mach-lookup)**: 기본 거부이고 다음 두 가지만 허용합니다: `com.apple.SecurityServer`(키체인에서 로그인 토큰 읽기), `com.apple.system.opendirectoryd.libinfo`(사용자 이름 조회: `whoami`·`id` 등). LaunchServices·launchd 같은 서비스는 막혀 있어 샌드박스 밖 앱을 띄우지 못하고, `open`·`osascript`·`launchctl` 실행과 Apple 이벤트도 막혀 있습니다.
+- **네트워크**: 열려 있지만 hq 데몬 포트(`127.0.0.1:7777`)에는 접속할 수 없습니다. 작업자가 스스로 승인하는 일을 막기 위해서입니다.
 - **환경 변수**: `PATH`, `HOME`, `LANG` 같은 기본값만 넘기고 API 키·토큰·`SSH_AUTH_SOCK`은 지웁니다. git push는 설정으로 막혀 있습니다.
-- **알려진 한계**: 커밋하려면 공유 `.git`에 써야 하므로, 작업자가 **다른 브랜치의 ref를 바꿀 수는 있습니다**. 그래서 hq는 브랜치 이름을 믿지 않고, 시도가 끝날 때 기록한 **커밋 SHA**로만 검증·통합·병합합니다. 작업자가 다른 브랜치를 건드려도 hq가 병합하는 내용은 바뀌지 않습니다.
+- **커밋**: 작업자는 hq 미러를 빌려 쓰는 자기 clone에서 커밋하고, 미러에는 쓸 수 없습니다. hq는 브랜치 이름을 믿지 않고 시도가 끝날 때 기록한 **커밋 SHA**만 가져와(개체 검사 포함) 검증·통합·병합합니다.
+- **알려진 한계** (v4에서도 남는 것):
+  - **키체인 항목**: 로그인 토큰 때문에 키체인 폴더와 securityd가 열려 있습니다. 항목마다의 접근 제어는 그대로지만, 접근 제어 없이 저장된 항목은 작업자도 요청할 수 있습니다.
+  - **`~/.gitconfig` 내용**: 읽을 수 있으므로 이 파일에 토큰이나 비밀이 든 URL을 적어 두지 마세요.
+  - **공유 임시 폴더**: `/private/tmp`와 사용자 임시 폴더는 다른 작업자와 사용자 프로그램도 같이 씁니다. 비밀을 임시 폴더에 두지 마세요.
+  - **`setsid` 탈출**: 작업자가 `setsid`로 새 프로세스 그룹을 만들면 hq의 그룹 종료(시간 초과·취소)에 걸리지 않고 남을 수 있습니다. 그 프로세스도 샌드박스 규칙은 그대로 받습니다.
+- **반복 팀**: 팀 명령도 같은 v4 규칙 조각(신호·mach 허용 목록·홈 읽기 기본 거부·`~/.claude` 쓰기 제한·실행 차단)으로 만든 프로필 안에서 돕니다. 차이는 팀 폴더(`cwd`) 읽기·쓰기, 설정한 추가 경로(`sandbox.readable`·`writable`·`mach`), 열려 있는 hq 포트(범위 토큰으로만 접속)이고, 마지막 규칙으로 hq 저장소 쓰기를 막습니다. 자세한 내용은 아래 "반복 팀"에 있습니다.
 
 ### 비밀 파일
 비밀값(`.env`, 개인 키, 인증서)을 **커밋해 둔 저장소는 등록을 지원하지 않습니다**. 작업자는 자기 clone에서 git이 추적하는 파일을 모두 읽을 수 있고, 샌드박스는 추적 파일을 가리지 않습니다. `hq doctor`는 등록된 프로젝트에서 `git ls-files`로(읽기만) `.env*`, `*.pem`, `id_rsa*`, `*.p12`, `*.key`에 맞는 추적 파일을 찾아 `비밀 파일 <id>` 경고를 냅니다. 해결: `git rm --cached <파일>`로 추적을 멈추고 `.gitignore`에 넣은 뒤, 이미 커밋된 값은 새 값으로 바꾸세요(이력에 남아 있으므로).
@@ -133,7 +148,8 @@ setup이 만든 추적되지 않는 파일·무시된 파일(검증 worktree 기
     - 같은 샌드박스 밖 프로세스에는 신호를 못 보내고, macOS 서비스(mach-lookup)는 키체인·사용자 정보 두 가지만 쓸 수 있으며, `open`·`osascript`·`launchctl`·Apple 이벤트로 샌드박스 밖 프로그램을 띄우지 못합니다.
     - 홈 폴더(`~`)는 기본적으로 **내용을 읽을 수 없고**, 다음만 읽을 수 있습니다: `~/Library/Keychains`, `~/.local/bin`, `~/.local/share/claude`, `~/.gitconfig`, `~/.config/git`, `~/.npm`(읽기만), 팀 폴더(`cwd`), 자기 `~/.claude/projects/<cwd를 바꾼 이름>/`(팀이 부르는 `claude -p`의 기록).
     - 쓸 수 있는 곳: 팀 폴더(`cwd`), 임시 폴더(`/private/tmp`와 사용자 임시 폴더), 자기 `~/.claude/projects/<cwd>/`(그 안의 `memory/`는 제외). `~/.claude`의 다른 곳·`~/.claude.json`·설정 파일은 쓸 수 없습니다.
-    - 데몬 토큰 폴더(`~/.config/hq`), `$HQ_HOME`, `~/.ssh`·`~/.aws`·`~/.config/gh`·`~/.netrc`·`~/.docker/config.json`은 어떤 설정으로도 열리지 않습니다. 팀 폴더를 `$HQ_HOME` 아래에 두지 마세요.
+    - 데몬 토큰 폴더(`~/.config/hq`), `$HQ_HOME`, `~/.ssh`·`~/.aws`·`~/.config/gh`·`~/.netrc`·`~/.docker/config.json`은 어떤 설정으로도 열리지 않고, hq 저장소는 어떤 설정으로도 쓸 수 없습니다(프로필의 마지막 규칙).
+    - **팀 폴더 제한**: 팀 `cwd`가 hq 저장소나 `$HQ_HOME`과 같거나, 그 위(조상)나 안에 있으면 그 팀은 실행하지 않고 말풍선에 `실행할 수 없어요: 팀 폴더가 hq 저장소나 hq 데이터와 겹쳐요`를 띄웁니다. 팀이 자기 격리 설정(`config/teams.json`)이나 데몬 코드를 고치지 못하게 하기 위해서입니다. 예시 파일의 `smoke` 팀(`~/code/hq-smoke`)은 예시 전용이고 꺼져 있습니다.
     - 네트워크는 열려 있습니다(웹 API, 그리고 범위 토큰으로 hq에 연결). npm·pip·XDG 캐시는 실행마다 새 임시 폴더를 쓰고 실행이 끝나면 지웁니다.
   - **경로 더 허용하기**: 팀이 홈의 다른 경로를 써야 하면 팀 항목에 `"sandbox": {"readable": ["~/경로"], "writable": ["~/경로"]}`를 넣습니다(`~` 가능, 상대 경로는 `cwd` 기준, `writable`은 읽기도 허용). 모두 공통 허용 목록이 아니라 그 팀에만 적용됩니다. 수익자동화 파이프라인(`hq_team.py`: 리서치·대본·승인 묶음)은 추가 경로 없이 돕니다(측정: `.venv` 가져오기, `hq_team.py`, `claude -p` haiku, 파이썬 https, 파이프라인 자체 테스트 12개, `yt-dlp` 조회, `ffmpeg-full` drawtext). 참고로 측정된 예외:
     - **Higgsfield CLI**(유료 단계, 지금은 팀이 아니라 사용자가 직접 실행): 설정 폴더 쓰기와 함께, HTTPS 인증서 확인에 macOS `trustd` 서비스가 필요합니다. 없으면 `request failed (no response received)`로 실패합니다. 팀이 Higgsfield를 불러야 한다면 아래처럼 허용합니다(측정: `higgsfield account status` 성공).
@@ -142,6 +158,7 @@ setup이 만든 추적되지 않는 파일·무시된 파일(검증 worktree 기
       ```
   - **mach 서비스 더하기**: `"sandbox": {"mach": [...]}`에는 hq가 정한 허용 목록(`src/exec/sandbox.ts`의 `TEAM_MACH_ALLOWED`)에 있는 이름만 넣을 수 있습니다. 지금 목록은 `com.apple.trustd.agent`(인증서 확인) 하나뿐입니다. 다른 이름을 넣으면 실행하지 않고 `실행할 수 없어요: 허용되지 않은 mach 서비스 <이름>`으로 끝납니다. LaunchServices·launchd 같은 서비스는 샌드박스 밖 프로그램을 띄우는 통로라서 목록에 넣지 않습니다.
   - **샌드박스 끄기**: `"sandbox": "none"`이면 그 팀은 샌드박스 없이 돕니다(범위 토큰·환경 변수 정리는 그대로). 명시적인 예외이므로 `hq doctor`가 `[경고] 팀 <이름>: 샌드박스 없이 실행돼요 (config/teams.json sandbox: "none")`로 계속 알립니다.
+  - **민감한 경로 경고**: `readable`·`writable`에 홈 폴더 자체, `~/Library`, `~/.config` 전체, `~/Library/LaunchAgents`(그 안 포함), 셸 rc 파일(`~/.zshrc`·`~/.bashrc`·`~/.zprofile`·`~/.profile`), `~/.claude` 전체, `~/.codex`(그 안 포함), 또는 이들을 품는 상위 폴더(예: `/`)를 넣으면 실행은 되지만 `hq doctor`가 `[경고] 팀 <이름>: 샌드박스 설정이 민감한 경로를 열어요 (<경로>)`로 알립니다. 꼭 필요한 하위 폴더나 파일로 좁혀 주세요.
   - **환경 변수**: 부모 환경에서 `HQ_TOKEN_FILE`과 이름이 `_TOKEN`·`_KEY`로 끝나거나 `ANTHROPIC_`·`OPENAI_`로 시작하는 변수는 빼고 넘깁니다(범위 토큰 `HQ_TOKEN`, `HQ_URL`, `HQ_TEAM`은 hq가 넣음). 팀에 필요한 키는 팀 폴더의 비밀 파일(예: `.env`)에서 읽으세요.
 - 팀 출력은 `$HQ_HOME/logs/teams/<팀 id>/<실행 번호>.log`에 쌓이고(팀마다 최근 50개), hq는 이 파일에서 `STATUS:` 줄과 종료 코드를 읽습니다. 팀 프로세스는 데몬과 따로 돌기 때문에 hq를 재시작해도 끊기지 않고, 재시작한 hq가 pid와 시작 시각으로 같은 프로세스인지 확인해 이어서 지켜봅니다(새 실행을 겹쳐 시작하지 않음). 이미 끝났다면 로그의 종료 코드로 마무리하고, 종료 코드가 없으면 `지난 실행이 중단됐어요 · 다음 실행 때 이어서 해요`로 둡니다. 같은 프로세스인지 확인할 수 없으면(`ps` 실패) 신호를 보내지 않고 새로 시작하지도 않으며, 회장에게 카드 `<팀>: 이전 실행을 확인할 수 없어요`(pid와 명령 줄 포함)를 올립니다.
   - `끝난 것으로 보고 다시 시작`: 그 실행을 종료 코드 -1로 닫고(프로세스에는 신호를 보내지 않음) 바로 새 실행을 허용합니다. 말풍선은 `확인할 수 없던 이전 실행을 끝난 것으로 봤어요 · 다시 시작해요`.
