@@ -88,3 +88,30 @@ test('17. API: encoded ids, question ownership, team card namespace, evidence al
     assert.equal((await call('GET', '/api/nope')).body.error.length > 0, true)
   } finally { server.close(); await h.close() }
 })
+
+test('decide release: refused (400) without a lingering earlier worker; accepted with one → lingering cleared, retried, never signalled', async () => {
+  const h = harness()
+  const { server, call } = await api(h)
+  try {
+    const id = h.plan([task('B', { brief: '[[FAKE:nodone]]' })])
+    assert.equal((await call('POST', `/api/approvals/${enc(`plan:${id}`)}`, { decision: '승인', subjectHash: h.store.approval(`plan:${id}`)!.subjectHash })).status, 200)
+    const tid = `${id}.B`
+    await h.waitFor(() => tsk(h, tid).status === 'blocked', 'blocked')
+    const bc = tsk(h, tid).block_count
+    const refused = await call('POST', `/api/tasks/${enc(tid)}/decide`, { decision: 'release', revision: bc })
+    assert.equal(refused.status, 400)
+    assert.match(refused.body.error, /release는 이전 작업자가 남아 있을 때만/)
+    assert.equal(tsk(h, tid).status, 'blocked')
+    // A recorded earlier worker (a pid that is not running: release sends nothing either way).
+    h.runner.stop()
+    h.store.updateTask(tid, { lingering: JSON.stringify({ pid: 4_000_000, lstart: null, since: new Date().toISOString() }) })
+    const card = (await call('GET', '/api/state')).body.decisions.find((d: { taskId: string }) => d.taskId === tid)
+    assert.deepEqual(card.options, ['retry', 'release', 'skip', 'stop'])
+    assert.equal(card.optionHelp.release, '이전 작업자를 끝난 것으로 보고 새 시도를 허용해요 · 신호는 보내지 않아요')
+    assert.equal((await call('POST', `/api/tasks/${enc(tid)}/decide`, { decision: 'release', revision: bc })).status, 200)
+    const t = tsk(h, tid)
+    assert.equal(t.lingering, null)
+    assert.equal(t.status, 'rework')
+    assert.match(t.note!, /^회장: 이전 작업자\(pid 4000000\)를 끝난 것으로 보고 진행 \(신호 없음\)/)
+  } finally { server.close(); await h.close() }
+})

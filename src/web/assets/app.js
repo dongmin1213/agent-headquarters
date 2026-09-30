@@ -387,7 +387,7 @@ function decisionCard(d) {
       : (answer) => post(`/tasks/${enc(d.taskId ?? '')}/answer`, { questionId: d.id, answer, revision: d.revision }, '답변을 보냈어요')
     actions.push(...answerControls(key, opts, busy, send, rec?.option))
   } else if (d.kind === 'blocked') {
-    // Options are wire values (retry|skip|stop); unknown values are shown but cannot be sent.
+    // Options are wire values (retry|release|skip|stop); unknown values are shown but cannot be sent.
     opts.forEach((decision, i) => {
       const label = BLOCKED_LABEL[decision] ?? decision
       const known = decision in BLOCKED_LABEL

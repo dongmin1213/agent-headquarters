@@ -1163,8 +1163,9 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         let project = projectPicker?.selectedItem?.representedObject as? String ?? ""
         post("api/requests", body: ["text": text, "project": project]); popover?.close()
     }
-    /// Blocked-card options are the wire values retry | skip | stop; labels are fixed here.
-    static let blockedLabels = ["retry": "한 번 더", "skip": "이 작업 건너뛰기", "stop": "요청 중단"]
+    /// Blocked-card options are the wire values retry | release | skip | stop; labels are fixed here.
+    /// Glossary copy: must match src/glossary.ts BLOCKED_LABELS (test/unit/glossary.test.ts).
+    static let blockedLabels = ["retry": "한 번 더", "release": "끝난 것으로 보고 진행", "skip": "이 작업 건너뛰기", "stop": "요청 중단"]
     /// Small label above a 내 차례 card; kinds without one (and unknown kinds) render without it.
     /// Glossary copy: must match src/glossary.ts KIND_LABELS (test/unit/glossary.test.ts).
     static let kindLabels = [

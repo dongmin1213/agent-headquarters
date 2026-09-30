@@ -199,7 +199,7 @@ stream.jsonl → activity.jsonl `{at, kind: message|tool|error|usage, text}`. �
 | `GET /api/requests/:id/diff?task=<key>` | `{files:[{path,added,removed}], diff, truncated}` base..head, 2MB |
 | `POST /api/requests` / `POST /api/requests/:id/answer` | 기존 (answer는 questionId가 그 요청 소유일 때만) |
 | `POST /api/tasks/:id/answer` | `{questionId, answer, revision}` |
-| `POST /api/tasks/:id/decide` | `{decision: retry|skip|stop, revision}` |
+| `POST /api/tasks/:id/decide` | `{decision: retry|skip|stop|release, revision}` |
 | `POST /api/requests/:id/reject` | `{reason, tasks?: string[]}` |
 | `POST /api/requests/:id/cancel` | 중단 |
 | `POST /api/requests/:id/merge` | 보류된 병합 다시 제시 |

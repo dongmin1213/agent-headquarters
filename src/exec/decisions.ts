@@ -8,6 +8,9 @@ import { explainError } from '../humanize.ts'
 
 const ORDER: DecisionItem['kind'][] = ['system', 'plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge', 'team']
 export const BLOCKED_OPTIONS = ['retry', 'skip', 'stop']
+/** Extra blocked option while an earlier worker may still run: forget it (no signal), then retry. */
+export const RELEASE = 'release'
+export const BLOCKED_OPTIONS_LINGERING = ['retry', RELEASE, 'skip', 'stop']
 
 function approvalRequestId(store: Store, a: ApprovalRow): string {
   if (a.subjectId) return a.subjectId
@@ -21,6 +24,7 @@ export const OPTION_HELP: Record<string, string> = {
   retry: '같은 작업을 같은 모델로 한 번 더 해요 · 사용량이 들어요',
   skip: '이 작업과 여기에 의존하는 작업을 빼고 계속해요 · 나중에 새 요청으로 다시 할 수 있어요',
   stop: '요청 전체를 멈춰요 · 만든 브랜치는 남겨 둬요',
+  release: '이전 작업자를 끝난 것으로 보고 새 시도를 허용해요 · 신호는 보내지 않아요',
   수락: '통합본을 병합 대기로 넘겨요 · 병합은 따로 승인해요',
   반려: '사유를 붙여 다시 작업시켜요',
   병합: '대상 브랜치에 fast-forward로 반영해요',
@@ -55,6 +59,21 @@ export function lingeringOf(t: Pick<TaskRow, 'lingering'>): Lingering | null {
 }
 export const lingeringWait = (pid: number) => `이전 작업자(pid ${pid})가 끝나기를 기다려요`
 export const lingeringKillHint = (pid: number) => `직접 종료하려면: kill -TERM -${pid} (프로세스 그룹)`
+/** kv key of the last `ps` look at a lingering pid: `{ lingering, ps, ours }` (written by the runner each poll). */
+export const lingeringPsKey = (taskId: string) => `lingering.ps:${taskId}`
+export interface LingeringPs { lingering: string; ps: string | null; ours: boolean }
+export const LINGERING_PS_UNKNOWN = '확인할 수 없음'
+export const LINGERING_NOT_OURS = '작업자 명령으로 보이지 않아 종료 방법은 안내하지 않아요 · 다른 프로그램일 수 있어요'
+
+/** Card lines for a lingering pid: the `ps` line (or 확인할 수 없음) and the kill hint only when it looks like our worker. */
+function lingeringDetail(store: Store, t: TaskRow, l: Lingering): string[] {
+  let seen: LingeringPs | null = null
+  try { const v = JSON.parse(store.get(lingeringPsKey(t.id)) ?? 'null') as LingeringPs | null; if (v && v.lingering === t.lingering) seen = v } catch { /* unknown */ }
+  const lines = [`이전 작업자 프로세스 (ps -o pid=,lstart=,command= -p ${l.pid}):`, seen?.ps ? seen.ps.slice(0, 500) : LINGERING_PS_UNKNOWN]
+  if (seen?.ps && seen.ours) lines.push(lingeringKillHint(l.pid))
+  else if (seen?.ps) lines.push(LINGERING_NOT_OURS)
+  return lines
+}
 /** Statuses in which a task waits for a slot; a gated one waits for its earlier worker instead. */
 const QUEUED = new Set(['pending', 'rework', 'held'])
 
@@ -148,12 +167,13 @@ export function decisionItems(store: Store, now = Date.now(), teamNames: Record<
       detailPath: detailPath(t.request_id, t.id), options: q.options, subjectHash: null, createdAt: q.created_at })
   }
   for (const t of store.tasksByStatus(['blocked'])) {
-    const ex = diagnosed(t.diagnosis, BLOCKED_OPTIONS, { situation: `작업이 막혔어요: ${t.title} · 어떻게 할지 정해 주세요`, cause: t.note ? explainError(t.note).cause : null, causeConfirmed: true, recommendation: null,
-      optionHelp: { retry: OPTION_HELP.retry, skip: OPTION_HELP.skip, stop: OPTION_HELP.stop } })
     const ling = lingeringOf(t)
-    const detail = ling ? [t.note ?? '', lingeringKillHint(ling.pid)].filter(Boolean).join('\n') : t.note ?? ''
+    const options = ling ? BLOCKED_OPTIONS_LINGERING : BLOCKED_OPTIONS
+    const ex = diagnosed(t.diagnosis, options, { situation: `작업이 막혔어요: ${t.title} · 어떻게 할지 정해 주세요`, cause: t.note ? explainError(t.note).cause : null, causeConfirmed: true, recommendation: null,
+      optionHelp: Object.fromEntries(options.map((o) => [o, OPTION_HELP[o]])) })
+    const detail = ling ? [t.note ?? '', ...lingeringDetail(store, t, ling)].filter(Boolean).join('\n') : t.note ?? ''
     items.push({ kind: 'blocked', id: t.id, revision: t.block_count, requestId: t.request_id, taskId: t.id, title: `작업이 막혔어요: ${t.title}`, detail, ...ex, confirm: { stop: CONFIRM_STOP },
-      detailPath: detailPath(t.request_id, t.id), options: BLOCKED_OPTIONS, subjectHash: null, createdAt: t.updated_at })
+      detailPath: detailPath(t.request_id, t.id), options, subjectHash: null, createdAt: t.updated_at })
   }
   return items.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || a.createdAt.localeCompare(b.createdAt))
 }

@@ -2,6 +2,7 @@
 // Copies that cannot import this file must stay identical (test/unit/glossary.test.ts checks them):
 //   src/web/assets/lib.js  GLOSSARY / KIND_LABELS
 //   pet/main.swift         Pet.kindLabels
+//   src/web/assets/lib.js  BLOCKED_LABEL / pet/main.swift Pet.blockedLabels
 
 /** Words for the same things everywhere. "CEO" is never shown: the agent is 사장. */
 export const GLOSSARY = {
@@ -24,4 +25,12 @@ export const KIND_LABELS = {
   accept: '결과 수락',
   merge: '병합 승인',
   team: '팀 결정',
+} as const
+
+/** Button labels of `blocked` card options; the options themselves are wire values (execution.md §17). */
+export const BLOCKED_LABELS = {
+  retry: '한 번 더',
+  release: '끝난 것으로 보고 진행',
+  skip: '이 작업 건너뛰기',
+  stop: '요청 중단',
 } as const

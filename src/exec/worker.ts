@@ -39,6 +39,25 @@ export function psLstart(pid: number): Promise<string | null> {
 
 export type PsLstart = (pid: number) => Promise<string | null>
 
+/** `ps -o pid=,lstart=,command= -p <pid>` output (LC_ALL=C), or null when the process is gone or ps cannot run (never rejects). */
+export function psInfo(pid: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    try {
+      execFile('ps', ['-o', 'pid=,lstart=,command=', '-p', String(pid)], { env: { ...process.env, LC_ALL: 'C' } },
+        (err, out) => resolve(err ? null : String(out).trim() || null))
+    } catch { resolve(null) }
+  })
+}
+
+/**
+ * Whether a `ps` line looks like one of our workers: it names the claude binary and either one of the task's paths
+ * (worktree/clone) or one of its attempt sessions (`--session-id <id>` / `--resume <id>`).
+ */
+export function looksLikeWorker(line: string, o: { bin: string; paths: string[]; sessions: string[] }): boolean {
+  if (!o.bin || !line.includes(o.bin)) return false
+  return o.paths.some((p) => !!p && line.includes(p)) || o.sessions.some((s) => !!s && (line.includes(`--session-id ${s}`) || line.includes(`--resume ${s}`)))
+}
+
 /** Calls a ps function, turning a synchronous throw or a rejection into null. */
 async function safeLstart(ps: PsLstart, pid: number): Promise<string | null> {
   try { return await ps(pid) } catch { return null }
@@ -84,8 +103,12 @@ export function psGroupMembers(pgid: number): Promise<number[] | null> {
 }
 
 /** How identity is observed; tests inject failing or swapped probes. */
-export interface Probe { lstart: PsLstart; members: (pgid: number) => Promise<number[] | null> }
-export const defaultProbe: Probe = { lstart: psLstart, members: psGroupMembers }
+export interface Probe {
+  lstart: PsLstart; members: (pgid: number) => Promise<number[] | null>
+  /** `ps -o pid=,lstart=,command=` line for the lingering-worker card (default psInfo). */
+  info?: (pid: number) => Promise<string | null>
+}
+export const defaultProbe: Probe = { lstart: psLstart, members: psGroupMembers, info: psInfo }
 
 /**
  * Identity of the process group led by `pid`. When the leader is gone but members of its group remain, the group is

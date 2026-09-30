@@ -235,8 +235,8 @@ export function confirmStep(open, key, d, option, step = 'pick') {
   return 'confirm'
 }
 
-/** Fixed display labels for `blocked` card options, which are wire values retry|skip|stop (execution.md §17). */
-export const BLOCKED_LABEL = { retry: '한 번 더', skip: '이 작업 건너뛰기', stop: '요청 중단' }
+/** Fixed display labels for `blocked` card options, which are wire values retry|release|skip|stop (execution.md §17; = src/glossary.ts BLOCKED_LABELS). */
+export const BLOCKED_LABEL = { retry: '한 번 더', release: '끝난 것으로 보고 진행', skip: '이 작업 건너뛰기', stop: '요청 중단' }
 /** Board columns, in order. */
 export const TASK_GROUPS = [
   { id: 'wait', label: '대기', statuses: ['pending', 'rework', 'revising', 'held'] },
