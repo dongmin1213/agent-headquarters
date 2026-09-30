@@ -51,13 +51,22 @@ export function daemonPlist(o: DaemonPlistOpts): string {
   })
 }
 
-export function petPlist(o: { label: string; appBinary: string; logFile: string }): string {
+export interface PetPlistOpts { label: string; appBinary: string; logFile: string; port: number; tokenFile: string; suffix: string | null }
+
+/**
+ * The pet reads HQ_URL and HQ_TOKEN_FILE (pet/main.swift). A non-default installation also gets its own defaults suite
+ * (character positions) and may run next to the default pet (HQ_ALLOW_SECOND_INSTANCE skips the single-instance exit).
+ */
+export function petPlist(o: PetPlistOpts): string {
+  const env: Record<string, string> = { HQ_URL: `http://127.0.0.1:${o.port}`, HQ_TOKEN_FILE: o.tokenFile }
+  if (o.suffix) { env.HQ_DEFAULTS_SUITE = `hqpet.${o.suffix}`; env.HQ_ALLOW_SECOND_INSTANCE = '1' }
   return renderPlist({
     Label: o.label,
     ProgramArguments: [o.appBinary],
     RunAtLoad: true,
     ProcessType: 'Interactive',
     LimitLoadToSessionType: 'Aqua',
+    EnvironmentVariables: env,
     StandardOutPath: o.logFile,
     StandardErrorPath: o.logFile,
   })

@@ -1,7 +1,7 @@
 // hq operator CLI. Exit codes: 0 ok, 1 error, 2 usage, 5 doctor fail, 6 doctor warn.
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { makeCtx, runCmd, type Ctx } from './ctx.ts'
+import { makeCtx, partialOverride, runCmd, type Ctx } from './ctx.ts'
 import { logs, openUi, restart, start, status, stop } from './daemon.ts'
 import { doctorCommand } from './doctor.ts'
 import { install, uninstall } from './install.ts'
@@ -23,7 +23,7 @@ export const HELP = `hq — agent-headquarters 운영 명령
   projects remove <id>
   version | help
 
-환경 변수: HQ_HOME, HQ_PORT, HQ_TOKEN_FILE, HQ_LAUNCH_AGENTS_DIR, HQ_DRY_RUN=1 (실행 대신 출력)
+환경 변수: HQ_HOME, HQ_PORT, HQ_TOKEN_FILE, HQ_LAUNCH_AGENTS_DIR (다른 설치를 다룰 때는 넷 모두 지정), HQ_DRY_RUN=1 (실행 대신 출력)
 자세한 안내: docs/SETUP.md`
 
 interface Parsed { pos: string[]; flags: Map<string, string | true> }
@@ -79,6 +79,10 @@ export async function main(argv: string[], ctx: Ctx): Promise<number> {
   if (!allowed) return usage(ctx, `알 수 없는 명령 "${cmd}"`)
   for (const f of flags.keys()) if (!allowed.includes(f)) return usage(ctx, `${cmd}에 쓸 수 없는 옵션 ${f}`)
   const json = flags.has('--json')
+  // Commands that write, delete or signal must not mix an overridden installation with the default one.
+  const writes = ['install', 'uninstall', 'start', 'stop', 'restart'].includes(cmd) || (cmd === 'projects' && ['add', 'remove', 'rm'].includes(pos[0] ?? ''))
+  const partial = writes ? partialOverride(ctx) : null
+  if (partial) { ctx.err(partial); return 2 }
   const noArgs = (n: number) => pos.length > n
 
   switch (cmd) {

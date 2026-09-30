@@ -50,7 +50,7 @@ bin/hq install                             # 진단 → 스프라이트 → 펫 
 | 명령 | 설명 |
 | --- | --- |
 | `hq status [--json]` | 데몬 상태, 상황 문장, 작업자, 결정 대기 건수, 사용 한도 |
-| `hq start` / `hq stop` / `hq restart` | 데몬 제어. 설치했으면 launchd로, 아니면 백그라운드 프로세스로. 포트가 응답하거나 데몬 잠금(`$HQ_HOME/daemon.lock`)의 pid가 살아 있으면 시작 거부. `stop`은 잠금의 pid만, 그것이 `src/main.ts`일 때만 종료 |
+| `hq start` / `hq stop` / `hq restart` | 데몬 제어. 설치했으면 launchd로, 아니면 백그라운드 프로세스로. 포트가 응답하거나 데몬 잠금(`$HQ_HOME/daemon.lock`)의 pid가 살아 있으면 시작 거부. launchd로 설치한 데몬은 launchctl로만 멈추고, 백그라운드 데몬은 잠금 파일의 신원(pid·포트·저장소·`HQ_HOME`·시작 시각)이 모두 맞고 명령줄이 `<저장소>/src/main.ts`일 때만 종료. 예전 형식(pid 한 줄) 잠금은 확인할 수 없어 종료하지 않음 |
 | `hq open` | 웹 화면 열기 (60초짜리 일회용 링크, 세션은 그 탭에만) |
 | `hq logs [-f] [-n 줄]` | 데몬 로그 (`$HQ_HOME/logs/daemon.log`, 10MB마다 교체, 3개 보관) |
 | `hq projects list` / `add <경로> [--id x] [--name y] [--setup "<명령>"]` / `remove <id>` | 프로젝트 목록 편집. 바꾼 뒤 `hq restart` |
@@ -107,6 +107,8 @@ hq projects add ~/code/web --setup "npm ci --prefer-offline"
 ### 환경 변수 (CLI)
 `HQ_HOME`, `HQ_PORT`(기본 7777), `HQ_TOKEN_FILE`(기본 `~/.config/hq/token`), `HQ_LAUNCH_AGENTS_DIR`(기본 `~/Library/LaunchAgents`), `HQ_DRY_RUN=1`(launchctl·open·빌드를 실행하지 않고 출력만).
 
+기본 설치가 아닌 다른 설치를 다룰 때는 앞의 네 가지(`HQ_HOME`·`HQ_PORT`·`HQ_TOKEN_FILE`·`HQ_LAUNCH_AGENTS_DIR`)를 **모두** 지정해야 합니다. 일부만 지정하면 기본 설치와 섞이므로 `install`·`uninstall`·`start`·`stop`·`restart`·`projects add/remove`는 아무것도 하지 않고 거부합니다(`status`·`doctor`는 그대로 동작). 다른 설치의 펫은 자기 포트와 토큰으로 연결되고, 캐릭터 위치를 따로 저장합니다.
+
 ### 펫 말풍선 글자 크기
 `~/.config/hq/pet.json`에 `{"bubbleFontSize": 12}` 형식으로 씁니다. 기본값은 10이고 범위는 8~24입니다. 파일이나 키가 없으면 10을 쓰고, 값이 잘못되었거나 JSON이 깨져 있으면 10을 쓰면서 로그에 `pet.json:` 경고를 남깁니다. 펫을 다시 켜야 반영되며, 파일 경로는 `HQ_PET_CONFIG`로 바꿀 수 있습니다.
 
@@ -137,7 +139,7 @@ hq projects add ~/code/web --setup "npm ci --prefer-offline"
 | 토큰 파일 | 경고: 없음 | `hq start` (데몬이 처음 뜰 때 만듦) |
 | 토큰 파일 | 실패: 0600 아님 | `chmod 600 ~/.config/hq/token` |
 | 포트 7777 | 실패: 다른 프로그램 | `lsof -nP -iTCP:7777 -sTCP:LISTEN`로 확인 후 종료, 또는 `HQ_PORT` 변경 |
-| 포트 7777 | 실패: 토큰이 다름(401) | 다른 토큰을 쓰는 hq가 떠 있음 → 그 프로세스 종료 후 `hq start` |
+| 포트 7777 | 실패: 토큰이 다름(401) | 토큰이 맞지 않음 → `hq restart`로 데몬을 다시 띄우거나 `HQ_TOKEN_FILE`이 가리키는 토큰 파일 확인 |
 | 데몬 잠금 | 경고: 오래된 잠금 / pid 재사용 | `hq start`(데몬이 넘겨받음). 안 되면 `rm $HQ_HOME/daemon.lock` |
 | 데몬 | 경고: 실행 중 아님 | `hq start`, 로그인 자동 시작은 `hq install`. 바로 죽으면 `hq logs` |
 | 데스크 펫 | 경고: 실행 중 아님 / 빌드 안 됨 | `open pet/HQPet.app` 또는 `hq install` |
@@ -160,4 +162,5 @@ hq projects add ~/code/web --setup "npm ci --prefer-offline"
 hq uninstall                 # 자동 시작 해제, plist 삭제, 데몬·펫 종료. 데이터는 남김
 hq uninstall --purge --yes   # $HQ_HOME(DB·worktree·증거), 토큰, 빌드한 펫까지 삭제
 ```
+`--purge`는 지우기 전에 모두 확인하고, 하나라도 맞지 않으면 아무것도 지우지 않습니다: `$HQ_HOME`에 `hq install`이 만든 표식 `.hq-install`(이 저장소·포트)이 있어야 하고, 토큰 경로는 일반 파일이어야 하며(폴더·심볼릭 링크 거부), 데몬이 멈춘 것을 확인해야 합니다. 빌드한 펫 앱은 기본 설치에서만 지웁니다(다른 설치와 함께 쓰므로). 표식이 생기기 전에 설치했다면 `hq install`을 한 번 다시 실행하면 표식이 생깁니다.
 저장소 폴더와 `config/`는 지우지 않습니다. 마지막으로 저장소 폴더를 지우면 끝입니다.

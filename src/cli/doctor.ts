@@ -2,7 +2,7 @@
 import { accessSync, constants, existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { loadConfig } from '../config.ts'
-import { probeHq, type HqProbe } from './api.ts'
+import { probeHq, tokenMismatchMsg, type HqProbe } from './api.ts'
 import { pidCommand, readLockPid } from './daemon.ts'
 import { sandboxSmoke, type SmokeResult } from './sandbox.ts'
 import { hqReadPaths, protectedFolders, tccLabels, tccPathList } from './tcc.ts'
@@ -194,7 +194,7 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
   const hq = await p.hq()
   if (hq.kind === 'down') add('port', `포트 ${ctx.port}`, 'ok', '비어 있음')
   else if (hq.kind === 'hq') add('port', `포트 ${ctx.port}`, 'ok', 'hq가 사용 중')
-  else if (hq.kind === 'unauthorized') add('port', `포트 ${ctx.port}`, 'fail', 'hq가 응답하지만 토큰이 다름 (401)', `다른 토큰 파일을 쓰는 hq가 떠 있습니다. hq stop 후 hq start (또는 HQ_TOKEN_FILE 확인)`)
+  else if (hq.kind === 'unauthorized') add('port', `포트 ${ctx.port}`, 'fail', 'hq가 응답하지만 토큰이 다름 (401)', tokenMismatchMsg(ctx.tokenFile))
   else add('port', `포트 ${ctx.port}`, 'fail', hq.kind === 'other' ? `다른 프로그램이 응답 (HTTP ${hq.status})` : `연결 오류: ${hq.message}`,
     `사용 중인 프로세스 확인: lsof -nP -iTCP:${ctx.port} -sTCP:LISTEN (또는 HQ_PORT로 다른 포트)`)
   if (hq.kind === 'hq') add('daemon', '데몬', 'ok', `실행 중 (127.0.0.1:${ctx.port})`)

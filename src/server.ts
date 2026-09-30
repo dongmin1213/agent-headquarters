@@ -229,7 +229,7 @@ export function startServer(d: ServerDeps) {
 
 function json(res: ServerResponse, status: number, data: unknown): void {
   if (res.headersSent) return void res.end()
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'x-content-type-options': 'nosniff' })
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'x-content-type-options': 'nosniff', 'x-hq': '1' })
   res.end(JSON.stringify(data))
 }
 

@@ -2,7 +2,7 @@
 // Every side effect (launchctl, open, build scripts) goes through `act`, which only prints under HQ_DRY_RUN=1.
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, realpathSync, renameSync, writeFileSync, chmodSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync, chmodSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path'
 import { loadConfig } from '../config.ts'
@@ -132,7 +132,7 @@ export function launchdJobPath(printOut: string): string | null {
   const m = /^[ \t]*path = (.+?)[ \t]*$/m.exec(printOut)
   return m ? m[1] : null
 }
-const samePath = (a: string, b: string) => {
+export const samePath = (a: string, b: string) => {
   if (resolve(a) === resolve(b)) return true
   try { return realpathSync(a) === realpathSync(b) } catch { return false }
 }
@@ -148,6 +148,29 @@ export async function launchdJob(ctx: Ctx, l: string): Promise<LaunchdJob> {
   const p = launchdJobPath(r.stdout)
   return p !== null && samePath(p, plistPath(ctx, l)) ? 'ours' : 'foreign'
 }
+
+/** The four variables that together name an installation. Setting only some of them mixes this installation with the default one. */
+export const OVERRIDE_VARS = ['HQ_HOME', 'HQ_PORT', 'HQ_TOKEN_FILE', 'HQ_LAUNCH_AGENTS_DIR'] as const
+export const PARTIAL_OVERRIDE_MSG = '다른 설치를 다루려면 HQ_HOME·HQ_PORT·HQ_TOKEN_FILE·HQ_LAUNCH_AGENTS_DIR를 모두 지정해 주세요'
+/** Refusal message when only some of OVERRIDE_VARS are set (commands that write, delete or signal must not run then). */
+export function partialOverride(ctx: Ctx): string | null {
+  const set = OVERRIDE_VARS.filter((k) => (ctx.env[k] ?? '') !== '')
+  return set.length > 0 && set.length < OVERRIDE_VARS.length ? PARTIAL_OVERRIDE_MSG : null
+}
+
+/** Written by `hq install`: proof that $HQ_HOME belongs to this installation, required before `--purge` deletes it. */
+export const installMarker = (ctx: Ctx) => join(ctx.home, '.hq-install')
+export interface InstallMarker { root: string; port: number; created: string }
+export const markerContent = (ctx: Ctx): string => JSON.stringify({ root: ctx.root, port: ctx.port, created: new Date().toISOString() } satisfies InstallMarker, null, 2) + '\n'
+/** True only when the marker exists, is a regular file, and names this root and port. */
+export function markerMatches(ctx: Ctx): boolean {
+  try {
+    if (!lstatSync(installMarker(ctx)).isFile()) return false
+    const m = JSON.parse(readFileSync(installMarker(ctx), 'utf8')) as Partial<InstallMarker>
+    return typeof m.root === 'string' && samePath(m.root, ctx.root) && m.port === ctx.port
+  } catch { return false }
+}
+
 export const petApp = (ctx: Ctx) => join(ctx.root, 'pet/HQPet.app')
 export const petBinary = (ctx: Ctx) => join(petApp(ctx), 'Contents/MacOS/hqpet')
 export const projectsFile = (ctx: Ctx) => join(ctx.root, 'config/projects.json')

@@ -3,7 +3,12 @@ import { request } from 'node:http'
 import { existsSync, readFileSync } from 'node:fs'
 import type { Ctx } from './ctx.ts'
 
-export interface ApiResponse { status: number; body: any }
+export interface ApiResponse { status: number; body: any; headers?: Record<string, string | string[] | undefined> }
+
+/** Every JSON response of the hq daemon carries this header (src/server.ts json()); a 401 without it is some other program. */
+export const HQ_HEADER = { name: 'x-hq', value: '1' } as const
+export const isHqResponse = (r: ApiResponse) => r.headers?.[HQ_HEADER.name] === HQ_HEADER.value
+export const tokenMismatchMsg = (tokenFile: string) => `토큰이 맞지 않아요 (${tokenFile}) · hq restart로 데몬을 다시 띄우거나 토큰 파일을 확인해 주세요`
 
 /** Returns the token or null. The value is never printed. */
 export function readToken(ctx: Ctx): string | null {
@@ -23,7 +28,7 @@ export function apiRequest(port: number, token: string | null, method: string, p
       res.on('end', () => {
         let parsed: unknown = raw
         try { parsed = raw ? JSON.parse(raw) : null } catch { /* not JSON */ }
-        done({ status: res.statusCode ?? 0, body: parsed })
+        done({ status: res.statusCode ?? 0, body: parsed, headers: res.headers })
       })
     })
     req.on('timeout', () => req.destroy(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })))
@@ -40,12 +45,12 @@ export type HqProbe =
   | { kind: 'down' }
   | { kind: 'error'; message: string }
 
-/** What answers on the port: hq (200 on /api/state), hq with a different token (401), something else, or nothing. */
+/** What answers on the port: hq (200 on /api/state), hq with a different token (401 + x-hq header), something else, or nothing. */
 export async function probeHq(ctx: Ctx, timeoutMs = 2000): Promise<HqProbe> {
   try {
     const r = await apiRequest(ctx.port, readToken(ctx), 'GET', '/api/state', undefined, timeoutMs)
     if (r.status === 200 && r.body && typeof r.body === 'object') return { kind: 'hq', snapshot: r.body }
-    if (r.status === 401 && r.body && typeof r.body === 'object' && r.body.error === 'unauthorized') return { kind: 'unauthorized' }
+    if (r.status === 401 && isHqResponse(r)) return { kind: 'unauthorized' }
     return { kind: 'other', status: r.status }
   } catch (e) {
     const code = (e as NodeJS.ErrnoException).code

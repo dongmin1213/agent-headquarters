@@ -3,8 +3,8 @@
 import { spawn } from 'node:child_process'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { apiRequest, probeHq, readToken, waitFor, type HqProbe } from './api.ts'
-import { daemonLabel, daemonLog, launchdJob, launchdTarget, lockFile, logsDir, pidFile, plistPath, runCmd, showCmd, type Ctx, type LaunchdJob } from './ctx.ts'
+import { apiRequest, probeHq, readToken, tokenMismatchMsg, waitFor, type HqProbe } from './api.ts'
+import { daemonLabel, daemonLog, launchdJob, launchdTarget, lockFile, logsDir, pidFile, plistPath, runCmd, samePath, showCmd, type Ctx, type LaunchdJob } from './ctx.ts'
 
 export const LOG_MAX_BYTES = 10 * 1024 * 1024
 export const LOG_KEEP = 3
@@ -39,40 +39,84 @@ export async function pidCommand(pid: number): Promise<string | null> {
   } catch { return null } // execFile throws synchronously on EPERM (setuid ps inside a sandbox)
 }
 
-/** First integer in $HQ_HOME/daemon.lock (plain "123" or JSON like {"pid":123}); null if absent or unreadable. */
-export function readLockPid(ctx: Ctx): number | null {
+/** Start time of a live pid as `ps -o lstart=` prints it under LC_ALL=C (the daemon records the same string), or null. */
+export async function pidStart(pid: number): Promise<string | null> {
+  if (!alive(pid)) return null
   try {
-    const m = /\d+/.exec(readFileSync(lockFile(ctx), 'utf8'))
-    const n = m ? Number(m[0]) : 0
-    return n > 0 ? n : null
+    const r = await runCmd('ps', ['-p', String(pid), '-o', 'lstart='], { timeoutMs: 5000, env: { ...process.env, LC_ALL: 'C' } })
+    return r.code === 0 && r.stdout.trim() ? r.stdout.trim() : null
   } catch { return null }
 }
 
-export type KillTarget = { pid: number; source: 'lock' | 'pidfile' } | { refuse: string } | null
+/** What the CLI can learn about a pid: its command line and start time (null when gone or `ps` cannot run). */
+export interface ProcInfo { command: string; startedAt: string | null }
+export async function procInfo(pid: number): Promise<ProcInfo | null> {
+  const command = await pidCommand(pid)
+  return command === null ? null : { command, startedAt: await pidStart(pid) }
+}
+
+/** $HQ_HOME/daemon.lock: JSON identity written by current daemons, or a plain pid line from older ones (identity unverifiable). */
+export type DaemonLock =
+  | { format: 'json'; pid: number; port: number | null; root: string | null; home: string | null; startedAt: string | null }
+  | { format: 'legacy'; pid: number }
+
+export function readLock(ctx: Ctx): DaemonLock | null {
+  let text: string
+  try { text = readFileSync(lockFile(ctx), 'utf8').trim() } catch { return null }
+  if (/^\d+$/.test(text)) { const pid = Number(text); return pid > 0 ? { format: 'legacy', pid } : null }
+  try {
+    const j = JSON.parse(text) as Record<string, unknown>
+    if (!Number.isInteger(j.pid) || (j.pid as number) <= 0) return null
+    const str = (v: unknown) => (typeof v === 'string' && v ? v : null)
+    return { format: 'json', pid: j.pid as number, port: Number.isInteger(j.port) ? j.port as number : null,
+      root: str(j.root), home: str(j.home), startedAt: str(j.startedAt) }
+  } catch { return null }
+}
+
+/** The lock's pid in either format; null if absent or unreadable. */
+export function readLockPid(ctx: Ctx): number | null { return readLock(ctx)?.pid ?? null }
+
+/** True when `command` has `<root>/src/main.ts` as one whole argument (not as a suffix of some other path). */
+export const runsOurMain = (ctx: Ctx, command: string) => ` ${command} `.includes(` ${join(ctx.root, 'src/main.ts')} `)
+
+export const LEGACY_LOCK_MSG = '잠금 파일 형식이 예전 것이라 확인할 수 없어요 · hq restart는 launchd로 하거나 해당 프로세스를 직접 종료해 주세요'
+
+export type KillTarget = { pid: number } | { refuse: string } | null
 
 /**
- * The only process `stop` may signal. With a daemon lock present that is the lock's pid and nothing else;
- * without one (older daemon) the CLI's own pidfile. Either way the command line must contain src/main.ts.
+ * The only process `stop` may signal: the pid in this installation's daemon lock, and only when
+ * its command line runs <ctx.root>/src/main.ts, the lock's root/home/port are this ctx's, and the process start time
+ * equals the lock's startedAt. A legacy (plain pid) lock or a missing lock proves nothing, so nothing is signalled.
  */
-export async function killTarget(ctx: Ctx, cmdOf: (pid: number) => Promise<string | null> = pidCommand): Promise<KillTarget> {
-  if (existsSync(lockFile(ctx))) {
-    const pid = readLockPid(ctx)
-    if (!pid) return null
-    const cmd = await cmdOf(pid)
-    if (cmd === null && alive(pid)) return { refuse: `pid ${pid}의 프로그램을 확인할 수 없어 종료하지 않습니다 (ps 실행 불가)` }
-    if (cmd === null) return null // stale lock
-    if (!cmd.includes('src/main.ts')) return { refuse: `잠금 파일 ${lockFile(ctx)}의 pid ${pid}는 hq 데몬이 아닙니다 (${cmd.slice(0, 80)}). 종료하지 않습니다. 오래된 잠금이면: rm ${lockFile(ctx)}` }
-    return { pid, source: 'lock' }
+export async function killTarget(ctx: Ctx, infoOf: (pid: number) => Promise<ProcInfo | null> = procInfo): Promise<KillTarget> {
+  const lf = lockFile(ctx)
+  if (!existsSync(lf)) {
+    const pid = readPid(ctx)
+    const info = pid ? await infoOf(pid) : null
+    if (pid && info && runsOurMain(ctx, info.command)) return { refuse: `pid ${pid}의 hq는 잠금 파일이 없어 신원을 확인할 수 없어요 · 해당 프로세스를 직접 종료해 주세요 (kill ${pid})` }
+    return null
   }
-  const pid = readPid(ctx)
-  if (!pid) return null
-  const cmd = await cmdOf(pid)
-  return cmd !== null && cmd.includes('src/main.ts') ? { pid, source: 'pidfile' } : null
+  const lock = readLock(ctx)
+  if (!lock) return null
+  const { pid } = lock
+  const info = await infoOf(pid)
+  if (info === null && alive(pid)) return { refuse: `pid ${pid}의 프로그램을 확인할 수 없어 종료하지 않습니다 (ps 실행 불가)` }
+  if (info === null) return null // stale lock
+  if (lock.format === 'legacy') return { refuse: LEGACY_LOCK_MSG }
+  if (!runsOurMain(ctx, info.command)) return { refuse: `잠금 파일 ${lf}의 pid ${pid}는 이 저장소(${ctx.root})의 hq 데몬이 아닙니다 (${info.command.slice(0, 80)}). 종료하지 않습니다. 오래된 잠금이면: rm ${lf}` }
+  const mismatch = [
+    lock.root === null || !samePath(lock.root, ctx.root) ? `저장소 ${lock.root ?? '?'}` : '',
+    lock.home === null || !samePath(lock.home, ctx.home) ? `HQ_HOME ${lock.home ?? '?'}` : '',
+    lock.port !== ctx.port ? `포트 ${lock.port ?? '?'}` : '',
+  ].filter(Boolean)
+  if (mismatch.length) return { refuse: `pid ${pid}는 다른 설치의 데몬이에요 (${mismatch.join(', ')} · 지금 설정은 포트 ${ctx.port}, ${ctx.home}). 종료하지 않습니다` }
+  if (!lock.startedAt || info.startedAt !== lock.startedAt) return { refuse: `pid ${pid}의 시작 시각이 잠금 파일과 달라요 (pid 재사용). 종료하지 않습니다. 오래된 잠금이면: rm ${lf}` }
+  return { pid }
 }
 
 /** Signals the kill target and waits; returns the pid it stopped, null if none, or an error message. */
-export async function stopTarget(ctx: Ctx, cmdOf: (pid: number) => Promise<string | null> = pidCommand): Promise<{ pid: number } | { error: string } | null> {
-  const t = await killTarget(ctx, cmdOf)
+export async function stopTarget(ctx: Ctx, infoOf: (pid: number) => Promise<ProcInfo | null> = procInfo): Promise<{ pid: number } | { error: string } | null> {
+  const t = await killTarget(ctx, infoOf)
   if (!t) return null
   if ('refuse' in t) return { error: t.refuse }
   if (ctx.dryRun) ctx.out(`[dry-run] kill -TERM ${t.pid}`)
@@ -84,7 +128,7 @@ export async function stopTarget(ctx: Ctx, cmdOf: (pid: number) => Promise<strin
 
 function busyMessage(ctx: Ctx, p: HqProbe): string | null {
   if (p.kind === 'hq') return `이미 hq가 127.0.0.1:${ctx.port}에서 실행 중입니다 (중복 실행 거부). 재시작: hq restart`
-  if (p.kind === 'unauthorized') return `포트 ${ctx.port}에서 다른 토큰을 쓰는 hq가 실행 중입니다. 그 프로세스를 먼저 종료하세요 (lsof -nP -iTCP:${ctx.port} -sTCP:LISTEN)`
+  if (p.kind === 'unauthorized') return tokenMismatchMsg(ctx.tokenFile)
   if (p.kind === 'other') return `포트 ${ctx.port}를 다른 프로그램이 쓰고 있습니다 (HTTP ${p.status}). lsof -nP -iTCP:${ctx.port} -sTCP:LISTEN 으로 확인하거나 HQ_PORT를 바꾸세요`
   if (p.kind === 'error') return `포트 ${ctx.port} 확인 실패: ${p.message}`
   return null
@@ -112,8 +156,8 @@ export async function start(ctx: Ctx): Promise<number> {
     ctx.err(`데몬 잠금 ${lockFile(ctx)}의 pid ${lockPid}가 살아 있어 시작하지 않습니다 (중복 실행 거부). 상태: hq status · 중지: hq stop`)
     return 1
   }
-  mkdirSync(logsDir(ctx), { recursive: true })
-  rotateLog(daemonLog(ctx))
+  if (ctx.dryRun) ctx.out(`[dry-run] mkdir -p ${logsDir(ctx)} · 로그 회전`)
+  else { mkdirSync(logsDir(ctx), { recursive: true }); rotateLog(daemonLog(ctx)) }
   const job = await daemonJob(ctx)
   if (job === 'foreign') ctx.err(`경고: launchd 작업 ${daemonLabel(ctx)}는 다른 설치의 plist로 로드돼 있어 건드리지 않고 백그라운드 프로세스로 시작합니다`)
   const viaLaunchd = job === 'ours' || job === 'unloaded'
@@ -171,7 +215,7 @@ export async function stop(ctx: Ctx): Promise<number> {
 
 export async function restart(ctx: Ctx): Promise<number> {
   if (await daemonJob(ctx) === 'ours') {
-    rotateLog(daemonLog(ctx))
+    if (!ctx.dryRun) rotateLog(daemonLog(ctx))
     const r = await ctx.act('launchctl', ['kickstart', '-k', target(ctx)])
     if (r.code !== 0) { ctx.err(`launchctl 실패: ${r.stderr.trim()}`); return 1 }
     if (!(await waitUp(ctx))) return failStart(ctx)
@@ -219,7 +263,7 @@ const pct = (v: number | null) => (v == null ? '?' : `${Math.round(v * 100)}%`)
 export async function status(ctx: Ctx, opts: { json: boolean }): Promise<number> {
   const p = await probeHq(ctx)
   if (p.kind !== 'hq') {
-    const why = p.kind === 'down' ? '꺼져 있음' : p.kind === 'unauthorized' ? '토큰 불일치 (401)' : p.kind === 'other' ? `다른 프로그램이 포트 사용 (HTTP ${p.status})` : p.message
+    const why = p.kind === 'down' ? '꺼져 있음' : p.kind === 'unauthorized' ? tokenMismatchMsg(ctx.tokenFile) : p.kind === 'other' ? `다른 프로그램이 포트 사용 (HTTP ${p.status})` : p.message
     if (opts.json) ctx.out(JSON.stringify({ up: false, port: ctx.port, reason: why }, null, 2))
     else {
       ctx.out(`데몬: ${why} (127.0.0.1:${ctx.port})`)

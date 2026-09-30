@@ -3,8 +3,8 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, rmSync, sy
 import { delimiter, join, resolve } from 'node:path'
 import { loadConfig } from '../config.ts'
 import { probeHq, waitFor } from './api.ts'
-import { daemonLabel, daemonLog, findBin, launchdJob, launchdTarget, logsDir, petApp, petBinary, petLabel, petLog, plistPath, type Ctx, writeAtomic } from './ctx.ts'
-import { stopTarget } from './daemon.ts'
+import { daemonLabel, daemonLog, findBin, installMarker, installSuffix, launchdJob, launchdTarget, logsDir, markerContent, markerMatches, petApp, petBinary, petLabel, petLog, plistPath, samePath, type Ctx, writeAtomic } from './ctx.ts'
+import { alive, readLockPid, stopTarget } from './daemon.ts'
 import { printDoctor, realProbes, runDoctor, type Probes } from './doctor.ts'
 import { daemonPlist, launchPath, petPlist } from './plist.ts'
 import { hqReadPaths, protectedFolders, tccLabels } from './tcc.ts'
@@ -22,7 +22,7 @@ export function buildPlists(ctx: Ctx) {
       label: daemonLabel(ctx), nodePath: process.execPath, root: ctx.root, home: ctx.home, port: ctx.port, path, logFile: daemonLog(ctx),
       tokenFile: ctx.env.HQ_TOKEN_FILE ? ctx.tokenFile : undefined,
     }),
-    pet: petPlist({ label: petLabel(ctx), appBinary: petBinary(ctx), logFile: petLog(ctx) }),
+    pet: petPlist({ label: petLabel(ctx), appBinary: petBinary(ctx), logFile: petLog(ctx), port: ctx.port, tokenFile: ctx.tokenFile, suffix: installSuffix(ctx) }),
   }
 }
 
@@ -88,18 +88,21 @@ export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
   ctx.out(`  ${petApp(ctx)}`)
 
   ctx.out('4/6 기존 데몬 정리')
-  const moved = await stopTarget(ctx)
-  if (moved && 'error' in moved) { ctx.err(moved.error); return 1 }
-  if (moved) {
-    ctx.out(`  백그라운드 데몬(pid ${moved.pid})을 멈추고 launchd로 옮깁니다`)
+  if (await launchdJob(ctx, daemonLabel(ctx)) === 'ours') {
+    // Our launchd job is replaced by 5/6 (bootout → bootstrap); its process is never signalled directly.
+    ctx.out('  launchd 데몬은 5/6에서 새 설정으로 다시 띄웁니다')
   } else {
-    const p = await probeHq(ctx)
-    const ours = await launchdJob(ctx, daemonLabel(ctx)) === 'ours'
-    if ((p.kind === 'hq' || p.kind === 'unauthorized') && !ours) {
-      ctx.err(`127.0.0.1:${ctx.port}에 직접 실행한 hq가 떠 있습니다. 그 프로세스를 먼저 종료하세요 (lsof -nP -iTCP:${ctx.port} -sTCP:LISTEN)`)
-      return 1
+    const moved = await stopTarget(ctx)
+    if (moved && 'error' in moved) { ctx.err(moved.error); return 1 }
+    if (moved) ctx.out(`  백그라운드 데몬(pid ${moved.pid})을 멈추고 launchd로 옮깁니다`)
+    else {
+      const p = await probeHq(ctx)
+      if (p.kind === 'hq' || p.kind === 'unauthorized') {
+        ctx.err(`127.0.0.1:${ctx.port}에 직접 실행한 hq가 떠 있습니다. 그 프로세스를 먼저 종료하세요 (lsof -nP -iTCP:${ctx.port} -sTCP:LISTEN)`)
+        return 1
+      }
+      ctx.out('  정리할 것 없음')
     }
-    ctx.out('  정리할 것 없음')
   }
 
   const tcc = protectedFolders(hqReadPaths(ctx), ctx.userHome)
@@ -109,8 +112,12 @@ export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
   for (const label of [daemonLabel(ctx), petLabel(ctx)]) {
     if (await launchdJob(ctx, label) === 'foreign') { ctx.err(foreignMsg(label)); return 1 }
   }
-  if (ctx.dryRun) ctx.out(`[dry-run] mkdir -p ${logsDir(ctx)}`)
-  else mkdirSync(logsDir(ctx), { recursive: true })
+  if (ctx.dryRun) ctx.out(`[dry-run] mkdir -p ${logsDir(ctx)} · write ${installMarker(ctx)}`)
+  else {
+    mkdirSync(logsDir(ctx), { recursive: true })
+    // Marker proving $HQ_HOME is this installation's (uninstall --purge deletes it only when it matches).
+    if (!markerMatches(ctx)) writeAtomic(installMarker(ctx), markerContent(ctx))
+  }
   const pl = buildPlists(ctx)
   for (const [label, content] of [[daemonLabel(ctx), pl.daemon], [petLabel(ctx), pl.pet]] as const) {
     if (ctx.dryRun) ctx.out(`[dry-run] write ${plistPath(ctx, label)}`)
@@ -143,14 +150,69 @@ export async function install(ctx: Ctx, opts: InstallOpts): Promise<number> {
   return 0
 }
 
-export async function uninstall(ctx: Ctx, opts: { purge: boolean; yes: boolean }): Promise<number> {
+export interface PurgePlan { home: string | null; token: string | null; petApp: string | null; notes: string[] }
+
+/** Decides what `--purge` may delete, before anything is touched. Any doubt is an error and nothing is deleted. */
+export function purgePlan(ctx: Ctx): PurgePlan | { error: string } {
+  const notes: string[] = []
+  const h = resolve(ctx.home)
+  if (h === '/' || h === resolve(ctx.userHome) || resolve(ctx.userHome).startsWith(h + '/') || resolve(ctx.root).startsWith(h + '/') || h === resolve(ctx.root)) {
+    return { error: `안전을 위해 ${h}는 지우지 않습니다 (HQ_HOME 확인)` }
+  }
+  let home: string | null = null
+  if (existsSync(h)) {
+    if (!markerMatches(ctx)) {
+      return { error: `${h}에 이 설치의 표식(${installMarker(ctx)})이 없거나 맞지 않아 아무것도 지우지 않았어요 · 이 폴더가 hq 데이터가 맞다면 hq install을 한 번 다시 실행해 표식을 만든 뒤 다시 시도하거나 직접 지워 주세요` }
+    }
+    home = h
+  }
+  let token: string | null = null
+  let st: ReturnType<typeof lstatSync> | null = null
+  try { st = lstatSync(ctx.tokenFile) } catch { /* absent */ }
+  if (st) {
+    if (!st.isFile()) return { error: `토큰 경로 ${ctx.tokenFile}가 일반 파일이 아니라(폴더·심볼릭 링크 등) 아무것도 지우지 않았어요 · HQ_TOKEN_FILE을 확인해 주세요` }
+    const defaultToken = resolve(ctx.userHome, '.config/hq/token')
+    if (installSuffix(ctx) !== null && samePath(ctx.tokenFile, defaultToken)) notes.push(`기본 설치의 토큰 ${ctx.tokenFile}는 남겨 둡니다`)
+    else token = ctx.tokenFile
+  }
+  // The pet app lives in the repository and is shared by every installation from it; only the default one removes it.
+  let pet: string | null = null
+  if (existsSync(petApp(ctx))) {
+    if (installSuffix(ctx) === null) pet = petApp(ctx)
+    else notes.push(`펫 앱 ${petApp(ctx)}은 기본 설치와 함께 쓰므로 남겨 둡니다`)
+  }
+  return { home, token, petApp: pet, notes }
+}
+
+/** True once this installation's daemon is gone: the lock pid is dead and the port no longer answers as hq. */
+async function daemonDown(ctx: Ctx, waitMs = 10_000): Promise<boolean> {
+  return waitFor(async () => {
+    const pid = readLockPid(ctx)
+    if (pid && alive(pid)) return false
+    const p = await probeHq(ctx, 1000)
+    return p.kind !== 'hq' && p.kind !== 'unauthorized'
+  }, waitMs)
+}
+
+export async function uninstall(ctx: Ctx, opts: { purge: boolean; yes: boolean; downWaitMs?: number }): Promise<number> {
   if (opts.purge && !opts.yes) {
     ctx.err(`--purge는 ${ctx.home} (DB·worktree·증거)와 토큰 파일을 지웁니다. 확인하려면 --purge --yes`)
     return 2
   }
+  let plan: PurgePlan | null = null
+  if (opts.purge) {
+    const r = purgePlan(ctx)
+    if ('error' in r) { ctx.err(r.error); return 1 }
+    plan = r
+  }
+  let daemonBootedOut = false
   for (const label of [petLabel(ctx), daemonLabel(ctx)]) {
-    if (await launchdJob(ctx, label) === 'foreign') ctx.err(`경고: ${foreignMsg(label)}`)
-    else await ctx.act('launchctl', ['bootout', launchdTarget(ctx, label)])
+    const job = await launchdJob(ctx, label)
+    if (job === 'foreign') ctx.err(`경고: ${foreignMsg(label)}`)
+    else {
+      await ctx.act('launchctl', ['bootout', launchdTarget(ctx, label)])
+      if (job === 'ours' && label === daemonLabel(ctx)) daemonBootedOut = true
+    }
     const f = plistPath(ctx, label)
     if (existsSync(f)) {
       if (ctx.dryRun) ctx.out(`[dry-run] rm ${f}`)
@@ -158,6 +220,8 @@ export async function uninstall(ctx: Ctx, opts: { purge: boolean; yes: boolean }
       ctx.out(`삭제: ${f}`)
     }
   }
+  // bootout already sent SIGTERM to our launchd daemon; let it exit before looking at the lock.
+  if (daemonBootedOut && !ctx.dryRun) await daemonDown(ctx, opts.downWaitMs)
   const stopped = await stopTarget(ctx)
   if (stopped && 'error' in stopped) ctx.err(`경고: ${stopped.error}`)
   else if (stopped) ctx.out(`백그라운드 데몬 중지 (pid ${stopped.pid})`)
@@ -169,15 +233,17 @@ export async function uninstall(ctx: Ctx, opts: { purge: boolean; yes: boolean }
       ctx.out(`삭제: ${link}`)
     }
   } catch { /* no link */ }
-  if (opts.purge) {
-    const h = resolve(ctx.home)
-    if (h === '/' || h === resolve(ctx.userHome) || resolve(ctx.root).startsWith(h + '/') || h === resolve(ctx.root)) {
-      ctx.err(`안전을 위해 ${h}는 지우지 않습니다 (HQ_HOME 확인)`)
+  if (plan) {
+    if (ctx.dryRun) ctx.out('[dry-run] 데몬 종료 확인 생략')
+    else if (!(await daemonDown(ctx, opts.downWaitMs))) {
+      ctx.err(`데몬이 멈췄는지 확인하지 못해 데이터는 지우지 않았어요 (127.0.0.1:${ctx.port}, ${ctx.home}) · 데몬을 직접 종료한 뒤 hq uninstall --purge --yes를 다시 실행해 주세요`)
       return 1
     }
-    for (const f of [h, ctx.tokenFile, petApp(ctx)]) {
-      if (!existsSync(f)) continue
+    for (const n of plan.notes) ctx.out(n)
+    for (const f of [plan.home, plan.token, plan.petApp]) {
+      if (!f) continue
       if (ctx.dryRun) ctx.out(`[dry-run] rm -rf ${f}`)
+      else if (f === plan.token) rmSync(f, { force: true })
       else rmSync(f, { recursive: true, force: true })
       ctx.out(`삭제: ${f}`)
     }
