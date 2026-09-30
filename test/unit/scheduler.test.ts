@@ -132,3 +132,22 @@ test('restore: no runs → 대기 중; disabled team keeps 대기 중', () => {
   const d = restarted(finished(2, 'boom'), { enabled: false })
   assert.equal(d.state, 'idle'); assert.equal(d.bubble, '대기 중')
 })
+
+test('summary keeps the last STATUS line even after 10 more lines; restore shows it', async () => {
+  const dir = tmp('hq-sched-')
+  const path = join(dir, 'hq.db')
+  const store = new Store(path)
+  const t: TeamConfig = { id: 'revenue', name: '수익', pack: 'digimon', command: ['/bin/sh', '-c', 'echo "STATUS: 대본 준비 완료: X"; for i in 1 2 3 4 5 6 7 8 9 10; do echo "log $i"; done; exit 0'], cwd: dir, everyMinutes: 60, enabled: true }
+  const sched = new Scheduler([t], store, new Bus(store), 'http://127.0.0.1:1', 'tok', { holdUntil: () => null, teamLimited: () => {} })
+  assert.equal(sched.runNow('revenue'), true)
+  await ended(store, 1)
+  const lines = store.lastRun('revenue')!.summary!.split('\n')
+  assert.equal(lines.length, 9)
+  assert.equal(lines[0], 'STATUS: 대본 준비 완료: X')
+  assert.equal(lines.at(-1), 'log 10')
+  store.close()
+  const again = new Store(path)
+  const v = new Scheduler([t], again, new Bus(again), 'http://127.0.0.1:1', 'tok', { holdUntil: () => null, teamLimited: () => {} }).views()[0]
+  assert.equal(v.state, 'idle'); assert.equal(v.bubble, '대본 준비 완료: X')
+  again.close()
+})

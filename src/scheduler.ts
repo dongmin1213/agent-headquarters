@@ -95,7 +95,11 @@ export class Scheduler {
       const finish = (exit: number, failure: string | null) => {
         if (done) return
         done = true
-        const summary = [...tail.slice(-8), ...(failure ? [failure] : [])].join('\n')
+        // Keep the last STATUS line even when it scrolled out of the last 8, so a restart can restore the bubble.
+        const kept = tail.slice(-8)
+        const status = tail.findLastIndex((l) => l.startsWith('STATUS:'))
+        if (status >= 0 && status < tail.length - kept.length) kept.unshift(tail[status])
+        const summary = [...kept, ...(failure ? [failure] : [])].join('\n')
         this.store.endRun(runId, exit, summary)
         s.running = false
         if (!failure && exit === 75) {
