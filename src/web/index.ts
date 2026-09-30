@@ -1,17 +1,17 @@
-// Web detail UI (docs/design/execution.md §15). Serves the single-page "자세히 보기" screen and proxies
-// /ui-api/* to the daemon's /api/* handlers behind cookie + CSRF auth.
-//   GET  /ui/open?code=…   one-time code (60 s) → hq_session cookie, then /ui
-//   GET  /ui               the page (401 page without a session)
-//   GET  /ui/assets/*      static assets read at startup
-//   *    /ui-api/*         cookie; non-GET also X-CSRF-Token + Origin → routeApi as /api/* with the Bearer token
+// Web detail UI (docs/design/execution.md §16). Serves the single-page "자세히 보기" screen and proxies an
+// allowlist of /ui-api/* to the daemon's /api/* handlers behind a cookie-less session token.
+//   GET  /ui, /ui/           page shell (no auth; the page itself holds no data)
+//   GET  /ui/assets/*        static assets read at startup
+//   POST /ui-api/session     {code} → {token}   one-time code from issueLoginUrl() (60 s, single use)
+//   *    /ui-api/<allowed>   Authorization: Bearer <session token> (events: ?t=<token> only) → routeApi as /api/*
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ApiRouter } from '../server.ts'
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 export interface WebUi {
-  /** Handles /ui, /ui/*, /ui-api/* (cookie + CSRF auth, then delegates /ui-api/* to routeApi as /api/*). */
+  /** Handles /ui, /ui/*, /ui-api/* (session token auth, then delegates allowed /ui-api/* to routeApi as /api/*). */
   handle(req: IncomingMessage, res: ServerResponse): Promise<void>
   /** One-time login URL (60 s) the pet opens in the browser. */
   issueLoginUrl(): string
@@ -19,15 +19,15 @@ export interface WebUi {
 
 export const CODE_TTL_MS = 60_000
 export const SESSION_IDLE_MS = 12 * 60 * 60_000
-const COOKIE = 'hq_session'
+export const SESSION_MAX_MS = 7 * 24 * 60 * 60_000
 
+/** Sent on every /ui* response, including ones produced by routeApi (execution.md §16). */
 export const SECURITY_HEADERS: Record<string, string> = {
-  'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
-  'x-frame-options': 'DENY',
-  'referrer-policy': 'no-referrer',
+  'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
   'x-content-type-options': 'nosniff',
-  'cross-origin-opener-policy': 'same-origin',
-  'cross-origin-resource-policy': 'same-origin',
+  'referrer-policy': 'no-referrer',
+  'cache-control': 'no-store',
+  'x-frame-options': 'DENY',
 }
 
 const ASSET_TYPES: Record<string, string> = {
@@ -36,136 +36,131 @@ const ASSET_TYPES: Record<string, string> = {
   'app.css': 'text/css; charset=utf-8',
 }
 
-interface Session { csrf: string; lastSeen: number }
+/** The only /api routes the browser may reach (`*` = one path segment). Everything else is 404. */
+const ALLOWED: Record<string, string[][]> = {
+  GET: [['state'], ['events'], ['requests', '*'], ['attempts', '*', 'activity'], ['attempts', '*', 'files', '*'], ['requests', '*', 'diff'], ['quota']],
+  POST: [['requests'], ['requests', '*', 'answer'], ['tasks', '*', 'answer'], ['tasks', '*', 'decide'], ['requests', '*', 'reject'],
+    ['requests', '*', 'cancel'], ['requests', '*', 'merge'], ['approvals', '*']],
+}
+
+export function isAllowed(method: string, segments: string[]): boolean {
+  return (ALLOWED[method] ?? []).some((p) => p.length === segments.length && p.every((x, i) => (x === '*' ? segments[i].length > 0 : x === segments[i])))
+}
+
+interface Session { createdAt: number; lastSeen: number }
 
 export function createWebUi(opts: { port: number; token: string; routeApi: ApiRouter; now?: () => number }): WebUi {
   const now = opts.now ?? Date.now
   const origin = `http://127.0.0.1:${opts.port}`
   const host = `127.0.0.1:${opts.port}`
   const codes = new Map<string, number>() // code → expiresAt
-  const sessions = new Map<string, Session>()
+  const sessions = new Map<string, Session>() // token → session (in memory: a daemon restart signs everyone out)
   const dir = join(import.meta.dirname, 'assets')
   const assets = new Map<string, Buffer>()
   for (const name of Object.keys(ASSET_TYPES)) assets.set(name, readFileSync(join(dir, name)))
-  const pageTemplate = readFileSync(join(dir, 'index.html'), 'utf8')
+  const shell = readFileSync(join(dir, 'index.html'))
 
+  const alive = (s: Session, t: number) => t - s.lastSeen <= SESSION_IDLE_MS && t - s.createdAt <= SESSION_MAX_MS
   function prune(): void {
     const t = now()
     for (const [c, exp] of codes) if (exp <= t) codes.delete(c)
-    for (const [id, s] of sessions) if (t - s.lastSeen > SESSION_IDLE_MS) sessions.delete(id)
+    for (const [id, s] of sessions) if (!alive(s, t)) sessions.delete(id)
   }
-
-  function session(req: IncomingMessage): Session | null {
-    const id = readCookie(req, COOKIE)
-    if (!id) return null
-    const s = sessions.get(id)
-    if (!s) return null
-    if (now() - s.lastSeen > SESSION_IDLE_MS) { sessions.delete(id); return null }
-    s.lastSeen = now()
-    return s
+  function session(token: string): boolean {
+    if (!token) return false
+    const s = sessions.get(token)
+    if (!s) return false
+    const t = now()
+    if (!alive(s, t)) { sessions.delete(token); return false }
+    s.lastSeen = t
+    return true
   }
 
   return {
     issueLoginUrl() {
       prune()
-      const code = randomBytes(24).toString('base64url')
+      const code = randomBytes(32).toString('base64url')
       codes.set(code, now() + CODE_TTL_MS)
-      return `${origin}/ui/open?code=${code}`
+      return `${origin}/ui/#code=${code}`
     },
 
     async handle(req, res) {
-      for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v)
-      res.setHeader('cache-control', 'no-store')
+      enforceHeaders(res)
       // DNS rebinding: only the exact loopback host:port this daemon listens on.
-      if (req.headers.host !== host) return text(res, 403, 'forbidden host')
+      if (req.headers.host !== host) return json(res, 403, { error: '허용되지 않은 Host예요' })
       const url = new URL(req.url ?? '/', origin)
       const path = url.pathname
 
-      if (path === '/ui/open') {
-        if (req.method !== 'GET') return text(res, 405, 'method not allowed')
-        prune()
-        const code = url.searchParams.get('code') ?? ''
-        const exp = codes.get(code)
-        codes.delete(code) // single use, even when expired
-        if (!code || exp === undefined || exp <= now()) return page(res, 403, messagePage('링크가 만료됐어요', "이 링크는 한 번만, 60초 안에 쓸 수 있어요. 펫에서 '자세히 보기'를 다시 눌러 주세요."))
-        const id = randomBytes(32).toString('base64url')
-        sessions.set(id, { csrf: randomBytes(32).toString('base64url'), lastSeen: now() })
-        res.setHeader('set-cookie', `${COOKIE}=${id}; HttpOnly; SameSite=Strict; Path=/`)
-        // A same-origin meta refresh instead of a 30x: a Strict cookie is not sent on a redirect chain
-        // that started from another site (e.g. a link clicked in a chat app).
-        return page(res, 200, messagePage('여는 중…', '잠시만요. 자동으로 넘어가지 않으면 아래를 눌러 주세요.', true))
+      if (path === '/ui' || path === '/ui/') {
+        if (req.method !== 'GET' && req.method !== 'HEAD') return json(res, 405, { error: 'method not allowed' })
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        return void res.end(shell)
       }
 
       if (path.startsWith('/ui/assets/')) {
         const name = path.slice('/ui/assets/'.length)
         const body = assets.get(name)
-        if (!body || req.method !== 'GET') return text(res, 404, 'not found')
-        // CSS is public so the sign-in message pages are styled; scripts only with a session.
-        if (name !== 'app.css' && !session(req)) return text(res, 401, 'unauthorized')
+        if (!body || req.method !== 'GET') return json(res, 404, { error: 'not found' })
         res.writeHead(200, { 'content-type': ASSET_TYPES[name] })
         return void res.end(body)
       }
 
-      if (path === '/ui' || path === '/ui/') {
-        if (req.method !== 'GET') return text(res, 405, 'method not allowed')
-        const s = session(req)
-        if (!s) return page(res, 401, messagePage('로그인이 필요해요', "펫에서 '자세히 보기'로 열어 주세요"))
-        return page(res, 200, pageTemplate.replace('{{CSRF}}', s.csrf))
+      if (path === '/ui-api/session') {
+        if (req.method !== 'POST') return json(res, 404, { error: 'not found' })
+        let code = ''
+        try { const b = JSON.parse(await readBody(req, 4096)); code = typeof b?.code === 'string' ? b.code : '' } catch { return json(res, 400, { error: '잘못된 요청이에요' }) }
+        prune()
+        // Consume in the same tick as the lookup: a code is only ever exchanged once.
+        const exp = codes.get(code)
+        codes.delete(code)
+        if (!code || exp === undefined || exp <= now()) return json(res, 403, { error: "링크가 만료됐어요. 펫에서 '자세히 보기'를 다시 눌러 주세요." })
+        const token = randomBytes(32).toString('base64url')
+        sessions.set(token, { createdAt: now(), lastSeen: now() })
+        return json(res, 200, { token })
       }
 
       if (path.startsWith('/ui-api/')) {
-        const s = session(req)
-        if (!s) return json(res, 401, { error: 'unauthorized' })
-        if (req.method !== 'GET' && req.method !== 'HEAD') {
-          if (req.headers.origin !== origin) return json(res, 403, { error: 'bad origin' })
-          if (!safeEqual(String(req.headers['x-csrf-token'] ?? ''), s.csrf)) return json(res, 403, { error: 'bad csrf token' })
-        }
-        req.url = '/api/' + (req.url ?? '').slice('/ui-api/'.length)
+        const rest = path.slice('/ui-api/'.length)
+        const segments = rest.split('/')
+        if (!isAllowed(req.method ?? '', segments)) return json(res, 404, { error: 'not found' })
+        const isEvents = req.method === 'GET' && rest === 'events'
+        const bearer = /^Bearer (.+)$/.exec(String(req.headers.authorization ?? ''))?.[1] ?? ''
+        // EventSource cannot send headers, so the events stream (and only it) takes ?t=<token>.
+        const token = bearer || (isEvents ? url.searchParams.get('t') ?? '' : '')
+        if (!session(token)) return json(res, 401, { error: "세션이 없어요. 펫에서 '자세히 보기'로 열어 주세요." })
+        if (isEvents) url.searchParams.delete('t')
+        req.url = '/api/' + rest + url.search
         req.headers.authorization = `Bearer ${opts.token}`
         delete req.headers.origin
         delete req.headers.cookie
-        delete req.headers['x-csrf-token']
         return opts.routeApi(req, res)
       }
 
-      return text(res, 404, 'not found')
+      return json(res, 404, { error: 'not found' })
     },
   }
 }
 
-function readCookie(req: IncomingMessage, name: string): string | null {
-  for (const part of String(req.headers.cookie ?? '').split(';')) {
-    const i = part.indexOf('=')
-    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim()
-  }
-  return null
+/** Security headers win over anything a handler (e.g. routeApi's SSE) passes to writeHead. */
+function enforceHeaders(res: ServerResponse): void {
+  for (const [k, v] of Object.entries(SECURITY_HEADERS)) res.setHeader(k, v)
+  const writeHead = res.writeHead.bind(res) as (...args: unknown[]) => ServerResponse
+  res.writeHead = ((status: number, ...rest: unknown[]) => {
+    const i = typeof rest[0] === 'string' ? 1 : 0
+    const h = rest[i]
+    if (h && typeof h === 'object' && !Array.isArray(h)) {
+      const clean: Record<string, unknown> = {}
+      for (const [k, v] of Object.entries(h)) if (!(k.toLowerCase() in SECURITY_HEADERS)) clean[k] = v
+      rest[i] = clean
+    }
+    return writeHead(status, ...rest)
+  }) as ServerResponse['writeHead']
 }
 
-function safeEqual(a: string, b: string): boolean {
-  const x = Buffer.from(a), y = Buffer.from(b)
-  return x.length === y.length && timingSafeEqual(x, y)
-}
-
-/** HTML-escapes text for the few server-rendered strings (all constants today). */
-export function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!)
-}
-
-function messagePage(title: string, message: string, toUi = false): string {
-  return `<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-${toUi ? '<meta http-equiv="refresh" content="0;url=/ui">' : ''}<link rel="icon" href="data:,"><link rel="stylesheet" href="/ui/assets/app.css">
-<title>HQ · ${escapeHtml(title)}</title></head><body class="message-page"><main class="message-card"><div class="brand-mark" aria-hidden="true">HQ</div>
-<h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p>${toUi ? '<p><a class="btn btn-primary" href="/ui">자세히 보기 열기</a></p>' : ''}</main></body></html>`
-}
-
-function page(res: ServerResponse, status: number, html: string): void {
-  res.writeHead(status, { 'content-type': 'text/html; charset=utf-8' })
-  res.end(html)
-}
-
-function text(res: ServerResponse, status: number, body: string): void {
-  res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' })
-  res.end(body)
+async function readBody(req: IncomingMessage, max: number): Promise<string> {
+  let raw = ''
+  for await (const chunk of req) { raw += chunk; if (raw.length > max) throw new Error('body too large') }
+  return raw
 }
 
 function json(res: ServerResponse, status: number, data: unknown): void {

@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<meta name="hq-csrf" content="{{CSRF}}">
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="/ui/assets/app.css">
 <title>HQ · 자세히 보기</title>
@@ -38,6 +37,13 @@
 </main>
 <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
 <aside id="drawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden></aside>
+<div id="gate" class="message-page" hidden>
+  <div class="message-card" role="alert">
+    <div class="brand-mark" aria-hidden="true">HQ</div>
+    <h1 id="gate-title">로그인이 필요해요</h1>
+    <p id="gate-text">펫에서 '자세히 보기'로 열어 주세요</p>
+  </div>
+</div>
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 </body>
 </html>

@@ -1,11 +1,10 @@
 // HQ web detail UI ("자세히 보기"). Vanilla JS, no dependencies.
 // Security: every piece of data reaches the DOM through textContent / text nodes / setAttribute — never as HTML.
 import {
-  ATTEMPT_STATUS, QUOTA_MODE, REQUEST_STATUS, TASK_GROUPS, TASK_STATUS, approvalKind, formatClock, formatCost, formatDuration,
-  formatRelative, normalizeActivity, parseDiff, percent, renderMarkdown, shortSha, statusInfo,
+  ATTEMPT_STATUS, DECISION_KIND, QUOTA_MODE, REQUEST_STATUS, TASK_GROUPS, TASK_STATUS, blockedDecision, formatClock, formatCost, formatDuration,
+  formatRelative, parseDiff, percent, renderMarkdown, shortSha, statusInfo, windowLabel,
 } from './lib.js'
 
-const CSRF = document.querySelector('meta[name="hq-csrf"]')?.getAttribute('content') ?? ''
 const $ = (id) => document.getElementById(id)
 
 // ---------- tiny DOM builder ----------
@@ -59,13 +58,13 @@ function swap(container, ...children) {
 // ---------- state ----------
 const state = {
   snap: null, snapError: null,
-  conn: 'connecting', // connecting | live | retry | down | auth
+  conn: 'connecting', // connecting | live | retry | down
   selected: null, // request id
   detail: null, detailFor: null, detailError: null, detailLoading: false,
   drawer: null, // { taskKey, tab, attemptId }
 }
 const drafts = new Map() // input key → text
-const ui = { rejectOpen: new Set(), confirm: new Set(), pending: new Set(), errors: new Map(), decisionsCollapsed: false }
+const ui = { rejectOpen: new Set(), rejectTasks: new Map(), confirm: new Set(), pending: new Set(), errors: new Map(), decisionsCollapsed: false }
 try { ui.decisionsCollapsed = localStorage.getItem('hq.decisionsCollapsed') === '1' } catch { /* storage unavailable */ }
 const sigs = new Map() // section → last rendered signature
 const activity = new Map() // attemptId → { lines, loading, error }
@@ -75,18 +74,51 @@ let follow = true
 let paneVersion = 0 // bumps when evidence/diff caches change
 let lastFocusBeforeDrawer = null
 
+// ---------- session (execution.md §16: one-time #code → session token in sessionStorage, Bearer on every call) ----------
+const SESSION_KEY = 'hq.session'
+let sessionToken = ''
+function readToken() { try { return sessionStorage.getItem(SESSION_KEY) ?? '' } catch { return '' } }
+function saveToken(t) { try { if (t) sessionStorage.setItem(SESSION_KEY, t); else sessionStorage.removeItem(SESSION_KEY) } catch { /* storage unavailable: session lasts for this page only */ } }
+/** Shows the sign-in gate instead of the dashboard. */
+function showGate(title, text) {
+  sessionToken = ''
+  saveToken('')
+  if (es) { es.close(); es = null }
+  $('gate-title').textContent = title
+  $('gate-text').textContent = text
+  $('gate').hidden = false
+  for (const id of ['topbar', 'main']) $(id).hidden = true
+  document.querySelector('.skip-link')?.setAttribute('hidden', '')
+  document.title = 'HQ · 로그인이 필요해요'
+}
+async function startSession() {
+  const m = /^#code=([A-Za-z0-9_-]+)$/.exec(location.hash)
+  if (m) {
+    history.replaceState(null, '', location.pathname) // the code never stays in the address bar or history
+    try {
+      const res = await fetch('/ui-api/session', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code: m[1] }) })
+      const data = await res.json().catch(() => null)
+      if (res.ok && typeof data?.token === 'string') { sessionToken = data.token; saveToken(sessionToken); return true }
+      showGate('링크가 만료됐어요', typeof data?.error === 'string' ? data.error : "펫에서 '자세히 보기'로 열어 주세요")
+    } catch { showGate('데몬에 연결할 수 없어요', "hq가 켜져 있는지 확인하고 펫에서 '자세히 보기'로 열어 주세요") }
+    return false
+  }
+  sessionToken = readToken()
+  if (!sessionToken) { showGate('로그인이 필요해요', "펫에서 '자세히 보기'로 열어 주세요"); return false }
+  return true
+}
+
 // ---------- API ----------
 class ApiError extends Error { constructor(status, msg) { super(msg); this.status = status } }
 async function api(path, opts = {}) {
-  const init = { method: opts.method ?? 'GET', credentials: 'same-origin', headers: { accept: 'application/json' } }
+  const init = { method: opts.method ?? 'GET', headers: { accept: 'application/json', authorization: `Bearer ${sessionToken}` } }
   if (init.method !== 'GET') {
     init.headers['content-type'] = 'application/json'
-    init.headers['x-csrf-token'] = CSRF
     init.body = JSON.stringify(opts.body ?? {})
   }
   let res
   try { res = await fetch('/ui-api' + path, init) } catch { throw new ApiError(0, '데몬에 연결할 수 없어요') }
-  if (res.status === 401) { setConn('auth'); throw new ApiError(401, '세션이 만료됐어요') }
+  if (res.status === 401) { showGate('세션이 끝났어요', "펫에서 '자세히 보기'로 열어 주세요"); throw new ApiError(401, '세션이 만료됐어요') }
   const type = res.headers.get('content-type') ?? ''
   const data = type.includes('json') ? await res.json().catch(() => null) : await res.text()
   if (!res.ok) throw new ApiError(res.status, (data && typeof data === 'object' && data.error) ? String(data.error) : `HTTP ${res.status}`)
@@ -97,9 +129,9 @@ const enc = encodeURIComponent
 function errorText(e) {
   if (!(e instanceof ApiError)) return '알 수 없는 오류가 났어요'
   if (e.status === 0) return e.message
-  if (e.status === 409) return '처리할 수 없는 상태예요 (이미 결정됐거나 내용이 바뀌었어요). 새로고침된 내용을 확인해 주세요.'
-  if (e.status === 403) return '보안 확인에 실패했어요. 페이지를 새로 열어 주세요.'
+  if (e.status === 409) return e.message.startsWith('HTTP') ? '처리할 수 없는 상태예요. 최신 내용을 다시 불러왔어요.' : e.message // the daemon's Korean reason
   if (e.status === 404) return '대상을 찾을 수 없어요'
+  if (e.status === 413) return '내용이 너무 커요'
   return `요청 실패: ${e.message}`
 }
 
@@ -148,7 +180,8 @@ function scheduleRefresh(delay = 300) {
 let es = null, lastBeat = 0, hadError = false
 function connect() {
   if (es) es.close()
-  es = new EventSource('/ui-api/events')
+  if (!sessionToken) return
+  es = new EventSource(`/ui-api/events?t=${enc(sessionToken)}`)
   es.onopen = () => { setConn('live'); lastBeat = Date.now(); if (hadError) { hadError = false; scheduleRefresh(0) } }
   es.onmessage = (ev) => {
     lastBeat = Date.now()
@@ -158,16 +191,16 @@ function connect() {
       if (data?.kind === 'attempt' && state.drawer) pollActivity()
     } catch { /* ignore malformed event */ }
   }
-  es.addEventListener('heartbeat', () => { lastBeat = Date.now(); if (state.conn !== 'live' && state.conn !== 'auth') setConn('live') })
+  es.addEventListener('heartbeat', () => { lastBeat = Date.now(); if (state.conn !== 'live') setConn('live') })
   es.onerror = () => {
     hadError = true
-    if (state.conn === 'auth') { es.close(); return }
+    if (!sessionToken) { es?.close(); return }
     setConn('retry')
-    if (es.readyState === EventSource.CLOSED) setTimeout(connect, 5000)
+    // A closed stream may mean the session ended (401): probe with a normal call, which shows the gate if so.
+    if (es.readyState === EventSource.CLOSED) { loadState(); setTimeout(connect, 5000) }
   }
 }
 function setConn(c) {
-  if (state.conn === 'auth') return
   state.conn = c
   renderConn()
 }
@@ -222,15 +255,10 @@ function render() {
 
 function renderConn() {
   const el = $('conn')
-  const map = { connecting: ['연결 중…', 'neutral'], live: ['실시간', 'ok'], retry: ['재연결 중…', 'warn'], down: ['데몬 연결 끊김', 'bad'], auth: ['세션 만료', 'bad'] }
+  const map = { connecting: ['연결 중…', 'neutral'], live: ['실시간', 'ok'], retry: ['재연결 중…', 'warn'], down: ['데몬 연결 끊김', 'bad'] }
   const [label, tone] = map[state.conn] ?? map.connecting
   el.className = `conn conn-${tone}`
   el.querySelector('.conn-label').textContent = label
-  el.title = state.conn === 'auth' ? "펫에서 '자세히 보기'를 다시 눌러 주세요" : ''
-  document.body.classList.toggle('is-auth-expired', state.conn === 'auth')
-  if (state.conn === 'auth' && !$('auth-banner')) {
-    document.body.prepend(h('div', { id: 'auth-banner', class: 'auth-banner', role: 'alert' }, "세션이 만료됐어요. 펫에서 '자세히 보기'를 다시 눌러 주세요."))
-  }
 }
 
 function renderTop() {
@@ -256,39 +284,25 @@ function renderTop() {
     return h('div', { class: 'meter', title: reset ? `${formatClock(reset)} 초기화` : '초기화 시각 미확인' },
       h('span', { class: 'meter-label' }, label),
       h('span', { class: 'meter-track', role: 'progressbar', 'aria-label': `${label} 사용량`, 'aria-valuemin': 0, 'aria-valuemax': 100, 'aria-valuenow': p ?? null },
-        h('span', { class: `meter-fill tone-${tone}`, style: null, 'data-w': p ?? 0 })),
+        h('span', { class: `meter-fill tone-${tone}`, 'data-w': p ?? 0 })),
       h('span', { class: 'meter-value' }, p === null ? '미확인' : `${p}%`),
-      h('span', { class: 'meter-reset' }, reset ? `${formatClock(reset)} 초기화` : ''))
+      h('span', { class: 'meter-reset' }, reset ? `${formatClock(reset)} 초기화` : '초기화 미확인'))
   }
-  const mode = q.mode in QUOTA_MODE ? QUOTA_MODE[q.mode] : txt(q.mode)
-  const modeTone = { normal: 'ok', save: 'warn', review_only: 'warn', hold: 'bad' }[q.mode] ?? 'neutral'
-  swap(quota, meter('5시간', q.fiveHour, q.fiveHourResetsAt), meter('7일', q.sevenDay, q.sevenDayResetsAt), chip([mode, modeTone], 'quota-mode'))
+  const windows = Array.isArray(q.windows) ? q.windows : []
+  swap(quota,
+    windows.length ? windows.map((w) => meter(windowLabel(w.name), w.utilization, w.resetsAt)) : h('span', { class: 'quota-none' }, '한도 창 미확인'),
+    chip(QUOTA_MODE[q.mode] ?? [txt(q.mode), 'neutral'], 'quota-mode'))
   // Width via CSSOM (CSP forbids inline style attributes).
   for (const f of quota.querySelectorAll('.meter-fill')) f.style.width = `${f.getAttribute('data-w')}%`
 }
 
-// ---------- decisions ----------
-function collectDecisions(s) {
-  const items = []
-  const reqs = s.requests ?? []
-  const reqById = new Map(reqs.map((r) => [r.id, r]))
-  const approvals = (s.approvals ?? []).filter((a) => a.decision === null || a.decision === undefined)
-  const byKind = (k) => approvals.filter((a) => approvalKind(a).kind === k)
-  for (const a of byKind('plan')) items.push({ type: 'plan', key: `ap:${a.id}`, a, req: reqById.get(approvalKind(a).requestId) })
-  for (const r of reqs) if (r.status === 'asking') for (const q of r.questions ?? []) if (q.answer === null || q.answer === undefined) items.push({ type: 'ceo-q', key: `cq:${r.id}:${q.id}`, r, q })
-  for (const r of reqs) for (const t of r.tasks ?? []) if (t.questions?.length) items.push({ type: 'worker-q', key: `wq:${t.id}`, r, t })
-  for (const a of byKind('accept')) items.push({ type: 'accept', key: `ap:${a.id}`, a, req: reqById.get(approvalKind(a).requestId) })
-  for (const a of byKind('merge')) items.push({ type: 'merge', key: `ap:${a.id}`, a, req: reqById.get(approvalKind(a).requestId) })
-  for (const r of reqs) for (const t of r.tasks ?? []) if (t.status === 'blocked') items.push({ type: 'blocked', key: `bl:${t.id}`, r, t })
-  for (const a of byKind('other')) items.push({ type: 'other', key: `ap:${a.id}`, a })
-  return items
-}
-
+// ---------- decisions (Snapshot.decisions, in the daemon's order; never rebuilt here) ----------
 function renderDecisions() {
   const s = state.snap
   const el = $('decisions')
-  const items = s ? collectDecisions(s) : []
-  const sig = JSON.stringify([items.map((i) => [i.key, i.a, i.q, i.t, i.req?.plan, i.req?.text, i.r?.text]), [...ui.rejectOpen], [...ui.confirm], [...ui.pending], [...ui.errors], ui.decisionsCollapsed, minute()])
+  const items = Array.isArray(s?.decisions) ? s.decisions : []
+  const reqTasks = items.filter((d) => d.kind === 'accept').map((d) => requestOf(d.requestId)?.tasks?.map((t) => [t.key, t.status, t.title]))
+  const sig = JSON.stringify([items, reqTasks, [...ui.rejectOpen], [...ui.rejectTasks].map(([k, v]) => [k, [...v]]), [...ui.confirm], [...ui.pending], [...ui.errors], ui.decisionsCollapsed, minute()])
   if (!changed('decisions', sig)) return
   el.hidden = items.length === 0
   if (!items.length) { swap(el); return }
@@ -303,104 +317,101 @@ function renderDecisions() {
     h('div', { class: 'decision-grid', id: 'decision-grid', hidden: collapsed }, items.map(decisionCard)))
 }
 
-const KIND_LABEL = { plan: ['계획 승인', 'info'], 'ceo-q': ['사장 질문', 'warn'], 'worker-q': ['작업자 질문', 'warn'], accept: ['결과 수락', 'ok'], merge: ['병합 승인', 'info'], blocked: ['회로 차단', 'bad'], other: ['팀 승인', 'neutral'] }
+function requestOf(id) { return state.snap?.requests?.find((r) => r.id === id) ?? null }
+function taskKeyOf(d) { return d.taskId && d.taskId.startsWith(d.requestId + '.') ? d.taskId.slice(d.requestId.length + 1) : null }
+function rerenderDecisions() { sigs.delete('decisions'); renderDecisions() }
 
-function decisionCard(item) {
-  const busy = ui.pending.has(item.key)
-  const err = ui.errors.get(item.key)
-  const [kl, kt] = KIND_LABEL[item.type]
-  const reqLink = (id, label) => id ? h('button', { class: 'link', type: 'button', onclick: () => { selectRequest(id); $('detail').scrollIntoView({ block: 'start', behavior: 'smooth' }) } }, label ?? '요청 보기') : null
-  const meta = []
+function decisionCard(d) {
+  const key = `${d.kind}:${d.id}`
+  const busy = ui.pending.has(key)
+  const err = ui.errors.get(key)
+  const [kl, kt] = DECISION_KIND[d.kind] ?? [txt(d.kind), 'neutral']
+  const req = requestOf(d.requestId)
+  const tkey = taskKeyOf(d)
+  const meta = [
+    req ? h('span', null, req.project) : null,
+    tkey ? h('span', { class: 'mono' }, tkey) : null,
+    d.revision > 0 && (d.kind === 'worker_question' || d.kind === 'blocked' || d.kind === 'revise') ? h('span', null, `리비전 ${d.revision}`) : null,
+    h('span', null, formatRelative(d.createdAt)),
+    tkey ? taskLink(d.requestId, tkey) : reqLink(d.requestId),
+  ]
   const body = []
+  if (req && !tkey) body.push(h('p', { class: 'why muted' }, h('span', { class: 'sub-label' }, '요청 '), req.text))
+  if (d.detail) body.push(h('pre', { class: 'card-body' }, d.detail))
   const actions = []
-  let title = ''
+  const opts = Array.isArray(d.options) ? d.options : []
+  const post = (path, payload, msg, onOk) => act(key, path, payload, msg, onOk)
 
-  if (item.a) {
-    const a = item.a
-    title = a.title
-    const exp = Date.parse(a.expiresAt)
-    if (isFinite(exp)) meta.push(h('span', { class: exp - Date.now() < 3600_000 ? 'meta-warn' : '' }, `만료 ${formatRelative(a.expiresAt)}`))
-    if (item.type === 'other') meta.push(h('span', null, `팀 ${txt(a.teamId)}`))
-    if (item.req) meta.push(h('span', null, item.req.project), reqLink(item.req.id))
-    if (item.type === 'plan' && item.req?.plan) {
-      body.push(h('p', { class: 'why' }, item.req.plan.summary))
-      if (item.req.plan.assumptions?.length) body.push(h('div', { class: 'sub' }, h('span', { class: 'sub-label' }, '가정'), h('ul', { class: 'compact' }, item.req.plan.assumptions.map((x) => h('li', null, x)))))
-    } else if (item.req) body.push(h('p', { class: 'why' }, item.req.text))
-    if (a.body) body.push(h('pre', { class: 'card-body' }, a.body))
-
-    if (item.type === 'accept' && ui.rejectOpen.has(item.key)) {
-      const dk = `reason:${item.key}`
-      const ta = h('textarea', { class: 'input', rows: 3, 'data-fkey': dk, placeholder: '무엇을 고쳐야 하는지 적어 주세요 (모든 작업이 재작업됩니다)', 'aria-label': '반려 사유', value: drafts.get(dk) ?? '', oninput: (e) => drafts.set(dk, e.target.value), disabled: busy })
-      body.push(h('div', { class: 'reject-form' }, ta))
-      actions.push(
-        h('button', { class: 'btn btn-danger', type: 'button', disabled: busy, 'data-fkey': `send:${item.key}`, onclick: () => {
-          const reason = (drafts.get(dk) ?? '').trim()
-          if (!reason) { ui.errors.set(item.key, '반려 사유를 입력해 주세요'); sigs.delete('decisions'); renderDecisions(); return }
-          act(item.key, `/requests/${enc(approvalKind(a).requestId)}/reject`, { reason }, '반려했어요', () => { ui.rejectOpen.delete(item.key); drafts.delete(dk) })
-        } }, busy ? '보내는 중…' : '반려 보내기'),
-        h('button', { class: 'btn', type: 'button', disabled: busy, onclick: () => { ui.rejectOpen.delete(item.key); ui.errors.delete(item.key); sigs.delete('decisions'); renderDecisions() } }, '취소'))
-    } else {
-      a.options.forEach((opt, i) => {
-        const danger = /반려|폐기|거절/.test(opt)
-        const primary = !danger && i === 0
-        actions.push(h('button', {
-          class: `btn ${primary ? 'btn-primary' : danger ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy, 'data-fkey': `opt:${item.key}:${i}`,
-          onclick: () => {
-            if (item.type === 'accept' && opt === '반려') { ui.rejectOpen.add(item.key); ui.errors.delete(item.key); sigs.delete('decisions'); renderDecisions(); document.querySelector(`[data-fkey="reason:${CSS.escape(item.key)}"]`)?.focus(); return }
-            act(item.key, `/approvals/${enc(a.id)}`, { decision: opt, subjectHash: a.subjectHash }, `${opt} — 보냈어요`)
-          },
-        }, busy ? '보내는 중…' : opt))
-      })
-    }
-  } else if (item.type === 'ceo-q') {
-    title = item.q.question
-    meta.push(h('span', null, item.r.project), reqLink(item.r.id))
-    body.push(h('p', { class: 'why' }, h('span', { class: 'sub-label' }, '요청 '), item.r.text))
-    if (item.q.reason) body.push(h('p', { class: 'why muted' }, h('span', { class: 'sub-label' }, '이유 '), item.q.reason))
-    actions.push(...answerControls(item.key, item.q.options, item.q.default, busy, (answer) => act(item.key, `/requests/${enc(item.r.id)}/answer`, { questionId: item.q.id, answer }, '답변을 보냈어요')))
-  } else if (item.type === 'worker-q') {
-    const t = item.t
-    title = `${t.title} — 질문 ${t.questions.length}개`
-    meta.push(h('span', null, `${t.project} · ${t.key}`), taskLink(item.r.id, t.key))
-    if (t.lastActivity) body.push(h('p', { class: 'why muted' }, t.lastActivity))
-    t.questions.forEach((q, qi) => {
-      const k = `${item.key}#${qi}`
-      body.push(h('div', { class: 'wq' },
-        h('p', { class: 'wq-q' }, `${t.questions.length > 1 ? `${qi + 1}. ` : ''}${q.question}`),
-        h('div', { class: 'actions' }, answerControls(k, q.options, q.default, busy, (answer) => act(item.key, `/tasks/${enc(t.id)}/answer`, { questionIndex: qi, answer }, '답변을 보냈어요')))))
+  if (d.kind === 'ceo_question' || d.kind === 'worker_question') {
+    const send = d.kind === 'ceo_question'
+      ? (answer) => post(`/requests/${enc(d.requestId)}/answer`, { questionId: d.id, answer }, '답변을 보냈어요')
+      : (answer) => post(`/tasks/${enc(d.taskId ?? '')}/answer`, { questionId: d.id, answer, revision: d.revision }, '답변을 보냈어요')
+    actions.push(...answerControls(key, opts, busy, send))
+  } else if (d.kind === 'blocked') {
+    opts.forEach((opt, i) => {
+      const decision = blockedDecision(opt)
+      const ck = `${key}:stop`
+      if (decision === 'stop' && ui.confirm.has(ck)) {
+        actions.push(h('span', { class: 'confirm' },
+          h('button', { class: 'btn btn-danger', type: 'button', disabled: busy, 'data-fkey': `stopyes:${key}`, onclick: () => { ui.confirm.delete(ck); post(`/tasks/${enc(d.taskId ?? '')}/decide`, { decision, revision: d.revision }, '요청을 중단했어요') } }, '정말 중단'),
+          h('button', { class: 'btn', type: 'button', onclick: () => { ui.confirm.delete(ck); rerenderDecisions() } }, '아니요')))
+        return
+      }
+      actions.push(h('button', {
+        class: `btn ${decision === 'retry' ? 'btn-primary' : decision === 'stop' ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy || !decision || !d.taskId,
+        title: decision ? null : '이 선택지를 처리할 수 없어요 (알 수 없는 결정)', 'data-fkey': `opt:${key}:${i}`,
+        onclick: () => {
+          if (decision === 'stop') { ui.confirm.add(ck); rerenderDecisions(); document.querySelector(`[data-fkey="stopyes:${CSS.escape(key)}"]`)?.focus(); return }
+          post(`/tasks/${enc(d.taskId ?? '')}/decide`, { decision, revision: d.revision }, `${opt} — 보냈어요`)
+        },
+      }, busy ? '보내는 중…' : opt))
     })
-  } else if (item.type === 'blocked') {
-    const t = item.t
-    title = `작업 "${t.title}"이 막혔어요`
-    meta.push(h('span', null, `${t.project} · ${t.key}`), h('span', null, `시도 ${t.attempts}회`), taskLink(item.r.id, t.key))
-    body.push(h('p', { class: 'why' }, txt(t.note, '막힌 이유 미확인')))
-    if (t.lastActivity) body.push(h('p', { class: 'why muted' }, `마지막 활동: ${t.lastActivity}`))
-    const decide = (decision, msg) => act(item.key, `/tasks/${enc(t.id)}/decide`, { decision }, msg)
-    const ck = `${item.key}:stop`
+  } else if (d.kind === 'accept' && ui.rejectOpen.has(key)) {
+    const dk = `reason:${key}`
+    const chosen = ui.rejectTasks.get(key) ?? new Set()
+    const passed = (req?.tasks ?? []).filter((t) => t.status === 'passed')
+    body.push(h('div', { class: 'reject-form' },
+      h('textarea', { class: 'input', rows: 3, 'data-fkey': dk, placeholder: '무엇을 고쳐야 하는지 적어 주세요', 'aria-label': '반려 사유', value: drafts.get(dk) ?? '', oninput: (e) => drafts.set(dk, e.target.value), disabled: busy }),
+      passed.length ? h('fieldset', { class: 'task-pick' },
+        h('legend', null, '다시 할 작업 (고르지 않으면 통과한 작업 전부)'),
+        passed.map((t) => h('label', { class: 'check-row' },
+          h('input', { type: 'checkbox', 'data-fkey': `pick:${key}:${t.key}`, checked: chosen.has(t.key), disabled: busy,
+            onchange: (e) => { const set = ui.rejectTasks.get(key) ?? new Set(); if (e.target.checked) set.add(t.key); else set.delete(t.key); ui.rejectTasks.set(key, set); rerenderDecisions() } }),
+          h('span', { class: 'mono' }, t.key), h('span', null, t.title)))) : null))
     actions.push(
-      h('button', { class: 'btn btn-primary', type: 'button', disabled: busy, 'data-fkey': `retry:${item.key}`, onclick: () => decide('retry', '최상위 모델로 다시 시도해요') }, '한 번 더 (최상위 모델)'),
-      h('button', { class: 'btn', type: 'button', disabled: busy, 'data-fkey': `skip:${item.key}`, onclick: () => decide('skip', '이 작업을 취소하고 계속해요') }, '이 작업 취소하고 계속'),
-      ui.confirm.has(ck)
-        ? h('span', { class: 'confirm' },
-          h('button', { class: 'btn btn-danger', type: 'button', disabled: busy, 'data-fkey': `stopyes:${item.key}`, onclick: () => { ui.confirm.delete(ck); decide('stop', '요청을 중단했어요') } }, '정말 중단'),
-          h('button', { class: 'btn', type: 'button', onclick: () => { ui.confirm.delete(ck); sigs.delete('decisions'); renderDecisions() } }, '아니요'))
-        : h('button', { class: 'btn btn-danger-ghost', type: 'button', disabled: busy, 'data-fkey': `stop:${item.key}`, onclick: () => { ui.confirm.add(ck); sigs.delete('decisions'); renderDecisions(); document.querySelector(`[data-fkey="stopyes:${CSS.escape(item.key)}"]`)?.focus() } }, '요청 중단'))
+      h('button', { class: 'btn btn-danger', type: 'button', disabled: busy, 'data-fkey': `send:${key}`, onclick: () => {
+        const reason = (drafts.get(dk) ?? '').trim()
+        if (!reason) { ui.errors.set(key, '반려 사유를 입력해 주세요'); rerenderDecisions(); return }
+        const payload = chosen.size ? { reason, tasks: [...chosen] } : { reason }
+        post(`/requests/${enc(d.requestId)}/reject`, payload, '반려했어요', () => { ui.rejectOpen.delete(key); ui.rejectTasks.delete(key); drafts.delete(dk) })
+      } }, busy ? '보내는 중…' : '반려 보내기'),
+      h('button', { class: 'btn', type: 'button', disabled: busy, onclick: () => { ui.rejectOpen.delete(key); ui.errors.delete(key); rerenderDecisions() } }, '취소'))
+  } else {
+    // plan, accept, merge, revise, integration: approval-backed cards.
+    opts.forEach((opt, i) => {
+      const danger = /반려|폐기|거절|중단/.test(opt)
+      actions.push(h('button', {
+        class: `btn ${!danger && i === 0 ? 'btn-primary' : danger ? 'btn-danger-ghost' : ''}`, type: 'button', disabled: busy || !d.subjectHash, 'data-fkey': `opt:${key}:${i}`,
+        onclick: () => {
+          if (d.kind === 'accept' && opt === '반려') { ui.rejectOpen.add(key); ui.errors.delete(key); rerenderDecisions(); document.querySelector(`[data-fkey="reason:${CSS.escape(key)}"]`)?.focus(); return }
+          post(`/approvals/${enc(d.id)}`, { decision: opt, subjectHash: d.subjectHash }, `${opt} — 보냈어요`)
+        },
+      }, busy ? '보내는 중…' : opt))
+    })
+    if (!d.subjectHash) body.push(h('p', { class: 'card-error' }, '승인 해시가 없어 결정할 수 없어요'))
   }
 
-  return h('article', { class: `card decision decision-${item.type}${busy ? ' is-busy' : ''}`, 'aria-busy': busy ? 'true' : null },
+  return h('article', { class: `card decision decision-${d.kind}${busy ? ' is-busy' : ''}`, 'aria-busy': busy ? 'true' : null },
     h('div', { class: 'decision-head' }, chip([kl, kt]), h('div', { class: 'decision-meta' }, meta)),
-    h('h3', { class: 'decision-title' }, title),
+    h('h3', { class: 'decision-title' }, txt(d.title, '제목 미확인')),
     body,
     h('div', { class: 'actions' }, actions),
     err ? h('p', { class: 'card-error', role: 'alert' }, err) : null)
 }
 
-function answerControls(key, options, def, busy, send) {
+function answerControls(key, options, busy, send) {
   const dk = `ans:${key}`
-  const out = (options ?? []).map((opt, i) => h('button', {
-    class: `btn ${opt === def ? 'btn-primary' : ''}`, type: 'button', disabled: busy, 'data-fkey': `ansopt:${key}:${i}`, onclick: () => send(opt),
-    title: opt === def ? '기본값' : null,
-  }, opt, opt === def ? h('span', { class: 'btn-note' }, '기본') : null))
+  const out = options.map((opt, i) => h('button', { class: `btn ${i === 0 ? 'btn-primary' : ''}`, type: 'button', disabled: busy, 'data-fkey': `ansopt:${key}:${i}`, onclick: () => send(opt) }, opt))
   const input = h('input', { class: 'input input-inline', type: 'text', 'data-fkey': dk, placeholder: '직접 답하기', 'aria-label': '직접 답하기', value: drafts.get(dk) ?? '', disabled: busy,
     oninput: (e) => drafts.set(dk, e.target.value),
     onkeydown: (e) => { if (e.key === 'Enter' && e.target.value.trim()) { send(e.target.value.trim()); drafts.delete(dk) } } })
@@ -409,25 +420,29 @@ function answerControls(key, options, def, busy, send) {
   return out
 }
 
+function reqLink(id) {
+  return id ? h('button', { class: 'link', type: 'button', onclick: () => { selectRequest(id); $('detail').scrollIntoView({ block: 'start', behavior: 'smooth' }) } }, '요청 보기') : null
+}
 function taskLink(reqId, key) {
   return h('button', { class: 'link', type: 'button', onclick: (e) => { lastFocusBeforeDrawer = e.currentTarget; if (state.selected !== reqId) selectRequest(reqId); openDrawer(key, 'activity') } }, '작업 보기')
 }
 
 async function act(key, path, body, okMsg, onOk) {
   ui.pending.add(key); ui.errors.delete(key)
-  sigs.delete('decisions'); renderDecisions()
+  rerenderDecisions()
   try {
     await api(path, { method: 'POST', body })
     onOk?.()
     toast(okMsg)
-    await loadState()
-    loadDetail()
   } catch (e) {
     ui.errors.set(key, errorText(e))
   } finally {
     ui.pending.delete(key)
-    sigs.delete('decisions'); renderDecisions()
+    rerenderDecisions()
   }
+  // Success or 409 (stale card / revision): refetch so the card reflects the daemon's current state.
+  await loadState()
+  loadDetail()
 }
 
 let toastTimer = null
@@ -631,22 +646,25 @@ function refreshDrawerData() {
 let pollTimer = null
 async function pollActivity() {
   clearTimeout(pollTimer)
+  pollTimer = null
   const t = currentTask()
   const a = selectedAttempt(t)
   if (!a || state.drawer?.tab !== 'activity') return
   let entry = activity.get(a.id)
-  if (!entry) { entry = { lines: [], loading: false, error: null, loaded: false }; activity.set(a.id, entry) }
+  if (!entry) { entry = { lines: [], next: 0, loading: false, error: null, loaded: false }; activity.set(a.id, entry) }
   if (entry.loading) return
   entry.loading = true
   try {
-    const got = normalizeActivity(await api(`/attempts/${enc(a.id)}/activity?after=${entry.lines.length}`))
-    entry.lines.push(...got)
+    const got = await api(`/attempts/${enc(a.id)}/activity?after=${entry.next}`) // {lines, next} (execution.md §15)
+    if (Array.isArray(got?.lines)) entry.lines.push(...got.lines)
+    if (Number.isInteger(got?.next)) entry.next = got.next
     entry.error = null
+    if (Array.isArray(got?.lines) && got.lines.length >= 500) pollTimer = setTimeout(pollActivity, 0) // more pages waiting
   } catch (e) { entry.error = e.status === 404 ? null : errorText(e) }
   entry.loading = false
   entry.loaded = true
   if (state.drawer?.tab === 'activity' && selectedAttempt(currentTask())?.id === a.id) renderActivityLog()
-  if (isLive(a)) pollTimer = setTimeout(pollActivity, 3000)
+  if (isLive(a) && !pollTimer) pollTimer = setTimeout(() => { pollTimer = null; pollActivity() }, 3000)
 }
 
 async function loadEvidence(a, name) {
@@ -665,9 +683,8 @@ async function loadDiff(t) {
   if (diffs.has(key)) return
   diffs.set(key, { status: 'loading' })
   try {
-    const raw = await api(`/requests/${enc(t.requestId)}/diff?task=${enc(t.key)}`)
-    const text = typeof raw === 'string' ? raw : typeof raw?.diff === 'string' ? raw.diff : ''
-    diffs.set(key, { status: 'ok', files: parseDiff(text) })
+    const d = await api(`/requests/${enc(t.requestId)}/diff?task=${enc(t.key)}`) // {files, diff, truncated} (execution.md §15)
+    diffs.set(key, { status: 'ok', files: Array.isArray(d?.files) ? d.files : [], parsed: parseDiff(typeof d?.diff === 'string' ? d.diff : ''), truncated: d?.truncated === true })
   } catch (e) { diffs.set(key, e.status === 404 ? { status: 'missing' } : { status: 'error', error: errorText(e) }) }
   paneVersion++; sigs.delete('drawer'); renderDrawer()
 }
@@ -702,7 +719,8 @@ function renderDrawer() {
     h('button', { class: 'btn btn-icon drawer-close', type: 'button', 'aria-label': '닫기', 'data-fkey': 'drawer-close', onclick: () => closeDrawer() }, '✕'))
   swap(el.querySelector('.drawer-body'),
     h('dl', { class: 'facts' },
-      fact('역할', t.role), fact('등급', t.grade), fact('모델', t.model), fact('시도', `${t.attempts}회`),
+      fact('역할', t.role), fact('등급', t.grade), fact('모델', t.model), fact('검토 모델', txt(t.reviewModel)),
+      fact('시도', `${t.attempts}회`), fact('리비전', Number.isInteger(t.revision) ? `r${t.revision}` : '미확인'),
       fact('HEAD', t.headSha ? shortSha(t.headSha) : '미확인', 'mono', t.headSha), fact('BASE', t.baseSha ? shortSha(t.baseSha) : '미확인', 'mono', t.baseSha),
       fact('브랜치', txt(t.branch), 'mono', t.branch), fact('갱신', formatRelative(t.updatedAt))),
     t.note ? h('p', { class: `callout ${t.status === 'blocked' ? 'callout-bad' : ''}` }, t.note) : null)
@@ -886,22 +904,29 @@ function diffPane(t) {
   if (!d || d.status === 'loading') return skeleton(8)
   if (d.status === 'missing') return h('p', { class: 'state' }, 'diff를 찾을 수 없어요.')
   if (d.status === 'error') return h('p', { class: 'state state-error' }, d.error)
-  if (!d.files.length) return h('p', { class: 'state' }, '변경 사항이 없어요.')
-  const added = d.files.reduce((n, f) => n + f.added, 0), removed = d.files.reduce((n, f) => n + f.removed, 0)
+  if (!d.files.length && !d.parsed.length) return h('p', { class: 'state' }, '변경 사항이 없어요.')
+  const num = (v) => (Number.isFinite(v) ? v : 0)
+  const added = d.files.reduce((n, f) => n + num(f.added), 0), removed = d.files.reduce((n, f) => n + num(f.removed), 0)
+  const bodyIndex = new Map(d.parsed.map((f, i) => [f.path, i]))
   let budget = DIFF_LINE_LIMIT
   const STATUS = { added: '추가', deleted: '삭제', renamed: '이름 변경', modified: '수정' }
+  const counts = (a, r) => h('span', { class: 'file-counts' }, h('span', { class: 'add-text' }, Number.isFinite(a) ? `+${a}` : '+?'), ' ', h('span', { class: 'del-text' }, Number.isFinite(r) ? `−${r}` : '−?'))
   return h('div', { class: 'diff' },
     h('div', { class: 'summary-row' }, h('span', null, `파일 ${d.files.length}개`), h('span', { class: 'add-text' }, `+${added}`), h('span', { class: 'del-text' }, `−${removed}`),
       h('span', { class: 'muted mono small' }, `${shortSha(t.baseSha)}..${shortSha(t.headSha)}`)),
-    h('ul', { class: 'file-list' }, d.files.map((f, i) => h('li', null, h('button', { class: 'file-link', type: 'button', onclick: () => document.getElementById(`diff-file-${i}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' }) },
-      h('span', { class: `file-status fs-${f.status}` }, STATUS[f.status] ?? f.status), h('span', { class: 'mono file-path' }, f.path),
-      h('span', { class: 'file-counts' }, h('span', { class: 'add-text' }, `+${f.added}`), ' ', h('span', { class: 'del-text' }, `−${f.removed}`)))))),
-    d.files.map((f, i) => {
+    d.truncated ? h('p', { class: 'callout' }, 'diff가 너무 커서 앞부분만 보여요 (2MB 제한). 파일 목록과 줄 수는 전체 기준이에요.') : null,
+    h('ul', { class: 'file-list' }, d.files.map((f) => {
+      const i = bodyIndex.get(f.path)
+      return h('li', null, h('button', { class: 'file-link', type: 'button', disabled: i === undefined, title: i === undefined ? '본문이 잘려서 보이지 않아요' : null,
+        onclick: () => document.getElementById(`diff-file-${i}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' }) },
+      h('span', { class: `file-status fs-${d.parsed[i]?.status ?? 'modified'}` }, STATUS[d.parsed[i]?.status] ?? '수정'), h('span', { class: 'mono file-path' }, txt(f.path)), counts(f.added, f.removed)))
+    })),
+    d.parsed.map((f, i) => {
       const lines = f.lines.filter((l) => !(l.kind === 'meta' && /^(diff --git|index |--- |\+\+\+ )/.test(l.text)))
       const shown = lines.slice(0, Math.max(0, budget))
       budget -= shown.length
       return h('section', { class: 'diff-file', id: `diff-file-${i}` },
-        h('header', { class: 'diff-file-head' }, h('span', { class: 'mono file-path' }, f.path), h('span', { class: 'file-counts' }, h('span', { class: 'add-text' }, `+${f.added}`), ' ', h('span', { class: 'del-text' }, `−${f.removed}`))),
+        h('header', { class: 'diff-file-head' }, h('span', { class: 'mono file-path' }, f.path), counts(f.added, f.removed)),
         f.binary ? h('p', { class: 'muted small pad' }, '바이너리 파일') : h('pre', { class: 'diff-body' }, shown.map((l) => h('span', { class: `dl dl-${l.kind}` }, l.text || ' '))),
         shown.length < lines.length ? h('p', { class: 'muted small pad' }, `나머지 ${lines.length - shown.length}줄은 생략했어요`) : null)
     }))
@@ -931,8 +956,11 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) sche
   const r = parseHash()
   if (r.req) { state.selected = r.req; if (r.task) state.drawer = { taskKey: r.task, tab: TABS.some(([k]) => k === r.tab) ? r.tab : 'activity', attemptId: null } }
 }
-render()
-loadState()
-loadDetail()
-connect()
+startSession().then((ok) => {
+  if (!ok) return
+  render()
+  loadState()
+  loadDetail()
+  connect()
+})
 document.querySelector('.skip-link')?.addEventListener('click', (e) => { e.preventDefault(); const m = $('main'); m.setAttribute('tabindex', '-1'); m.focus() })

@@ -2,7 +2,7 @@
 // Fixtures conform to src/types.ts and cover every request/task/attempt status and every decision kind.
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ApiRouter } from '../../src/server.ts'
-import type { Approval, AttemptView, CheckResult, HqEvent, RequestDetail, RequestView, Snapshot, TaskStatus, TaskView, Verdict, WorkerView } from '../../src/types.ts'
+import type { Approval, AttemptView, CheckResult, DecisionItem, HqEvent, RequestDetail, RequestView, Snapshot, TaskStatus, TaskView, Verdict, WorkerView } from '../../src/types.ts'
 
 export interface MockCall { method: string; url: string; headers: IncomingMessage['headers']; body: string }
 export interface MockApi {
@@ -32,7 +32,7 @@ export function createMockApi(opts: { live?: boolean } = {}): MockApi {
   const details = new Map<string, DetailTask[]>()
 
   function task(req: string, key: string, title: string, role: string, grade: string, model: string, status: TaskStatus, n: number, extra: Partial<DetailTask> = {}): DetailTask {
-    const id = `${req}/${key}`
+    const id = `${req}.${key}`
     const list: AttemptView[] = []
     for (let i = 1; i <= n; i++) {
       const last = i === n
@@ -40,14 +40,14 @@ export function createMockApi(opts: { live?: boolean } = {}): MockApi {
       const workStatus = last
         ? status === 'running' ? 'running' : status === 'question' ? 'question' : status === 'held' ? 'limited' : status === 'blocked' ? 'unverifiable' : status === 'pending' ? 'starting' : 'succeeded'
         : 'failed'
-      list.push({ id: `${id}#a${i}`, taskId: id, kind: 'work', n: i, model: i === 3 ? 'opus' : model, status: workStatus as AttemptView['status'],
+      list.push({ id: `${id}~a${i}`, taskId: id, kind: 'work', n: i, model: i === 3 ? 'opus' : model, status: workStatus as AttemptView['status'],
         startedAt: ago(started), endedAt: workStatus === 'running' || workStatus === 'starting' ? null : ago(started - 11 - i),
         costUsd: workStatus === 'running' || workStatus === 'starting' ? null : 0.18 + i * 0.21,
         reason: last ? (status === 'blocked' ? 'done.json 없음 — 종료 코드 0이지만 완료 계약을 확인할 수 없어요' : status === 'held' ? '5시간 한도 도달' : null)
           : i === 1 ? '기계 검증 실패: npm test (종료 코드 1) — 2개 테스트 실패' : '검토 blocking 1건: 세션 만료 처리 누락' })
       if (!last || ['reviewing', 'passed'].includes(status)) {
         const reviewStatus = !last ? 'failed' : status === 'reviewing' ? 'running' : 'succeeded'
-        list.push({ id: `${id}#r${i}`, taskId: id, kind: 'review', n: i, model: model === 'opus' ? 'sonnet' : 'opus', status: reviewStatus as AttemptView['status'],
+        list.push({ id: `${id}~r${i}`, taskId: id, kind: 'review', n: i, model: model === 'opus' ? 'sonnet' : 'opus', status: reviewStatus as AttemptView['status'],
           startedAt: ago(started - 12), endedAt: reviewStatus === 'running' ? null : ago(started - 16), costUsd: reviewStatus === 'running' ? null : 0.31,
           reason: reviewStatus === 'failed' ? 'blocking: 쿠키 만료 경계값 테스트 없음' : null })
       }
@@ -57,7 +57,7 @@ export function createMockApi(opts: { live?: boolean } = {}): MockApi {
     const cur = list.length ? list[list.length - 1].id : null
     const base: DetailTask = {
       id, key, requestId: req, project: 'hq', title, role, grade, model, status, attempts: list.filter((a) => a.kind === 'work').length,
-      currentAttemptId: cur, lastActivity: null, questions: [], note: null, headSha: status === 'pending' ? null : sha(key), updatedAt: ago(n * 3),
+      currentAttemptId: cur, lastActivity: null, questions: [], note: null, headSha: status === 'pending' ? null : sha(key), revision: 0, reviewModel: model === 'opus' ? 'sonnet' : 'opus', updatedAt: ago(n * 3),
       spec: { brief: `${title}.`, owns: [`src/${key}/**`], acceptance: [{ id: 'a1', text: '테스트 통과', check: 'node --test' }], depends_on: [] },
       branch: status === 'pending' ? null : `hq/${req}/${key}`, baseSha: 'e90ee5a41c2d8b7f', attemptsList: list,
     }
@@ -72,11 +72,12 @@ export function createMockApi(opts: { live?: boolean } = {}): MockApi {
     task(R1, 'ladder', '재작업 사다리와 회로 차단', 'implement', 'L2', 'sonnet', 'pending', 0),
     task(R1, 'quota', '한도 관측과 보류 스케줄', 'implement', 'L1', 'haiku', 'rework', 1, { lastActivity: '실패: node --test (2개 실패)', note: '재작업 2회차 대기 — 같은 모델' }),
     task(R1, 'merge', '로컬 병합과 worktree 정리', 'implement', 'L2', 'sonnet', 'held', 1, { note: '5시간 한도 93% — 18:40까지 보류' }),
-    task(R1, 'recover', '재시작 복구 (process.json 확인)', 'implement', 'L3', 'opus', 'blocked', 3, { note: '3번 실패했어요: done.json 없음 (확인 불가)', lastActivity: '종료 코드 0, done.json 없음' }),
+    task(R1, 'recover', '재시작 복구 (process.json 확인)', 'implement', 'L3', 'opus', 'blocked', 3, { note: '3번 실패했어요: done.json 없음 (확인 불가)', lastActivity: '종료 코드 0, done.json 없음', revision: 1 }),
+    task(R1, 'sandbox', '샌드박스 프로필 생성', 'implement', 'L2', 'sonnet', 'revising', 1, { note: 'CEO가 지시서를 고치는 중 (owns 확장 요청)' }),
     task(R1, 'notify', 'macOS 알림 문구 정리', 'collect', 'L0', 'haiku', 'question', 1, {
       lastActivity: '질문을 남기고 멈췄어요',
-      questions: [{ question: '알림을 결정 항목이 생길 때마다 보낼까요, 아니면 5분에 한 번 묶어서 보낼까요?', options: ['매번', '5분 묶음'], default: '매번' },
-        { question: `알림 제목 예시에 들어간 ${XSS} 같은 문자열은 그대로 둘까요?`, options: ['그대로', '제거'], default: '제거' }] }),
+      questions: [{ id: 'wq-1a2b3c4d', question: '알림을 결정 항목이 생길 때마다 보낼까요, 아니면 5분에 한 번 묶어서 보낼까요?', options: ['매번', '5분 묶음'], default: '매번' },
+        { id: 'wq-5e6f7a8b', question: `알림 제목 예시에 들어간 ${XSS} 같은 문자열은 그대로 둘까요?`, options: ['그대로', '제거'], default: '제거' }] }),
     task(R1, 'docs', 'README 실행 단계 문서화', 'collect', 'L0', 'haiku', 'cancelled', 0, { note: '회장님이 취소' }),
   ]
   details.set(R1, r1Tasks)
@@ -125,14 +126,18 @@ export function createMockApi(opts: { live?: boolean } = {}): MockApi {
       options: ['병합', '보류'], subjectHash: 'h-merge-91aa', expiresAt: ahead(60 * 23), createdAt: ago(20), decision: null, decidedAt: null },
     { id: `plan:${R2}`, teamId: 'ceo', title: '계획 승인: 태그 필터 컴포넌트와 모바일 카드 간격 수정', body: 'filter [L1·sonnet] 태그 필터 컴포넌트\n  check: npm test -- tags\nspacing [L0·haiku] 모바일 카드 간격\n  check: manual',
       options: ['승인', '반려'], subjectHash: 'h-plan-2b81', expiresAt: ahead(60 * 18), createdAt: ago(6), decision: null, decidedAt: null },
-    { id: 'blog:publish-2026-09-30', teamId: 'blog', title: `새 글 발행: 주간 회고 ${XSS}`, body: '초안 1,840자 · 이미지 2개 · 예약 발행 09:00', options: ['발행', '보류', '폐기'],
+    { id: `revise:${R1}.sandbox`, teamId: 'ceo', title: '지시서 수정 승인: 샌드박스 프로필 생성', body: '- owns: src/exec/sandbox.ts\n+ owns: src/exec/sandbox.ts, src/exec/profiles/**\n  이유: 프로필 템플릿을 별도 파일로 두어야 검사가 가능',
+      options: ['승인', '반려'], subjectHash: 'h-revise-sbx', expiresAt: ahead(60 * 24 * 30), createdAt: ago(12), decision: null, decidedAt: null },
+    { id: `integration:${R5}:blog`, teamId: 'ceo', title: '통합 실패: blog', body: `충돌 파일: src/list.ts\ncheck 실패: npm test (종료 코드 1) ${XSS}`,
+      options: ['다시 통합', '요청 중단'], subjectHash: 'h-integ-91aa', expiresAt: ahead(60 * 24 * 30), createdAt: ago(18), decision: null, decidedAt: null },
+    { id: 'team:blog:publish-2026-09-30', teamId: 'blog', title: `새 글 발행: 주간 회고 ${XSS}`, body: '초안 1,840자 · 이미지 2개 · 예약 발행 09:00', options: ['발행', '보류', '폐기'],
       subjectHash: 'h-blog-0930', expiresAt: ahead(90), createdAt: ago(40), decision: null, decidedAt: null },
   ]
 
   const workers: WorkerView[] = [
-    { attemptId: `${R1}/runner#a2`, taskId: `${R1}/runner`, requestId: R1, title: '작업자 프로세스 실행기 (detached spawn)', project: 'hq', role: 'implement', model: 'sonnet', kind: 'work', state: 'running', bubble: 'Bash: node --test test/exec/runner.test.ts', startedAt: ago(34) },
-    { attemptId: `${R1}/contract#a1`, taskId: `${R1}/contract`, requestId: R1, title: '완료 계약 판정 순수 함수', project: 'hq', role: 'implement', model: 'haiku', kind: 'verify', state: 'verifying', bubble: '기계 검증: npm test 실행 중', startedAt: ago(4) },
-    { attemptId: `${R1}/review#r1`, taskId: `${R1}/review`, requestId: R1, title: '교차 검토 실행과 verdict 검사', project: 'hq', role: 'implement', model: 'opus', kind: 'review', state: 'reviewing', bubble: '검토자: test/exec/review.test.ts 실행', startedAt: ago(8) },
+    { attemptId: `${R1}.runner~a2`, taskId: `${R1}.runner`, requestId: R1, title: '작업자 프로세스 실행기 (detached spawn)', project: 'hq', role: 'implement', model: 'sonnet', kind: 'work', state: 'running', bubble: 'Bash: node --test test/exec/runner.test.ts', startedAt: ago(34) },
+    { attemptId: `${R1}.contract~a1`, taskId: `${R1}.contract`, requestId: R1, title: '완료 계약 판정 순수 함수', project: 'hq', role: 'implement', model: 'haiku', kind: 'verify', state: 'verifying', bubble: '기계 검증: npm test 실행 중', startedAt: ago(4) },
+    { attemptId: `${R1}.review~r1`, taskId: `${R1}.review`, requestId: R1, title: '교차 검토 실행과 verdict 검사', project: 'hq', role: 'implement', model: 'opus', kind: 'review', state: 'reviewing', bubble: '검토자: test/exec/review.test.ts 실행', startedAt: ago(8) },
   ]
 
   // ---------- evidence ----------
@@ -146,9 +151,9 @@ export function createMockApi(opts: { live?: boolean } = {}): MockApi {
     ['tool', 'Bash: git add -A && git commit -m "exec: detached runner"'], ['usage', '입력 182,340 · 출력 9,812 토큰 · $0.61'],
   ]
   const base = t0 - 34 * 60_000
-  activity.set(`${R1}/runner#a2`, runnerLines.map(([kind, text], i) => ({ at: new Date(base + i * 150_000).toISOString(), kind, text })))
-  activity.set(`${R1}/runner#a1`, [{ at: ago(60), kind: 'message', text: '첫 시도: 실행기 뼈대 작성' }, { at: ago(55), kind: 'tool', text: 'Write src/exec/runner.ts' }, { at: ago(52), kind: 'error', text: 'npm test 실패 (종료 코드 1)' }])
-  for (const [id] of attempts) if (!activity.has(`${id}#a1`)) activity.set(`${id}#a1`, [{ at: ago(30), kind: 'message', text: '작업을 시작합니다.' }, { at: ago(25), kind: 'tool', text: `Edit src/${id.split('/')[1]}/index.ts` }, { at: ago(20), kind: 'usage', text: '입력 40,120 · 출력 3,004 토큰 · $0.18' }])
+  activity.set(`${R1}.runner~a2`, runnerLines.map(([kind, text], i) => ({ at: new Date(base + i * 150_000).toISOString(), kind, text })))
+  activity.set(`${R1}.runner~a1`, [{ at: ago(60), kind: 'message', text: '첫 시도: 실행기 뼈대 작성' }, { at: ago(55), kind: 'tool', text: 'Write src/exec/runner.ts' }, { at: ago(52), kind: 'error', text: 'npm test 실패 (종료 코드 1)' }])
+  for (const [id] of attempts) if (!activity.has(`${id}~a1`)) activity.set(`${id}~a1`, [{ at: ago(30), kind: 'message', text: '작업을 시작합니다.' }, { at: ago(25), kind: 'tool', text: `Edit src/${id.split('.')[1]}/index.ts` }, { at: ago(20), kind: 'usage', text: '입력 40,120 · 출력 3,004 토큰 · $0.18' }])
 
   const report = `## 요약
 작업자 프로세스를 \`detached: true\`로 띄우고, spawn 직후 \`process.json\`을 **원자적으로** 기록하도록 구현했습니다. 데몬이 재시작돼도 pid와 시작 시각으로 같은 프로세스인지 확인할 수 있습니다. 수용 기준 3개를 모두 직접 실행해 확인했습니다.
@@ -187,7 +192,7 @@ writeAtomic(join(dir, 'process.json'), { pid: child.pid, startedAt })
     advisory: [{ id: 'v1', summary: 'runner.ts의 오류 메시지를 한국어로 통일하면 좋겠습니다' }, { id: 'v2', summary: 'spawn 실패 시 stderr.log 경로를 note에 남기기' }],
     criteria: [{ id: 'a1', result: 'pass', evidence: 'node --test 7/7 통과' }, { id: 'a2', result: 'pass', evidence: 'tsc 오류 없음' }, { id: 'a3', result: 'manual', evidence: '사람 확인 필요' }, { id: 'a4', result: 'fail', evidence: 'recover 테스트 1개 실패' }],
     tests_run: [{ command: 'node --test test/exec/', exit_code: 1, summary: '15개 중 14개 통과' }, { command: 'npx tsc --noEmit', exit_code: 0, summary: '오류 없음' }],
-    task: `${R1}/review`, head_sha: sha('review'), base_sha: 'e90ee5a41c2d8b7f', reviewer_model: 'opus', implementer_model: 'sonnet', sameFamily: true,
+    task: `${R1}.review`, head_sha: sha('review'), base_sha: 'e90ee5a41c2d8b7f', reviewer_model: 'opus', implementer_model: 'sonnet', sameFamily: true,
   }
   const diff = `diff --git a/src/exec/runner.ts b/src/exec/runner.ts
 new file mode 100644
@@ -236,20 +241,45 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
 
   // ---------- helpers ----------
   const allTasks = () => [...details.values()].flat()
+  /** The daemon builds this list (execution.md §17); the mock mirrors its order: plan → ceo_question → worker_question → revise → blocked → integration → accept → merge. */
+  function decisionItems(): DecisionItem[] {
+    const open = approvals.filter((a) => a.decision === null)
+    const fromApproval = (prefix: string, kind: DecisionItem['kind']): DecisionItem[] => open.filter((a) => a.id.startsWith(prefix)).map((a) => {
+      const rest = a.id.slice(prefix.length)
+      const requestId = rest.split(/[.:]/)[0]
+      return { kind, id: a.id, revision: kind === 'revise' ? 1 : 0, requestId, taskId: kind === 'revise' ? rest : null, title: a.title, detail: a.body, options: a.options, subjectHash: a.subjectHash, createdAt: a.createdAt }
+    })
+    const ceoQ: DecisionItem[] = requests.filter((r) => r.status === 'asking').flatMap((r) => r.questions.filter((q) => q.answer === null).map((q) => ({
+      kind: 'ceo_question' as const, id: q.id, revision: 0, requestId: r.id, taskId: null, title: q.question, detail: `이유: ${q.reason}\n기본값: ${q.default}`, options: q.options, subjectHash: null, createdAt: r.updatedAt })))
+    const workerQ: DecisionItem[] = allTasks().filter((t) => t.status === 'question').flatMap((t) => t.questions.map((q) => ({
+      kind: 'worker_question' as const, id: q.id, revision: t.revision, requestId: t.requestId, taskId: t.id, title: q.question, detail: `${t.title} · 기본값: ${q.default}`, options: q.options, subjectHash: null, createdAt: t.updatedAt })))
+    const blocked: DecisionItem[] = allTasks().filter((t) => t.status === 'blocked').map((t) => ({
+      kind: 'blocked' as const, id: t.id, revision: t.revision, requestId: t.requestId, taskId: t.id, title: `작업 "${t.title}"이 막혔어요`, detail: t.note ?? '',
+      options: ['한 번 더 (최상위 모델)', '이 작업 취소하고 계속', '요청 중단'], subjectHash: null, createdAt: t.updatedAt }))
+    return [...fromApproval('plan:', 'plan'), ...ceoQ, ...workerQ, ...fromApproval('revise:', 'revise'), ...blocked, ...fromApproval('integration:', 'integration'),
+      ...fromApproval('accept:', 'accept'), ...fromApproval('merge:', 'merge')]
+  }
+
   function snapshot(): Snapshot {
     const open = approvals.filter((a) => a.decision === null)
-    const blockedOrQ = allTasks().filter((t) => t.status === 'blocked' || (t.status === 'question' && t.questions.length))
-    const ceoQ = requests.filter((r) => r.status === 'asking').reduce((n, r) => n + r.questions.filter((q) => q.answer === null).length, 0)
-    const needs = open.length + blockedOrQ.length + ceoQ
     for (const r of requests) if (details.has(r.id)) r.tasks = details.get(r.id)!.map(view)
+    const decisions = decisionItems()
+    const needs = decisions.length
     return {
       updatedAt: new Date().toISOString(), lastEventId: eventId, teams: [
         { id: 'blog', name: '블로그 팀', pack: 'digimon', state: 'waiting', bubble: '발행 승인 대기', lastRun: { id: 88, teamId: 'blog', startedAt: ago(45), endedAt: ago(41), exitCode: 0, summary: '초안 작성' }, nextRunAt: ahead(60) },
       ],
       approvals: open, requests, projects: [{ id: 'hq', name: 'agent-headquarters' }, { id: 'blog', name: '블로그' }, { id: 'pet', name: '데스크 펫' }],
-      limit: { blockedUntil: null }, workers,
-      headline: needs ? { text: `회장님 결정 ${needs}건: ${open[0]?.title ?? '작업 질문'}`, needsYou: needs } : { text: '지금 하실 일은 없어요', needsYou: 0 },
-      quota: { fiveHour: 0.72, sevenDay: 0.41, fiveHourResetsAt: ahead(95), sevenDayResetsAt: ahead(60 * 24 * 3 + 200), mode: 'normal', observedAt: ago(1) },
+      limit: { blockedUntil: null }, workers, decisions,
+      headline: needs ? { text: `회장님 결정 ${needs}건: ${decisions[0].title}`, needsYou: needs } : { text: '지금 하실 일은 없어요', needsYou: 0 },
+      quota: {
+        windows: [
+          { name: 'five_hour', utilization: 0.72, resetsAt: ahead(95), status: 'allowed' },
+          { name: 'seven_day', utilization: 0.41, resetsAt: ahead(60 * 24 * 3 + 200), status: 'allowed' },
+          { name: 'seven_day_opus', utilization: 0.88, resetsAt: ahead(60 * 24 * 2), status: 'allowed_warning' },
+        ],
+        fiveHour: 0.72, sevenDay: 0.41, fiveHourResetsAt: ahead(95), sevenDayResetsAt: ahead(60 * 24 * 3 + 200), mode: 'save', observedAt: ago(1),
+      },
     }
   }
 
@@ -264,12 +294,12 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
     let k = 0
     const extra = ['tool', 'Read src/exec/runner.ts', 'message', '다음: 재시작 복구와 연결되는 부분 확인', 'tool', 'Bash: npx tsc --noEmit', 'tool', 'Grep "attempt_token" src/']
     timers.push(setInterval(() => {
-      const list = activity.get(`${R1}/runner#a2`)!
+      const list = activity.get(`${R1}.runner~a2`)!
       const i = (k++ % (extra.length / 2)) * 2
       list.push({ at: new Date().toISOString(), kind: extra[i], text: extra[i + 1] })
       workers[0].bubble = extra[i + 1]
       const t = r1Tasks[1]; t.lastActivity = extra[i + 1]; t.updatedAt = new Date().toISOString()
-      emit({ kind: 'attempt', text: extra[i + 1], data: { id: `${R1}/runner#a2`, requestId: R1 } })
+      emit({ kind: 'attempt', text: extra[i + 1], data: { id: `${R1}.runner~a2`, requestId: R1 } })
     }, 4000))
     timers.push(setInterval(() => { for (const c of clients) c.write(`event: heartbeat\ndata: ${Date.now()}\n\n`) }, 15000))
   }
@@ -306,21 +336,25 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
         const key = url.searchParams.get('task')
         const t = (details.get(parts[2]) ?? []).find((x) => x.key === key)
         if (!t) return send(res, 404, { error: 'not found' })
-        if (!t.headSha) { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' }); return void res.end('') }
-        res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' })
-        return void res.end(diff)
+        if (!t.headSha) return send(res, 200, { files: [], diff: '', truncated: false })
+        return send(res, 200, { files: [{ path: 'src/exec/runner.ts', added: 14, removed: 0 }, { path: 'src/store.ts', added: 4, removed: 3 }, { path: 'docs/logo.png', added: 0, removed: 0 },
+          { path: `src/huge-generated-${'x'.repeat(40)}.ts`, added: 20480, removed: 0 }], diff, truncated: true })
       }
       if (parts[1] === 'attempts' && parts[3] === 'activity') {
         const after = Number(url.searchParams.get('after') ?? 0) || 0
-        return send(res, 200, (activity.get(parts[2]) ?? []).slice(after))
+        const all = activity.get(parts[2]) ?? []
+        const lines = all.slice(after, after + 500)
+        return send(res, 200, { lines, next: after + lines.length })
       }
       if (parts[1] === 'attempts' && parts[3] === 'files') {
         const id = parts[2], name = parts[4]
         const a = [...attempts.values()].flat().find((x) => x.id === id)
         if (!a || a.status === 'running' || a.status === 'starting') return send(res, 404, { error: 'not found' })
-        if (name === 'report.md' && a.kind === 'work') { res.writeHead(200, { 'content-type': 'text/markdown; charset=utf-8' }); return void res.end(report) }
-        if (name === 'checks.json' && a.kind === 'work') return send(res, 200, a.status === 'succeeded' ? { ...checks, checks: checks.checks.slice(0, 2), pass: true } : checks)
-        if (name === 'verdict.json' && a.kind === 'review') return send(res, 200, a.status === 'succeeded' ? { ...verdict, pass: true, blocking: [], criteria: verdict.criteria.slice(0, 3) } : verdict)
+        // Evidence files are served as text/plain + nosniff (execution.md §15).
+        const plain = (body: string) => { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'x-content-type-options': 'nosniff' }); res.end(body) }
+        if (name === 'report.md' && a.kind === 'work') return plain(report)
+        if (name === 'checks.json' && a.kind === 'work') return plain(JSON.stringify(a.status === 'succeeded' ? { ...checks, checks: checks.checks.slice(0, 2), pass: true } : checks))
+        if (name === 'verdict.json' && a.kind === 'review') return plain(JSON.stringify(a.status === 'succeeded' ? { ...verdict, pass: true, blocking: [], criteria: verdict.criteria.slice(0, 3) } : verdict))
         return send(res, 404, { error: 'not found' })
       }
       if (url.pathname === '/api/quota') return send(res, 200, snapshot().quota)
@@ -328,7 +362,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
     if (req.method === 'POST') {
       if (parts[1] === 'approvals' && parts.length === 3) {
         const a = approvals.find((x) => x.id === parts[2] && x.decision === null)
-        if (!a || a.subjectHash !== b.subjectHash || !a.options.includes(b.decision)) return send(res, 409, { error: 'approval unknown, expired, already decided, subject changed, or decision not in options' })
+        if (!a || a.subjectHash !== b.subjectHash || !a.options.includes(b.decision)) return send(res, 409, { error: '이미 결정됐거나 내용이 바뀐 카드예요' })
         a.decision = b.decision; a.decidedAt = new Date().toISOString()
         emit({ kind: 'approval', teamId: a.teamId, text: `결정: ${a.title} → ${a.decision}`, data: { id: a.id } })
         return send(res, 200, a)
@@ -336,7 +370,7 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
       if (parts[1] === 'requests' && parts[3] === 'answer') {
         const r = requests.find((x) => x.id === parts[2])
         const q = r?.questions.find((x) => x.id === b.questionId && x.answer === null)
-        if (!r || !q || typeof b.answer !== 'string' || !b.answer) return send(res, 409, { error: 'question unknown, already answered, or request not asking' })
+        if (!r || !q || typeof b.answer !== 'string' || !b.answer) return send(res, 409, { error: '이미 답했거나 없는 질문이에요' })
         q.answer = b.answer
         if (r.questions.every((x) => x.answer !== null)) r.status = 'thinking'
         emit({ kind: 'request', text: '답변 받음', data: { id: r.id } })
@@ -347,7 +381,8 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
         if (!r || typeof b.reason !== 'string' || !b.reason.trim()) return send(res, 400, { error: 'reason is required' })
         r.status = 'executing'
         const a = approvals.find((x) => x.id === `accept:${r.id}`); if (a) { a.decision = '반려'; a.decidedAt = new Date().toISOString() }
-        for (const t of details.get(r.id) ?? []) { t.status = 'rework'; t.note = `반려: ${b.reason}` }
+        const only: string[] | null = Array.isArray(b.tasks) && b.tasks.length ? b.tasks : null
+        for (const t of details.get(r.id) ?? []) if (t.status === 'passed' && (!only || only.includes(t.key))) { t.status = 'rework'; t.note = `반려: ${b.reason}` }
         emit({ kind: 'request', text: '결과 반려', data: { id: r.id } })
         return send(res, 200, { ok: true })
       }
@@ -355,15 +390,25 @@ Binary files a/docs/logo.png and b/docs/logo.png differ
         const r = requests.find((x) => x.id === parts[2]); if (!r) return send(res, 404, { error: 'not found' })
         r.status = 'cancelled'; emit({ kind: 'request', text: '요청 중단', data: { id: r.id } }); return send(res, 200, { ok: true })
       }
+      if (parts[1] === 'requests' && parts[3] === 'merge') {
+        const r = requests.find((x) => x.id === parts[2]); if (!r) return send(res, 404, { error: 'not found' })
+        return send(res, 409, { error: '다시 제시할 보류된 병합이 없어요' })
+      }
+      if (parts[1] === 'requests' && parts.length === 2) {
+        if (typeof b.text !== 'string' || !b.text) return send(res, 400, { error: 'text is required' })
+        return send(res, 201, { id: 'req-new00001' })
+      }
       if (parts[1] === 'tasks' && (parts[3] === 'answer' || parts[3] === 'decide')) {
         const t = allTasks().find((x) => x.id === parts[2])
         if (!t) return send(res, 404, { error: 'not found' })
+        if (b.revision !== t.revision) return send(res, 409, { error: `지시서가 바뀌었어요 (리비전 ${t.revision}). 새 내용을 확인해 주세요` })
         if (parts[3] === 'answer') {
-          if (t.status !== 'question' || typeof b.questionIndex !== 'number' || !t.questions[b.questionIndex] || typeof b.answer !== 'string') return send(res, 409, { error: 'no such question' })
-          t.questions.splice(b.questionIndex, 1)
+          const qi = t.questions.findIndex((q) => q.id === b.questionId)
+          if (t.status !== 'question' || qi < 0 || typeof b.answer !== 'string' || !b.answer) return send(res, 409, { error: '이미 답했거나 없는 질문이에요' })
+          t.questions.splice(qi, 1)
           if (!t.questions.length) { t.status = 'running'; t.lastActivity = '답변을 받아 이어서 진행' }
         } else {
-          if (t.status !== 'blocked' || !['retry', 'skip', 'stop'].includes(b.decision)) return send(res, 409, { error: 'task not blocked or bad decision' })
+          if (t.status !== 'blocked' || !['retry', 'skip', 'stop'].includes(b.decision)) return send(res, 409, { error: '막힌 작업이 아니거나 알 수 없는 결정이에요' })
           t.status = b.decision === 'retry' ? 'pending' : 'cancelled'
           t.note = b.decision === 'retry' ? '최상위 모델로 한 번 더' : '회장님 결정으로 취소'
           if (b.decision === 'stop') { const r = requests.find((x) => x.id === t.requestId); if (r) r.status = 'cancelled' }

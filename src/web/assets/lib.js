@@ -167,21 +167,42 @@ export const REQUEST_STATUS = {
   queued: ['대기열', 'neutral'], thinking: ['사장 검토 중', 'info'], asking: ['질문 대기', 'warn'], planned: ['계획 승인 대기', 'warn'],
   approved: ['승인됨', 'info'], executing: ['실행 중', 'info'], awaiting_acceptance: ['결과 수락 대기', 'warn'], accepted: ['수락됨', 'ok'],
   merging: ['병합 중', 'info'], merged: ['병합 완료', 'ok'], rejected: ['반려됨', 'neutral'], failed: ['실패', 'bad'],
-  blocked: ['막힘', 'bad'], cancelled: ['중단됨', 'neutral'],
+  blocked: ['막힘', 'bad'], cancelled: ['중단됨', 'neutral'], expired: ['만료됨', 'neutral'],
 }
 export const TASK_STATUS = {
   pending: ['대기', 'neutral'], running: ['진행 중', 'info'], verifying: ['검증 중', 'info'], reviewing: ['검토 중', 'info'],
-  passed: ['통과', 'ok'], rework: ['재작업 대기', 'warn'], question: ['질문 대기', 'warn'], held: ['한도 보류', 'warn'],
+  passed: ['통과', 'ok'], rework: ['재작업 대기', 'warn'], revising: ['지시서 수정 중', 'warn'], question: ['질문 대기', 'warn'], held: ['한도 보류', 'warn'],
   blocked: ['막힘', 'bad'], cancelled: ['취소됨', 'neutral'],
 }
 export const ATTEMPT_STATUS = {
-  starting: ['시작 중', 'info'], running: ['실행 중', 'info'], succeeded: ['성공', 'ok'], failed: ['실패', 'bad'], question: ['질문', 'warn'],
-  limited: ['한도 걸림', 'warn'], runaway: ['폭주 중단', 'bad'], unverifiable: ['확인 불가', 'bad'], start_failed: ['시작 실패', 'bad'],
+  starting: ['시작 중', 'info'], running: ['실행 중', 'info'], succeeded: ['성공', 'ok'], failed: ['실패', 'bad'], brief_blocked: ['지시서 막힘', 'warn'],
+  question: ['질문', 'warn'], limited: ['한도 걸림', 'warn'], transient: ['일시 오류', 'warn'], runaway: ['폭주 중단', 'bad'],
+  unverifiable: ['확인 불가', 'bad'], start_failed: ['시작 실패', 'bad'],
 }
-export const QUOTA_MODE = { normal: '정상', save: '절약 (동시 1)', review_only: '검토만', hold: '보류' }
+export const QUOTA_MODE = { normal: ['정상', 'ok'], save: ['절약 (동시 1)', 'warn'], hold: ['보류', 'bad'], unobserved: ['관측 전', 'neutral'] }
+const WINDOW_NAMES = { five_hour: '5시간', seven_day: '7일', seven_day_opus: '7일 (opus)', seven_day_sonnet: '7일 (sonnet)' }
+/** Korean label for a quota window name; unknown windows keep their name. */
+export function windowLabel(name) { return WINDOW_NAMES[name] ?? String(name ?? '미확인') }
+/** Decision kinds in the order the daemon sends them (execution.md §17), with their card label and tone. */
+export const DECISION_KIND = {
+  plan: ['계획 승인', 'info'], ceo_question: ['사장 질문', 'warn'], worker_question: ['작업자 질문', 'warn'], revise: ['지시서 수정 승인', 'warn'],
+  blocked: ['회로 차단', 'bad'], integration: ['통합 실패', 'bad'], accept: ['결과 수락', 'ok'], merge: ['병합 승인', 'info'],
+}
+/**
+ * Maps a `blocked` card's button label to the /decide value. The contract leaves the labels free, so accept the raw values
+ * and the Korean labels from execution.md; anything else returns null and the button stays disabled.
+ */
+export function blockedDecision(label) {
+  const s = String(label ?? '').trim()
+  if (s === 'retry' || s === 'skip' || s === 'stop') return s
+  if (/한 번 더|다시 시도|재시도/.test(s)) return 'retry'
+  if (/취소하고 계속|건너뛰|이 작업 취소/.test(s)) return 'skip'
+  if (/요청 중단|중단/.test(s)) return 'stop'
+  return null
+}
 /** Board columns, in order. */
 export const TASK_GROUPS = [
-  { id: 'wait', label: '대기', statuses: ['pending', 'rework', 'held'] },
+  { id: 'wait', label: '대기', statuses: ['pending', 'rework', 'revising', 'held'] },
   { id: 'run', label: '진행', statuses: ['running'] },
   { id: 'check', label: '검증·검토', statuses: ['verifying', 'reviewing'] },
   { id: 'done', label: '완료', statuses: ['passed', 'cancelled'] },
@@ -233,22 +254,4 @@ export function formatCost(usd) {
 export function percent(frac) {
   if (typeof frac !== 'number' || !isFinite(frac)) return null
   return Math.max(0, Math.min(100, Math.round(frac * 100)))
-}
-
-/** Classifies an open approval by id prefix (execution.md §11). */
-export function approvalKind(a) {
-  const id = String(a?.id ?? '')
-  if (id.startsWith('plan:')) return { kind: 'plan', requestId: id.slice(5) }
-  if (id.startsWith('accept:')) return { kind: 'accept', requestId: id.slice(7) }
-  if (id.startsWith('merge:')) {
-    const rest = id.slice(6), j = rest.lastIndexOf(':')
-    return j > 0 ? { kind: 'merge', requestId: rest.slice(0, j), project: rest.slice(j + 1) } : { kind: 'merge', requestId: rest, project: null }
-  }
-  return { kind: 'other', requestId: null }
-}
-
-/** Activity endpoint shape is not fixed by the contract: accept an array or {lines|items|activity: [...]}. */
-export function normalizeActivity(data) {
-  const arr = Array.isArray(data) ? data : Array.isArray(data?.lines) ? data.lines : Array.isArray(data?.items) ? data.items : Array.isArray(data?.activity) ? data.activity : []
-  return arr.map((x) => (typeof x === 'string' ? { at: null, kind: 'message', text: x } : { at: x?.at ?? null, kind: String(x?.kind ?? 'message'), text: String(x?.text ?? '') }))
 }
