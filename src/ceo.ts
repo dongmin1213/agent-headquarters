@@ -67,6 +67,9 @@ export function unsafeCommand(cmd: string): string | null {
   return null
 }
 
+/** Guidance appended to a one-command rejection (quotes do not help: the check is conservative on purpose). */
+export const ONE_COMMAND_HINT = '인자에 | ; & 같은 문자가 필요하면 스크립트 파일로 감싸 한 명령으로 실행하게 해 주세요'
+
 /** A plan check is one command or the word `manual` (§3). Returns the offending token, or null. */
 export function chainedCheck(check: string): string | null {
   if (check.trim() === 'manual') return null
@@ -115,7 +118,7 @@ export function validateTasks(tasks: PlanTask[], projects: Project[]): string | 
     for (const a of t.acceptance) {
       if (a.kind !== 'new' && a.kind !== 'regression') return `작업 ${t.id}의 수용 기준 ${a.id}에 kind(new | regression)가 없습니다`
       const tok = chainedCheck(a.check)
-      if (tok) return `작업 ${t.id}의 수용 기준 ${a.id} check는 명령 하나여야 합니다 (${tok} 사용 금지): ${a.check.slice(0, 80)}`
+      if (tok) return `작업 ${t.id}의 수용 기준 ${a.id} check는 명령 하나여야 합니다 (${tok} 사용 금지): ${a.check.slice(0, 80)} · ${ONE_COMMAND_HINT}`
     }
   }
   // Cycle check (Kahn).

@@ -29,6 +29,8 @@ bin/hq install                             # 진단 → 스프라이트 → 펫 
 5. `~/Library/LaunchAgents`에 `com.agent-headquarters.daemon.plist`, `com.agent-headquarters.pet.plist`를 쓰고 `launchctl bootout` → `bootstrap gui/<uid>` 합니다. 로그인할 때마다 데몬과 펫이 자동으로 뜨고, 데몬이 비정상 종료하면 10초 뒤 다시 뜹니다.
 6. 데몬이 10초 안에 `127.0.0.1:7777`에서 응답하는지 확인하고 펫을 띄웁니다.
 
+`$HQ_HOME`(기본 `~/.hq`)은 비어 있거나 없는 폴더, 또는 hq가 만든 폴더여야 합니다. 표식 `.hq-install`이 없는데 다른 파일이 들어 있으면 `HQ_HOME(<경로>)에 hq가 만들지 않은 파일이 있어요`로 멈춥니다(나중에 `--purge`가 내 파일을 hq 데이터로 여기지 않도록). 빈 폴더나 새 경로를 `HQ_HOME`으로 지정하세요. 표식이 생기기 전에 쓰던 기본 `~/.hq`는 hq가 만든 항목(`hq.db*`, `repos/`, `work/`, `worktrees/`, `runs/`, `logs/`, `cache/`, `daemon.lock`, `daemon.pid`)만 있으면 그대로 넘겨받습니다.
+
 여러 번 실행해도 안전합니다(설정 파일을 다시 쓰고 다시 등록). `~/.local/bin`이 있고 PATH에 들어 있으면 `hq` 링크를 만들어 어디서나 `hq`로 부를 수 있습니다. 아니면 안내대로 `bin/`을 PATH에 추가하세요.
 
 ## 3. 첫 요청 해 보기
@@ -73,6 +75,8 @@ hq projects add ~/code/web --setup "npm ci --prefer-offline"
 ```json
 [{ "id": "web", "name": "web", "path": "~/code/web", "setup": "npm ci --prefer-offline" }]
 ```
+setup이 만든 추적되지 않는 파일·무시된 파일(검증 worktree 기준)은 검사 기록(`checks.json`의 `setupCreated`: 개수와 앞 20개)에 남고, 검토자 프롬프트(`setup이 만든 파일: …`)와 결과 카드(`setup이 만든 파일 N개`)에 보입니다. `node_modules/`처럼 무시된 폴더 아래 파일은 `node_modules/ (N개)` 한 줄로 묶습니다. 추적 파일 내용 비교에서는 빠지는 파일이라 기록만 하고 실패로 치지 않습니다. 추적 파일을 바꾸는 setup은 환경 오류로 멈춥니다.
+
 `hq projects list`가 등록된 setup을 함께 보여 줍니다. 파일이 없으면 데몬은 `config/projects.example.json`으로 뜨지만 실제 프로젝트가 없는 상태입니다.
 
 ### 실행 설정 `config/hq.json` (모든 키 선택)
@@ -103,6 +107,9 @@ hq projects add ~/code/web --setup "npm ci --prefer-offline"
 - **네트워크**: hq 데몬 포트(`127.0.0.1:7777`)에는 접속할 수 없습니다. 작업자가 스스로 승인하는 일을 막기 위해서입니다.
 - **환경 변수**: `PATH`, `HOME`, `LANG` 같은 기본값만 넘기고 API 키·토큰·`SSH_AUTH_SOCK`은 지웁니다. git push는 설정으로 막혀 있습니다.
 - **알려진 한계**: 커밋하려면 공유 `.git`에 써야 하므로, 작업자가 **다른 브랜치의 ref를 바꿀 수는 있습니다**. 그래서 hq는 브랜치 이름을 믿지 않고, 시도가 끝날 때 기록한 **커밋 SHA**로만 검증·통합·병합합니다. 작업자가 다른 브랜치를 건드려도 hq가 병합하는 내용은 바뀌지 않습니다.
+
+### 비밀 파일
+비밀값(`.env`, 개인 키, 인증서)을 **커밋해 둔 저장소는 등록을 지원하지 않습니다**. 작업자는 자기 clone에서 git이 추적하는 파일을 모두 읽을 수 있고, 샌드박스는 추적 파일을 가리지 않습니다. `hq doctor`는 등록된 프로젝트에서 `git ls-files`로(읽기만) `.env*`, `*.pem`, `id_rsa*`, `*.p12`, `*.key`에 맞는 추적 파일을 찾아 `비밀 파일 <id>` 경고를 냅니다. 해결: `git rm --cached <파일>`로 추적을 멈추고 `.gitignore`에 넣은 뒤, 이미 커밋된 값은 새 값으로 바꾸세요(이력에 남아 있으므로).
 
 ### 환경 변수 (CLI)
 `HQ_HOME`, `HQ_PORT`(기본 7777), `HQ_TOKEN_FILE`(기본 `~/.config/hq/token`), `HQ_LAUNCH_AGENTS_DIR`(기본 `~/Library/LaunchAgents`), `HQ_DRY_RUN=1`(launchctl·open·빌드를 실행하지 않고 출력만).
@@ -147,6 +154,8 @@ hq projects add ~/code/web --setup "npm ci --prefer-offline"
 | 포트 7777 | 실패: 다른 프로그램 | `lsof -nP -iTCP:7777 -sTCP:LISTEN`로 확인 후 종료, 또는 `HQ_PORT` 변경 |
 | 포트 7777 | 실패: 토큰이 다름(401) | 토큰이 맞지 않음 → `hq restart`로 데몬을 다시 띄우거나 `HQ_TOKEN_FILE`이 가리키는 토큰 파일 확인 |
 | 데몬 잠금 | 경고: 오래된 잠금 / pid 재사용 | `hq start`(데몬이 넘겨받음). 안 되면 `rm $HQ_HOME/daemon.lock` |
+| 데몬 잠금 | 경고: 예전 형식이에요 | 업그레이드 전 데몬이 아직 pid 한 줄 잠금을 쥐고 있어 `hq stop`·`hq restart`가 신원을 확인하지 못함 → `launchctl kickstart -k gui/<uid>/<데몬 label>`로 한 번 재시작하면 새 형식이 됨 (진단 결과의 `해결:` 줄에 이 설치의 label이 들어간 명령이 나옴) |
+| 비밀 파일 `<id>` | 경고: 추적되는 비밀 파일 | 위 "비밀 파일" 참고: `git rm --cached` 후 `.gitignore`, 커밋된 값은 교체 |
 | 데몬 | 경고: 실행 중 아님 | `hq start`, 로그인 자동 시작은 `hq install`. 바로 죽으면 `hq logs` |
 | 데스크 펫 | 경고: 실행 중 아님 / 빌드 안 됨 | `open pet/HQPet.app` 또는 `hq install` |
 | 자동 시작: 데몬·펫 | 경고: 미설치·로드 안 됨 | `hq install` |
@@ -161,12 +170,20 @@ hq projects add ~/code/web --setup "npm ci --prefer-offline"
   - 이미 거부했다면: 시스템 설정 → 개인정보 보호 및 보안 → 파일 및 폴더 → node에서 해당 폴더를 켜세요.
   - 권한 창을 아예 피하려면 저장소를 `~/src` 같은 보호 폴더 밖으로 옮기세요.
 - `hq stop`이 "이 CLI가 시작한 프로세스가 아닙니다" → 터미널에서 직접 `node src/main.ts`로 띄운 데몬입니다. 그 터미널에서 Ctrl+C.
+- 업그레이드 뒤 `hq stop`·`hq restart`가 "잠금 파일 형식이 예전 것이라 확인할 수 없어요"로 거부 → 업그레이드 전에 뜬 데몬입니다. launchd로 설치했다면 `hq doctor`의 `데몬 잠금` 줄에 나오는 `launchctl kickstart -k gui/<uid>/<데몬 label>`로 한 번 재시작하세요. 백그라운드로 띄운 데몬이면 그 프로세스를 직접 종료한 뒤 `hq start`.
 - 진단 결과를 누구에게 보여 줄 때는 `hq doctor --json`. 토큰이나 계정 정보는 출력하지 않습니다.
 
 ## 7. 제거
 ```bash
 hq uninstall                 # 자동 시작 해제, plist 삭제, 데몬·펫 종료. 데이터는 남김
-hq uninstall --purge --yes   # $HQ_HOME(DB·worktree·증거), 토큰, 빌드한 펫까지 삭제
+hq uninstall --purge --yes   # $HQ_HOME의 hq 데이터(DB·worktree·증거), 토큰, 빌드한 펫까지 삭제
 ```
+`--purge`는 `$HQ_HOME` 안에서 hq가 만든 항목(`hq.db*`, `repos/`, `work/`, `worktrees/`, `runs/`, `logs/`, `cache/`, `daemon.lock`, `daemon.pid`, `.hq-install`)만 지우고, 폴더가 비었을 때만 폴더도 지웁니다. 그 밖의 파일은 남기고 `hq가 만들지 않은 파일은 남겨 뒀어요: …`로 알려 줍니다.
 `--purge`는 지우기 전에 모두 확인하고, 하나라도 맞지 않으면 아무것도 지우지 않습니다: `$HQ_HOME`에 `hq install`이 만든 표식 `.hq-install`(이 저장소·포트)이 있어야 하고, 토큰 경로는 일반 파일이어야 하며(폴더·심볼릭 링크 거부), 데몬이 멈춘 것을 확인해야 합니다. 빌드한 펫 앱은 기본 설치에서만 지웁니다(다른 설치와 함께 쓰므로). 표식이 생기기 전에 설치했다면 `hq install`을 한 번 다시 실행하면 표식이 생깁니다.
 저장소 폴더와 `config/`는 지우지 않습니다. 마지막으로 저장소 폴더를 지우면 끝입니다.
+
+## 8. 릴리스 전 확인 (개발자)
+- `npx tsc --noEmit` 오류 없음
+- `npm test` 실패 0
+- `HQ_LIVE=1 npm test`: 실제 Claude CLI(haiku 한 번)로 샌드박스 계약을 확인합니다. 로그인된 구독이 필요하고 사용량이 조금 듭니다.
+- `hq doctor`가 이 맥에서 `[실패]` 없음

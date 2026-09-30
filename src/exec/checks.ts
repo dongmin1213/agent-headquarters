@@ -23,7 +23,11 @@ export interface ChecksFile {
   checks: CheckOutcome[]; secrets: SecretHit[]; pass: boolean; error: string | null; warnings?: string[]; manual?: string[]; baseTails?: Record<string, string>
   /** The worktree's tracked content differed from the commit under test before any check ran (setup changed it): an environment failure. */
   setupChanged?: boolean
+  /** Untracked and ignored files present before the first check, i.e. made by setup (the worktree is fresh). Recorded, never a failure. */
+  setupCreated?: SetupCreated
 }
+/** `count`: files in total; `sample`: first 20 entries, files under an ignored directory collapsed to `dir/ (N개)`. */
+export interface SetupCreated { count: number; sample: string[] }
 /** One check's result on the base (§9 baseline). `setupFailed`: the project setup failed, so the check never ran. */
 export interface BaseResult { pass: boolean; exitCode: number | null; timedOut: boolean; setupFailed?: boolean; tail: string }
 /** The base run says nothing about the code: setup failed, timed out, or the command could not be found/executed. */
@@ -182,6 +186,35 @@ async function hashPaths(wt: MirrorWorktree, paths: string[]): Promise<string[] 
   return out
 }
 
+const SAMPLE_MAX = 20
+
+/**
+ * Untracked (non-ignored) files plus ignored files in the worktree. Files under an ignored directory (node_modules/,
+ * dist/ …) are counted but shown as one `dir/ (N개)` entry. Null when git fails (nothing recorded).
+ */
+export async function untrackedFiles(wt: MirrorWorktree): Promise<SetupCreated | null> {
+  const z = (out: string) => out.split('\0').filter(Boolean)
+  const plain = await wtGit(wt, ['ls-files', '-z', '-o', '--exclude-standard'])
+  const ignored = await wtGit(wt, ['ls-files', '-z', '-o', '-i', '--exclude-standard'])
+  const dirs = await wtGit(wt, ['ls-files', '-z', '-o', '-i', '--exclude-standard', '--directory'])
+  if (plain.code !== 0 || ignored.code !== 0 || dirs.code !== 0) return null
+  const ignoredDirs = z(dirs.stdout).filter((d) => d.endsWith('/'))
+  const perDir = new Map<string, number>(ignoredDirs.map((d) => [d, 0]))
+  const loose: string[] = []
+  for (const f of z(ignored.stdout)) {
+    const d = ignoredDirs.find((x) => f.startsWith(x))
+    if (d) perDir.set(d, perDir.get(d)! + 1)
+    else loose.push(f)
+  }
+  const files = [...z(plain.stdout), ...loose]
+  const entries = [...files, ...[...perDir].map(([d, n]) => `${d} (${n}개)`)].sort()
+  return { count: files.length + [...perDir.values()].reduce((a, b) => a + b, 0), sample: entries.slice(0, SAMPLE_MAX) }
+}
+
+/** `setup이 만든 파일: a, b, node_modules/ (3개) (모두 5개)` for the review prompt; '' when none. */
+export const setupCreatedLine = (s: SetupCreated | undefined): string =>
+  s && s.count ? `setup이 만든 파일: ${s.sample.join(', ')} (모두 ${s.count}개)` : ''
+
 export interface RunChecksOpts {
   /** Fresh mirror worktree at `head` (§9); hq inspects it only through the mirror admin dir. */
   wt: MirrorWorktree
@@ -208,6 +241,10 @@ export async function runChecks(o: RunChecksOpts): Promise<ChecksFile> {
   if (head !== o.head) return { checks: [], secrets: [], pass: false, error: `검증 worktree HEAD(${head?.slice(0, 10) ?? '없음'})가 기록된 head_sha와 다름` }
   const before = await trackedChanges(o.wt, o.head)
   if (before.length) return { checks: [], secrets: [], pass: false, error: setupChangedReason(before), setupChanged: true }
+  // Callers hand a fresh worktree (verifyWorktree) and run only setup on it before this point: whatever untracked or
+  // ignored file exists now was made by setup. Content checks ignore such files, so they are recorded for the reviewer.
+  const created = await untrackedFiles(o.wt)
+  const setupCreated = created?.count ? { setupCreated: created } : {}
   atomicWrite(o.profilePath, sandboxProfile(o.sandbox))
   const results: CheckOutcome[] = []
   const warnings: string[] = []
@@ -228,7 +265,7 @@ export async function runChecks(o: RunChecksOpts): Promise<ChecksFile> {
     results.push(r)
   }
   const secrets = await secretScan(o.wt.mirror, o.base, o.head)
-  return { checks: results, secrets, pass: results.every((r) => r.pass || r.baseFailed) && secrets.length === 0, error: null, warnings }
+  return { checks: results, secrets, pass: results.every((r) => r.pass || r.baseFailed) && secrets.length === 0, error: null, warnings, ...setupCreated }
 }
 
 /**

@@ -164,7 +164,7 @@ test('daemon lock: absent ok, live hq ok, stale warn, reused pid warn', async ()
     return checks.find((c) => c.id === 'lock')!
   }
   assert.equal((await lock(null, null)).status, 'ok')
-  const live = await lock('4242\n', '/usr/local/bin/node /repo/src/main.ts')
+  const live = await lock('{"pid":4242}', '/usr/local/bin/node /repo/src/main.ts')
   assert.equal(live.status, 'ok'); assert.match(live.detail, /pid 4242 실행 중/)
   const stale = await lock('4242', null)
   assert.equal(stale.status, 'warn'); assert.match(stale.detail, /오래된 잠금/); assert.ok(stale.fix)
@@ -181,4 +181,36 @@ test('config error from loadConfig is surfaced verbatim (e.g. unknown key)', asy
   assert.ok(msg)
   const c = (await runDoctor(ctx, probes())).find((x) => x.id === 'config')!
   assert.equal(c.status, 'fail'); assert.equal(c.detail, msg)
+})
+
+test('N7. a live daemon holding a legacy (plain pid) lock → warn with the launchctl kickstart fix', async () => {
+  const { lockFile, launchdTarget } = await import('../../src/cli/ctx.ts')
+  const ctx = healthy()
+  writeFileSync(lockFile(ctx), '4242\n')
+  await doctorCommand(ctx, { json: false, probes: probes({ pidCommand: async () => '/usr/local/bin/node /repo/src/main.ts' }) })
+  assert.match(ctx.text(), /\[경고\] 데몬 잠금: 예전 형식이에요/)
+  assert.ok(ctx.text().includes(`해결: launchctl kickstart -k ${launchdTarget(ctx, daemonLabel(ctx))} 로 한 번 재시작하면 새 형식이 돼요`), ctx.text())
+})
+
+test('tracked secret-like files in a registered project → warn (read-only git ls-files)', async () => {
+  const ctx = healthy()
+  const calls: string[][] = []
+  const base = probes()
+  const tracked = ['src/a.ts', '.env', 'config/.env.local', 'certs/server.pem', 'keys/id_rsa', 'x.p12', 'tls.key', 'README.md'].join('\0') + '\0'
+  const p = probes({ run: async (cmd, args) => {
+    calls.push(args)
+    if (cmd.endsWith('git') && args.includes('ls-files')) return { code: 0, stdout: tracked, stderr: '' }
+    return base.run(cmd, args)
+  } })
+  const checks = await runDoctor(ctx, p)
+  const w = checks.find((c) => c.id === 'project-secrets:proj')!
+  assert.equal(w.status, 'warn')
+  assert.match(w.detail, /\.env, config\/\.env\.local, certs\/server\.pem, keys\/id_rsa, x\.p12 외 1개/)
+  assert.doesNotMatch(w.detail, /src\/a\.ts|README/)
+  assert.ok(w.fix)
+  assert.ok(calls.some((a) => a.includes('ls-files')))
+  assert.ok(!calls.some((a) => /^(rm|add|commit|checkout|reset)$/.test(a[2] ?? '')), 'read-only')
+  // Nothing secret-like → no check at all.
+  const clean = await runDoctor(healthy(), probes({ run: async (cmd, args) => cmd.endsWith('git') && args.includes('ls-files') ? { code: 0, stdout: 'src/a.ts\0', stderr: '' } : base.run(cmd, args) }))
+  assert.equal(clean.find((c) => c.id.startsWith('project-secrets:')), undefined)
 })
