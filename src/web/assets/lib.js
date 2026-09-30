@@ -266,3 +266,39 @@ export function parseFragment(hash) {
   if (task) out.task = request && task.startsWith(request + '.') ? task.slice(request.length + 1) : task
   return out
 }
+
+/**
+ * Incremental Server-Sent Events parser (the page reads /ui-api/events with fetch so it can send Authorization).
+ * Feed it decoded text chunks in any split; it calls onEvent({event, data, id}) per dispatched frame.
+ * Follows the SSE rules: CRLF/LF/CR line ends, `:` comments, multi-line data joined with \n, frames without data are dropped.
+ */
+export function createSseParser(onEvent) {
+  let buf = '', data = [], event = '', id = null, lastId = null
+  const dispatch = () => {
+    if (id !== null) lastId = id
+    if (data.length) onEvent({ event: event || 'message', data: data.join('\n'), id: lastId })
+    data = []; event = ''; id = null
+  }
+  const line = (l) => {
+    if (l === '') return dispatch()
+    if (l.startsWith(':')) return
+    const i = l.indexOf(':')
+    const field = i < 0 ? l : l.slice(0, i)
+    let value = i < 0 ? '' : l.slice(i + 1)
+    if (value.startsWith(' ')) value = value.slice(1)
+    if (field === 'data') data.push(value)
+    else if (field === 'event') event = value
+    else if (field === 'id' && !value.includes('\0')) id = value
+  }
+  return (chunk) => {
+    buf += chunk
+    for (;;) {
+      const m = /\r\n|\r|\n/.exec(buf)
+      if (!m) break
+      // A lone \r at the very end may be the first half of \r\n: wait for more input.
+      if (m[0] === '\r' && m.index === buf.length - 1) break
+      line(buf.slice(0, m.index))
+      buf = buf.slice(m.index + m[0].length)
+    }
+  }
+}

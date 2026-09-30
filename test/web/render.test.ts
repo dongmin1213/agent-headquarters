@@ -80,6 +80,18 @@ test('diff parsing counts lines per file and flags binary/new files', () => {
   assert.equal(lib.parseDiff('').length, 0)
 })
 
+test('SSE parser handles split chunks, CRLF, comments, multi-line data, ids and named events', () => {
+  const got: { event: string; data: string; id: string | null }[] = []
+  const feed = lib.createSseParser((e: { event: string; data: string; id: string | null }) => got.push(e))
+  const stream = ': connected\r\n\r\nid: 7\r\ndata: {"kind":"task",\r\ndata: "text":"<script>x</script>"}\r\n\r\nevent: heartbeat\ndata: 123\n\nid: 8\n\nevent: nodata\n\ndata:no-space\r\r: tail\n'
+  for (let i = 0; i < stream.length; i += 3) feed(stream.slice(i, i + 3)) // arbitrary chunk boundaries
+  assert.deepEqual(got, [
+    { event: 'message', data: '{"kind":"task",\n"text":"<script>x</script>"}', id: '7' },
+    { event: 'heartbeat', data: '123', id: '7' },
+    { event: 'message', data: 'no-space', id: '8' },
+  ])
+})
+
 test('labels and formatting', () => {
   assert.deepEqual(lib.BLOCKED_LABEL, { retry: '한 번 더', skip: '이 작업 건너뛰기', stop: '요청 중단' })
   assert.equal(lib.windowLabel('five_hour'), '5시간')
