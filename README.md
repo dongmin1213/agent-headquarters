@@ -62,10 +62,11 @@
 - [x] 재작업 사다리(같은 모델 2회 → 한 단계 위, 3회 실패 시 멈춤), 사장의 지시서 수정·진단 카드
 - [x] 결과 수락 → 통합 → 별도 병합 승인(`merge --ff-only`만), 구독 한도 절약/보류 모드, 로그인 만료 카드
 - [x] 웹 화면(`hq open`), CLI(`hq doctor / install / status / logs`), 자동 시작(launchd)
+- [x] 독립 리뷰어 최종 판정 **SIGN** (구현 검토 → 재검토 → 최종 확인, `research/` 25~27 · PR #10~#21)
 - [x] 외부 구현 검토 2건(NO SIGN) → 샌드박스·판정·프로세스·팀·CLI 전면 수정(v4, 계약 §22, PR #10~#16)
 - [x] hq가 hq 자신을 고침: 펫 말풍선 글자 크기 설정, 상황 문장 다듬기 (그 과정에서 찾은 엔진 구멍 3개 수정 → [개발 기록](docs/devlog.md))
 - [x] 실제 요청 끝까지 성공: 연습 저장소에 "slugify 추가" → 계획 → 작업(Sonnet $0.064) → 검사 5개 통과 → 검토(Sonnet $0.038) → 수락 → ff 병합, 테스트 2/2 통과
-- [x] 테스트 275개 통과(단위·웹·CLI·펫, `npm test`)
+- [x] 테스트 310개 통과(단위·웹·CLI·펫, `npm test`)
 
 ## 개발 과정
 기능마다 브랜치와 PR로 진행합니다 → [PR 목록](https://github.com/dongmin1213/agent-headquarters/pulls?q=is%3Apr) · [개발 기록](docs/devlog.md) · [결정 기록](docs/decisions/)
