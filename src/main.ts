@@ -1,36 +1,66 @@
-// hq daemon entry point.
-import { existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs'
+// hq daemon entry point. Start order (exec-engine-spec §F): recover → runner → engine → server.
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { RequestEngine } from './engine.ts'
-import type { Project } from './ceo.ts'
-import { resolve } from 'node:path'
 import { homedir } from 'node:os'
-import { mkdirSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
 import { Bus } from './bus.ts'
+import type { Project } from './ceo.ts'
+import { loadConfig } from './config.ts'
+import { RequestEngine } from './engine.ts'
+import { Runner } from './exec/runner.ts'
+import { notify } from './notify.ts'
 import { Scheduler } from './scheduler.ts'
 import { startServer } from './server.ts'
-import { Store } from './store.ts'
+import { migrateDb, Store } from './store.ts'
 import type { TeamConfig } from './types.ts'
 
 const root = resolve(import.meta.dirname, '..')
+const cfg = loadConfig(root)
 const port = Number(process.env.HQ_PORT ?? 7777)
-const teams = JSON.parse(readFileSync(resolve(root, 'config/teams.json'), 'utf8')) as TeamConfig[]
-const store = new Store(resolve(root, '.data/hq.db'))
+mkdirSync(cfg.home, { recursive: true })
+
+// Single instance: daemon.lock holds our pid as one integer line.
+const lockPath = resolve(cfg.home, 'daemon.lock')
+if (existsSync(lockPath)) {
+  const other = Number(readFileSync(lockPath, 'utf8').trim())
+  let cmd = ''
+  if (other > 0 && other !== process.pid) try { cmd = execFileSync('ps', ['-o', 'command=', '-p', String(other)], { encoding: 'utf8' }) } catch { /* not running */ }
+  if (cmd.includes('src/main.ts')) { console.error(`hq가 이미 실행 중이에요 (pid ${other})`); process.exit(1) }
+}
+writeFileSync(lockPath, `${process.pid}\n`)
+const releaseLock = () => { try { if (readFileSync(lockPath, 'utf8').trim() === String(process.pid)) rmSync(lockPath) } catch { /* gone */ } }
+process.on('exit', releaseLock)
+
+const dbPath = resolve(cfg.home, 'hq.db')
+if (migrateDb(resolve(root, '.data/hq.db'), dbPath)) console.log(`DB 이전: .data/hq.db → ${dbPath}`)
+const store = new Store(dbPath)
 const bus = new Bus(store)
+
 // Outside ~/Desktop so the pet app never triggers a macOS folder-access prompt.
-const tokenDir = resolve(homedir(), '.config/hq'); mkdirSync(tokenDir, { recursive: true, mode: 0o700 })
-const tokenPath = resolve(tokenDir, 'token')
+const tokenPath = process.env.HQ_TOKEN_FILE ?? resolve(homedir(), '.config/hq/token')
+mkdirSync(dirname(tokenPath), { recursive: true, mode: 0o700 })
 if (!existsSync(tokenPath)) { writeFileSync(tokenPath, randomBytes(24).toString('hex')); chmodSync(tokenPath, 0o600) }
 const token = readFileSync(tokenPath, 'utf8').trim()
-const scheduler = new Scheduler(teams, store, bus, `http://127.0.0.1:${port}`, token)
+
+const teams = JSON.parse(readFileSync(resolve(root, 'config/teams.json'), 'utf8')) as TeamConfig[]
 // config/projects.json is machine-specific (gitignored); fall back to the committed example.
-const projectsFile = ['config/projects.json', 'config/projects.example.json'].map(f => resolve(root, f)).find(existsSync)!
-const projects = (JSON.parse(readFileSync(projectsFile, 'utf8')) as Project[])
-  .map(p => ({ ...p, path: p.path.replace(/^~(?=\/|$)/, homedir()) }))
-const engine = new RequestEngine(store, bus, projects, root)
-startServer(port, store, bus, scheduler, token, engine, projects)
+const projectsFile = ['config/projects.json', 'config/projects.example.json'].map((f) => resolve(root, f)).find(existsSync)!
+const projects = (JSON.parse(readFileSync(projectsFile, 'utf8')) as Project[]).map((p) => ({ ...p, path: p.path.replace(/^~(?=\/|$)/, homedir()) }))
+
+const runner = new Runner({ store, bus, cfg, projects, hqRoot: root, hqPort: port, notify: cfg.notify ? notify : () => {}, now: Date.now, tokenDir: dirname(tokenPath) })
+const scheduler = new Scheduler(teams, store, bus, `http://127.0.0.1:${port}`, token, {
+  holdUntil: () => runner.holdUntil(),
+  teamLimited: (until) => store.setQuotaWindow({ window: 'team', utilization: null, resets_at: until, status: 'rejected', observed_at: new Date().toISOString() }),
+})
+const engine = new RequestEngine(store, bus, projects, root, runner)
+
+await runner.recover()
+runner.start()
 engine.start()
+startServer({ port, store, bus, scheduler, token, engine, runner, projects })
 setInterval(() => bus.heartbeat(), 10_000)
 scheduler.start()
-bus.emit({ kind: 'team', text: `hq 시작 (팀 ${teams.length}개, 127.0.0.1:${port})` })
-for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { scheduler.stop(); process.exit(0) })
+bus.emit({ kind: 'team', text: `hq 시작 (팀 ${teams.length}개, 127.0.0.1:${port}, ${cfg.home})` })
+// Workers are detached and survive; the next start re-adopts them (§7).
+for (const sig of ['SIGINT', 'SIGTERM'] as const) process.on(sig, () => { runner.stop(); engine.stop(); scheduler.stop(); process.exit(0) })

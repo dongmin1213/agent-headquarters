@@ -10,6 +10,8 @@ import type { TeamConfig, TeamState, TeamView } from './types.ts'
 
 const LIMIT_BACKOFF_MS = 30 * 60_000
 
+export interface TeamQuota { holdUntil(): string | null; teamLimited(untilIso: string): void }
+
 export class Scheduler {
   private state = new Map<string, { state: TeamState; bubble: string; running: boolean }>()
   private timer: NodeJS.Timeout | null = null
@@ -19,9 +21,11 @@ export class Scheduler {
   private bus: Bus
   private hqUrl: string
   private token: string
+  private quota: TeamQuota | null
 
-  constructor(teams: TeamConfig[], store: Store, bus: Bus, hqUrl: string, token: string) {
-    this.teams = teams; this.store = store; this.bus = bus; this.hqUrl = hqUrl; this.token = token
+  /** `quota` connects teams to the shared quota hold (execution.md §13); without it the legacy kv hold is used. */
+  constructor(teams: TeamConfig[], store: Store, bus: Bus, hqUrl: string, token: string, quota: TeamQuota | null = null) {
+    this.teams = teams; this.store = store; this.bus = bus; this.hqUrl = hqUrl; this.token = token; this.quota = quota
     for (const t of teams) this.state.set(t.id, { state: 'idle', bubble: '대기 중', running: false })
   }
 
@@ -33,6 +37,7 @@ export class Scheduler {
   stop(): void { if (this.timer) clearInterval(this.timer) }
 
   blockedUntil(): string | null {
+    if (this.quota) return this.quota.holdUntil()
     const v = this.store.get('limit.blockedUntil')
     if (v && Date.parse(v) <= Date.now()) { this.store.set('limit.blockedUntil', null); return null }
     return v
@@ -60,6 +65,7 @@ export class Scheduler {
   runNow(teamId: string): boolean {
     const t = this.teams.find((x) => x.id === teamId)
     if (!t || this.state.get(t.id)!.running) return false
+    if (this.blockedUntil()) return false
     void this.runTeam(t)
     return true
   }
@@ -94,7 +100,8 @@ export class Scheduler {
         else if (exit === 3) this.set(t.id, 'waiting', lastStatus(tail) ?? '승인 대기')
         else if (exit === 75) {
           const until = new Date(Date.now() + LIMIT_BACKOFF_MS).toISOString()
-          this.store.set('limit.blockedUntil', until)
+          if (this.quota) this.quota.teamLimited(until)
+          else this.store.set('limit.blockedUntil', until)
           this.bus.emit({ kind: 'limit', teamId: t.id, text: `사용 한도 — ${until}까지 대기` })
           this.set(t.id, 'sleeping', '사용 한도, 쉬는 중')
         } else this.set(t.id, 'error', `오류 (종료 코드 ${exit}): ${tail.at(-1) ?? ''}`.slice(0, 140))

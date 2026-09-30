@@ -1,0 +1,182 @@
+// Screen data: decision items (§17), headline (§18), worker/task views (§19).
+import { join } from 'node:path'
+import type { Store, TaskRow, AttemptRow, ApprovalRow } from '../store.ts'
+import type { DecisionItem, Headline, TaskView, WorkerView } from '../types.ts'
+import type { QuotaState } from './quota.ts'
+import { lastActivityOf } from './stream.ts'
+
+const ORDER: DecisionItem['kind'][] = ['plan', 'ceo_question', 'worker_question', 'revise', 'blocked', 'integration', 'accept', 'merge']
+export const BLOCKED_OPTIONS = ['retry', 'skip', 'stop']
+
+function approvalRequestId(store: Store, a: ApprovalRow): string {
+  if (a.subjectId) return a.subjectId
+  const [, rest] = a.id.split(/:(.*)/s)
+  if (a.kind === 'revise') return store.task(rest)?.request_id ?? ''
+  return (rest ?? '').split(':')[0]
+}
+
+/** Fixed option texts (execution.md §17). */
+export const OPTION_HELP: Record<string, string> = {
+  retry: '같은 작업을 최상위 모델로 한 번 더 해요 · 사용량이 들어요',
+  skip: '이 작업과 여기에 의존하는 작업을 빼고 계속해요 · 나중에 새 요청으로 다시 할 수 있어요',
+  stop: '요청 전체를 멈춰요 · 만든 브랜치는 남겨 둬요',
+  수락: '통합본을 병합 대기로 넘겨요 · 병합은 따로 승인해요',
+  반려: '사유를 붙여 다시 작업시켜요',
+  병합: '대상 브랜치에 fast-forward로 반영해요',
+  보류: '지금은 병합하지 않고 둬요 · 나중에 다시 제시할 수 있어요',
+}
+const PLAN_HELP = { 승인: '계획대로 작업을 시작해요 · 사용량이 들어요', 반려: '계획을 버리고 이 요청을 끝내요' }
+const REVISE_HELP = { 승인: '고친 지시서로 이 작업을 다시 해요 · 사용량이 들어요', 반려: '수정안을 버리고 이 작업을 멈춤 상태로 둬요 · 다음 결정은 차단 카드에서 해요' }
+const INTEGRATION_HELP = { '다시 통합': '대상 브랜치의 최신 커밋 위에서 합치기와 검사를 다시 해요 · 사용량은 들지 않아요', '요청 중단': OPTION_HELP.stop }
+
+export const detailPath = (requestId: string, taskId: string | null) => `/ui/#request=${encodeURIComponent(requestId)}${taskId ? `&task=${encodeURIComponent(taskId)}` : ''}`
+
+const firstLine = (s: string | null) => (s ?? '').split('\n').find((l) => l.trim())?.trim().slice(0, 300) ?? ''
+
+type Explain = Pick<DecisionItem, 'situation' | 'cause' | 'causeConfirmed' | 'recommendation' | 'optionHelp'>
+
+function answerHelp(options: string[], def: string): Record<string, string> {
+  return Object.fromEntries(options.map((o) => [o, o === def ? '이 답으로 이어서 진행해요 (추천 기본값)' : '이 답으로 이어서 진행해요']))
+}
+
+/** A stored CEO diagnosis if there is a valid one for this occurrence, otherwise hq's own fact sentences. */
+function diagnosed(raw: string | null, options: string[], fallback: Explain): Explain {
+  if (!raw) return fallback
+  try {
+    const s = JSON.parse(raw) as { ok: boolean; d?: { situation: string; cause: string; causeConfirmed: boolean; recommendation: { option: string; reason: string } } }
+    if (!s.ok || !s.d || !options.includes(s.d.recommendation.option)) return fallback
+    return { ...fallback, situation: s.d.situation, cause: s.d.cause, causeConfirmed: s.d.causeConfirmed, recommendation: s.d.recommendation }
+  } catch { return fallback }
+}
+
+export function decisionItems(store: Store, now = Date.now()): DecisionItem[] {
+  const items: DecisionItem[] = []
+  for (const a of store.openApprovals(now)) {
+    if (!['plan', 'revise', 'integration', 'accept', 'merge'].includes(a.kind)) continue
+    const requestId = approvalRequestId(store, a)
+    const taskId = a.kind === 'revise' ? a.id.slice('revise:'.length) : null
+    let ex: Explain
+    if (a.kind === 'plan') {
+      const plan = store.request(requestId)?.plan
+      const n = plan ? (JSON.parse(plan).tasks as unknown[]).length : 0
+      ex = { situation: `사장이 작업 ${n}개짜리 계획을 올렸어요 · 실행할 명령과 범위를 확인해 주세요`, cause: null, causeConfirmed: false, recommendation: null, optionHelp: PLAN_HELP }
+    } else if (a.kind === 'revise') {
+      const t = store.task(taskId!)
+      ex = { situation: `작업자가 ${t?.title ?? '작업'}을(를) 지시서대로 할 수 없다고 멈췄고, 사장이 지시서를 고쳤어요 · 범위나 검사 명령이 바뀌어 승인이 필요해요`,
+        cause: firstLine(t?.note ?? null) || null, causeConfirmed: true, recommendation: null, optionHelp: REVISE_HELP }
+    } else if (a.kind === 'integration') {
+      const project = a.id.split(':')[2]
+      const m = store.mergeRow(requestId, project)
+      ex = diagnosed(m?.diagnosis ?? null, a.options, { situation: `프로젝트 ${project}의 결과를 대상 브랜치 위에 합치다 문제가 생겼어요`,
+        cause: m?.note ?? firstLine(a.body), causeConfirmed: true, recommendation: null, optionHelp: INTEGRATION_HELP })
+    } else if (a.kind === 'accept') {
+      const passed = store.tasks(requestId).filter((t) => t.status === 'passed').length
+      ex = { situation: `작업 ${passed}개가 검사·검토를 통과했어요 · 결과를 확인하고 수락해 주세요`, cause: null, causeConfirmed: false, recommendation: null,
+        optionHelp: { 수락: OPTION_HELP.수락, 반려: OPTION_HELP.반려 } }
+    } else {
+      const project = a.id.split(':')[2]
+      const m = store.mergeRow(requestId, project)
+      const files = store.tasks(requestId).filter((t) => t.project === project && t.role === 'implement' && t.status === 'passed').length
+      ex = { situation: `${m?.target ?? '대상 브랜치'} (${m?.target_sha?.slice(0, 10) ?? '?'})에 작업 ${files}개의 통합본 ${m?.integration_sha?.slice(0, 10) ?? '?'}을(를) 반영할 준비가 됐어요`,
+        cause: m?.note ?? null, causeConfirmed: !!m?.note, recommendation: null, optionHelp: { 병합: OPTION_HELP.병합, 보류: OPTION_HELP.보류 } }
+    }
+    items.push({ kind: a.kind as DecisionItem['kind'], id: a.id, revision: a.revision, requestId, taskId, title: a.title, detail: a.body, ...ex,
+      detailPath: detailPath(requestId, taskId), options: a.options, subjectHash: a.subjectHash, createdAt: a.createdAt })
+  }
+  for (const r of store.requestsByStatus(['asking'])) for (const q of store.questions(r.id)) {
+    if (q.answer !== null) continue
+    items.push({ kind: 'ceo_question', id: q.id, revision: 0, requestId: r.id, taskId: null, title: q.question, detail: q.reason,
+      situation: `사장이 계획을 세우기 전에 물어볼 게 있어요: ${q.question}`, cause: q.reason, causeConfirmed: false,
+      recommendation: q.options.includes(q.default) ? { option: q.default, reason: '사장이 추천한 기본값이에요' } : null, optionHelp: answerHelp(q.options, q.default),
+      detailPath: detailPath(r.id, null), options: q.options, subjectHash: null, createdAt: r.updated_at })
+  }
+  for (const t of store.tasksByStatus(['question'])) for (const q of store.taskQuestions(t.id)) {
+    if (q.answer !== null || q.revision !== t.revision) continue
+    items.push({ kind: 'worker_question', id: q.id, revision: t.revision, requestId: t.request_id, taskId: t.id, title: `${t.title}: ${q.question}`, detail: `기본값: ${q.default}`,
+      situation: `작업자가 ${t.title}을(를) 하다가 물어볼 게 있어요: ${q.question}`, cause: firstLine(t.note) || null, causeConfirmed: false,
+      recommendation: q.options.includes(q.default) ? { option: q.default, reason: '작업자가 제안한 기본값이에요' } : null, optionHelp: answerHelp(q.options, q.default),
+      detailPath: detailPath(t.request_id, t.id), options: q.options, subjectHash: null, createdAt: q.created_at })
+  }
+  for (const t of store.tasksByStatus(['blocked'])) {
+    const ex = diagnosed(t.diagnosis, BLOCKED_OPTIONS, { situation: `작업 ${t.title}이(가) 멈췄어요 · 어떻게 할지 정해 주세요`, cause: t.note, causeConfirmed: true, recommendation: null,
+      optionHelp: { retry: OPTION_HELP.retry, skip: OPTION_HELP.skip, stop: OPTION_HELP.stop } })
+    items.push({ kind: 'blocked', id: t.id, revision: t.revision, requestId: t.request_id, taskId: t.id, title: `작업 ${t.title}이(가) 막혔어요`, detail: t.note ?? '', ...ex,
+      detailPath: detailPath(t.request_id, t.id), options: BLOCKED_OPTIONS, subjectHash: null, createdAt: t.updated_at })
+  }
+  return items.sort((a, b) => ORDER.indexOf(a.kind) - ORDER.indexOf(b.kind) || a.createdAt.localeCompare(b.createdAt))
+}
+
+export function currentAttempt(store: Store, taskId: string): AttemptRow | null { return store.attempts(taskId).at(-1) ?? null }
+
+export const hqDirOf = (a: AttemptRow) => join(a.dir, 'hq')
+export const outDirOf = (a: AttemptRow) => join(a.dir, 'out')
+
+export function taskView(store: Store, t: TaskRow, activity: (a: AttemptRow) => string | null = (a) => lastActivityOf(hqDirOf(a))): TaskView {
+  const cur = currentAttempt(store, t.id)
+  return {
+    id: t.id, key: t.key, requestId: t.request_id, project: t.project, title: t.title, role: t.role, grade: t.grade, model: t.model,
+    status: t.status as TaskView['status'], attempts: t.attempts, currentAttemptId: cur?.id ?? null, lastActivity: cur ? activity(cur) : null,
+    questions: t.status === 'question' ? store.taskQuestions(t.id).filter((q) => q.revision === t.revision && q.answer === null).map((q) => ({ id: q.id, question: q.question, options: q.options, default: q.default })) : [],
+    note: t.note, headSha: t.head_sha, revision: t.revision, reviewModel: t.review_model, updatedAt: t.updated_at,
+  }
+}
+
+export const hhmm = (iso: string) => { const d = new Date(iso); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` }
+
+export function workerViews(store: Store, activity: (a: AttemptRow) => string | null = (a) => lastActivityOf(hqDirOf(a)), holdUntil: string | null = null): WorkerView[] {
+  const out: WorkerView[] = []
+  for (const a of store.liveAttempts()) {
+    const t = store.task(a.task_id)
+    if (!t) continue
+    const review = a.kind === 'review'
+    out.push({ attemptId: a.id, taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, model: a.model,
+      kind: review ? 'review' : 'work', state: review ? 'reviewing' : 'running', bubble: activity(a) ?? (review ? '검토 준비 중' : '준비 중'), startedAt: a.started_at ?? t.updated_at })
+  }
+  for (const t of store.tasksByStatus(['verifying', 'held', 'blocked'])) {
+    const last = store.attempts(t.id).at(-1)
+    const base = { attemptId: last?.id ?? '', taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, startedAt: t.updated_at }
+    if (t.status === 'verifying') out.push({ ...base, attemptId: store.attempts(t.id).filter((x) => x.kind === 'work').at(-1)?.id ?? '', model: 'hq', kind: 'verify', state: 'verifying', bubble: '수용 기준 검사 중' })
+    else if (t.status === 'held') out.push({ ...base, model: t.model, kind: 'work', state: 'held', bubble: holdUntil ? `한도 보류 · ${hhmm(holdUntil)}까지` : '한도 보류' })
+    else out.push({ ...base, model: t.model, kind: last?.kind === 'review' ? 'review' : 'work', state: 'blocked', bubble: '멈춤 · 사장에게 보고' })
+  }
+  return out
+}
+
+const WINDOW_NAMES: Record<string, string> = { five_hour: '5시간', seven_day: '7일', seven_day_opus: '7일(opus)', seven_day_sonnet: '7일(sonnet)', team: '팀' }
+
+export interface HeadlineInput {
+  decisions: DecisionItem[]
+  /** Blocked requests without a decision item (§18 장애). */
+  failures: { title: string; reason: string }[]
+  workers: WorkerView[]
+  ceoThinking: boolean
+  /** Tasks ready to start but waiting for a slot or the quota. */
+  waiting: number
+  quota: QuotaState
+  /** Request merged within the last 10 minutes. */
+  recentMerged: string | null
+  /** For a verify worker: whether an LLM review follows. */
+  reviewFollows?: (taskId: string) => boolean
+}
+
+export function buildHeadline(h: HeadlineInput): Headline {
+  const needsYou = h.decisions.length
+  if (needsYou) return { text: `회장님 결정 ${needsYou}건: ${h.decisions[0].title}`, needsYou }
+  if (h.failures.length) return { text: `${h.failures[0].title}이 막혔어요: ${h.failures[0].reason.split('\n')[0].slice(0, 80)}`, needsYou }
+  const active = h.workers.filter((w) => w.state !== 'held' && w.state !== 'blocked')
+  if (active.length) {
+    const w = active[0]
+    const verb = w.kind === 'review' ? '검토' : w.kind === 'verify' ? '검증' : '구현'
+    const next = w.kind === 'work' ? (w.role === 'collect' ? '결과 수락' : '검증') : w.kind === 'verify' ? (h.reviewFollows?.(w.taskId) === false ? '통합' : '검토') : '통합'
+    return { text: `${w.model}가 ${w.title} ${verb} 중 · 다음: ${next}${active.length > 1 ? ` 외 ${active.length - 1}명` : ''}`, needsYou }
+  }
+  if (h.ceoThinking) return { text: '사장이 계획 중이에요', needsYou }
+  const held = h.workers.some((w) => w.state === 'held')
+  if (h.quota.mode === 'hold' && (h.waiting > 0 || held) && h.quota.until) {
+    const pct = Math.round((h.quota.pct ?? 1) * 100)
+    return { text: `사용 한도 ${WINDOW_NAMES[h.quota.window ?? ''] ?? h.quota.window ?? ''} ${pct}% — ${hhmm(h.quota.until)}까지 쉬어요`, needsYou }
+  }
+  if (h.waiting > 0) return { text: h.quota.mode === 'unobserved' ? '한도 관측 전이라 하나씩 실행 중' : `빈 자리 기다리는 중 (${h.waiting}건)`, needsYou }
+  if (h.recentMerged) return { text: `병합 완료: ${h.recentMerged}`, needsYou }
+  return { text: '지금 하실 일은 없어요', needsYou }
+}
