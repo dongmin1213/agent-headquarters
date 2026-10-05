@@ -44,7 +44,7 @@ export function recordRateLimit(store: Store, line: Record<string, unknown>, now
 /** Windows whose reset time has passed say nothing about the present. */
 const liveRows = (rows: QuotaRow[], now: number) => rows.filter((r) => !(r.resets_at && Date.parse(r.resets_at) <= now))
 
-/** Extra hold sources besides window rows: the resetsAt-less limit back-off timer and a missing Claude login (§13). */
+/** Extra hold sources besides window rows: the resetsAt-less limit back-off timer and a missing Codex login (§13). */
 export interface HoldTimers { backoffUntil?: string | null; loginRequired?: boolean }
 
 /**

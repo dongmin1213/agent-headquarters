@@ -154,7 +154,7 @@ Codex 실행에는 `com.apple.trustd.agent`를 추가 허용합니다(TLS 인증
     - 데몬 토큰 폴더(`~/.config/hq`), `$HQ_HOME`, `~/.ssh`·`~/.aws`·`~/.config/gh`·`~/.netrc`·`~/.docker/config.json`은 어떤 설정으로도 열리지 않고, hq 저장소는 어떤 설정으로도 쓸 수 없습니다(프로필의 마지막 규칙).
     - **팀 폴더 제한**: 팀 `cwd`가 hq 저장소나 `$HQ_HOME`과 같거나, 그 위(조상)나 안에 있으면 그 팀은 실행하지 않고 말풍선에 `실행할 수 없어요: 팀 폴더가 hq 저장소나 hq 데이터와 겹쳐요`를 띄웁니다. 팀이 자기 격리 설정(`config/teams.json`)이나 데몬 코드를 고치지 못하게 하기 위해서입니다. 예시 파일의 `smoke` 팀(`~/code/hq-smoke`)은 예시 전용이고 꺼져 있습니다.
     - 네트워크는 열려 있습니다(웹 API, 그리고 범위 토큰으로 hq에 연결). npm·pip·XDG 캐시는 실행마다 새 임시 폴더를 쓰고 실행이 끝나면 지웁니다.
-  - **경로 더 허용하기**: 팀이 홈의 다른 경로를 써야 하면 팀 항목에 `"sandbox": {"readable": ["~/경로"], "writable": ["~/경로"]}`를 넣습니다(`~` 가능, 상대 경로는 `cwd` 기준, `writable`은 읽기도 허용). 모두 공통 허용 목록이 아니라 그 팀에만 적용됩니다. 수익자동화 파이프라인(`hq_team.py`: 리서치·대본·승인 묶음)은 추가 경로 없이 돕니다(측정: `.venv` 가져오기, `hq_team.py`, Codex JSON 응답·실시간 웹 검색, 파이썬 https, 파이프라인 자체 테스트 12개, `yt-dlp` 조회, `ffmpeg-full` drawtext). 참고로 측정된 예외:
+  - **경로 더 허용하기**: 팀이 홈의 다른 경로를 써야 하면 팀 항목에 `"sandbox": {"readable": ["~/경로"], "writable": ["~/경로"]}`를 넣습니다(`~` 가능, 상대 경로는 `cwd` 기준, `writable`은 읽기도 허용). 모두 공통 허용 목록이 아니라 그 팀에만 적용됩니다. 수익자동화 파이프라인(`hq_team.py`: 리서치·대본·승인 묶음)은 추가 경로 없이 돕니다(측정: `.venv` 가져오기, `hq_team.py`, Codex JSON 응답·실시간 웹 검색, 파이썬 https, 파이프라인 자체 테스트 19개, `yt-dlp` 조회, `ffmpeg-full` drawtext). 참고로 측정된 예외:
     - **Higgsfield CLI**(유료 단계, 지금은 팀이 아니라 사용자가 직접 실행): 설정 폴더 쓰기와 함께, HTTPS 인증서 확인에 macOS `trustd` 서비스가 필요합니다. 없으면 `request failed (no response received)`로 실패합니다. 팀이 Higgsfield를 불러야 한다면 아래처럼 허용합니다(측정: `higgsfield account status` 성공).
       ```json
       "sandbox": { "writable": ["~/.config/higgsfield"], "mach": ["com.apple.trustd.agent"] }
@@ -222,6 +222,7 @@ hq uninstall --purge --yes   # $HQ_HOME의 hq 데이터(DB·worktree·증거), �
 - `npx tsc --noEmit` 오류 없음
 - `npm test` 실패 0
 - `HQ_LIVE=1 node --test test/unit/codex-live.test.ts`: 실제 Codex 호출·명령 실행·JSON 응답·세션 재개를 검증합니다. ChatGPT 로그인과 사용량이 필요합니다. 수익자동화 파이프라인의 Codex 연결·실시간 웹 검색 시험은 별도 `HQ_LIVE_PIPELINE=1`일 때만 실행합니다.
+- `HQ_LIVE_FLOW=1 node --test --test-timeout=360000 test/unit/codex-flow-live.test.ts`: 격리된 임시 저장소에서 실제 Codex 사장 계획 → 구현 → 독립 검토 → 수락 → fast-forward 병합을 검증합니다. 승인도 이 시험 요청에만 적용하며 운영 데몬·프로젝트는 건드리지 않습니다.
 - `hq doctor`가 이 맥에서 `[실패]` 없음
 
 

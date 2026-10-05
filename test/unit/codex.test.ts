@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { activateCodexProvider, CodexEvents, commandText, execArgs, prepareCodexHome, strictSchema } from '../../src/codex.ts'
+import { activateCodexProvider, chatgptEnv, CodexEvents, commandText, execArgs, prepareCodexHome, strictSchema } from '../../src/codex.ts'
 import { Store } from '../../src/store.ts'
 import { loadConfig } from '../../src/config.ts'
 import { StreamTail, extractBashRuns } from '../../src/exec/stream.ts'
@@ -132,4 +132,10 @@ test('provider switch clears only stale account limits once, preserving requests
     activateCodexProvider(store)
     assert.equal(store.get('login.required'), 'new-codex-login', 'restart must not clear a current provider hold')
   } finally { store.close(); rmSync(root, { recursive: true, force: true }) }
+})
+
+test('ChatGPT calls preserve the private Codex home without inherited API keys or daemon credentials', () => {
+  const from = { CODEX_HOME: '/private-codex', PATH: '/bin', CODEX_API_KEY: 'dummy', OPENAI_API_KEY: 'dummy', ANTHROPIC_API_KEY: 'dummy', HQ_TOKEN: 'dummy', HQ_TOKEN_FILE: '/token' }
+  assert.deepEqual(chatgptEnv(from), { CODEX_HOME: '/private-codex', PATH: '/bin' })
+  assert.equal(from.CODEX_API_KEY, 'dummy', 'caller environment is not mutated')
 })

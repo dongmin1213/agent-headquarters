@@ -956,7 +956,7 @@ function verdictView(v) {
   return h('div', { class: 'stack' },
     h('div', { class: 'summary-row' }, h('span', null, '판정 '), passChip(v?.pass),
       h('span', { class: 'muted' }, `검토 ${txt(v?.reviewer_model)} → 구현 ${txt(v?.implementer_model)}`),
-      v?.sameFamily ? h('span', { class: 'chip chip-neutral', title: '같은 Claude 계열 모델끼리의 교차 검토예요' }, '같은 계열') : null,
+      v?.sameFamily ? h('span', { class: 'chip chip-neutral', title: '같은 모델 계열끼리의 교차 검토예요' }, '같은 계열') : null,
       v?.head_sha ? h('span', { class: 'mono muted', title: v.head_sha }, `@${shortSha(v.head_sha)}`) : null),
     h('section', { class: 'vsec' }, h('h4', null, `차단 (blocking) ${list(v?.blocking).length}`),
       list(v?.blocking).length ? h('ul', { class: 'issues' }, list(v.blocking).map((b) => h('li', { class: 'issue issue-bad' }, h('span', { class: 'mono issue-id' }, txt(b.id)), h('span', { class: 'issue-sum' }, txt(b.summary)), b.evidence ? h('span', { class: 'issue-ev muted' }, b.evidence) : null))) : h('p', { class: 'muted small' }, '없음')),

@@ -89,6 +89,7 @@ export function runSandboxed(command: string, cwd: string, timeoutMs: number, pr
 const SECRET_PATTERNS: [string, RegExp][] = [
   ['private-key', /-----BEGIN .*PRIVATE KEY/],
   ['anthropic-key', /sk-ant-/],
+  ['openai-key', /sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}/],
   ['github-token', /ghp_/],
   ['aws-access-key', /AKIA[0-9A-Z]{16}/],
   ['slack-token', /xox[bp]-/],

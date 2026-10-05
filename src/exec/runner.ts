@@ -634,7 +634,7 @@ export class Runner {
 
   /**
    * The blocked card shows what the lingering pid is now (`ps` line) and offers `kill` only when that line looks like
-   * this task's worker (claude binary + its worktree or one of its attempt sessions). Read-only: nothing is signalled.
+   * this task's worker (Codex binary + its worktree or one of its attempt sessions). Read-only: nothing is signalled.
    */
   private async lookAtLingering(t: TaskRow, l: Lingering): Promise<void> {
     let ps: string | null = null

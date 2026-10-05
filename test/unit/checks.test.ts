@@ -79,3 +79,14 @@ test('3. secret added in a middle commit and removed later is still detected, wi
   assert.doesNotMatch(JSON.stringify(hits), /sk-ant-x/)
   assert.ok(head)
 })
+
+test('Codex migration: OpenAI keys in earlier commits are rejected without retaining the secret', async () => {
+  const e = await env()
+  const key = 'sk-proj-' + 'x'.repeat(40)
+  commitFile(e.repo, 'config.txt', `key=${key}\n`, 'add key')
+  commitFile(e.repo, 'config.txt', 'key=removed\n', 'remove key')
+  await ensureMirror({ id: 'p', path: e.repo }, e.mirror)
+  const hits = await secretScan(e.mirror, e.base, sh(e.repo, 'rev-parse', 'HEAD'))
+  assert.ok(hits.some(h => h.pattern === 'openai-key' && h.file === 'config.txt'))
+  assert.ok(!JSON.stringify(hits).includes(key))
+})

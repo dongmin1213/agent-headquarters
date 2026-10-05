@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { CodexEvents, execArgs, prepareCodexHome, strictSchema } from './codex.ts'
+import { chatgptEnv, CodexEvents, execArgs, prepareCodexHome, strictSchema } from './codex.ts'
 import { DEFAULTS } from './config.ts'
 import { join, matchesGlob, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
@@ -171,9 +171,7 @@ export function runJsonTurn(i: JsonTurnInput): Promise<JsonTurn> {
   const schemaPath = join(codexHome, `schema-${randomUUID()}.json`)
   writeFileSync(schemaPath, JSON.stringify(strictSchema(i.schema)), { mode: 0o600 })
   const args = execArgs({ model: i.model ?? DEFAULTS.models.sonnet, sessionId: i.sessionId, resume: i.resume, schemaPath })
-  const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: codexHome }
-  delete env.OPENAI_API_KEY
-  delete env.ANTHROPIC_API_KEY
+  const env: NodeJS.ProcessEnv = { ...chatgptEnv(), CODEX_HOME: codexHome }
   const decoder = new CodexEvents()
   return new Promise((done) => {
     const child = spawn(i.codexBin, args, { cwd: i.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
@@ -185,11 +183,11 @@ export function runJsonTurn(i: JsonTurnInput): Promise<JsonTurn> {
       try { line = JSON.parse(raw) } catch { return }
       if (!line || typeof line !== 'object') return
       for (const event of decoder.consume(line)) {
-      line = event
-      if (line.type === 'result') result = line
-      if (typeof line.session_id === 'string') sid = line.session_id
-      if (line.type === 'rate_limit_event' && (line.rate_limit_info as Record<string, unknown> | undefined)?.status === 'rejected') rejected = true
-      try { i.onLine?.(line) } catch { /* observer errors never break the turn */ }
+        line = event
+        if (line.type === 'result') result = line
+        if (typeof line.session_id === 'string') sid = line.session_id
+        if (line.type === 'rate_limit_event' && (line.rate_limit_info as Record<string, unknown> | undefined)?.status === 'rejected') rejected = true
+        try { i.onLine?.(line) } catch { /* observer errors never break the turn */ }
       }
     })
     child.stderr!.on('data', (b: Buffer) => { if (err.length < 20_000) err += b })

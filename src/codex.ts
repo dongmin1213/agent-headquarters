@@ -131,12 +131,19 @@ export class CodexEvents {
   }
 }
 
+/** Use the saved ChatGPT login; inherited API keys must not silently switch billing/authentication. */
+export function chatgptEnv(from: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env = { ...from }
+  for (const key of ['CODEX_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'HQ_TOKEN', 'HQ_TOKEN_FILE']) delete env[key]
+  return env
+}
+
 /** Small team helper. Scheduler supplies a private CODEX_HOME and the outer Seatbelt profile. */
 export function runCodex(run: { prompt: string; cwd: string; model?: string; timeoutMs?: number }): Promise<{ ok: boolean; text: string; limited: boolean }> {
   return new Promise((resolve) => {
     const decoder = new CodexEvents()
     const child = spawn(process.env.HQ_CODEX_BIN ?? 'codex', execArgs({ model: run.model, externalSandbox: !!process.env.HQ_TEAM }),
-      { cwd: run.cwd, stdio: ['pipe', 'pipe', 'pipe'] })
+      { cwd: run.cwd, env: chatgptEnv(), stdio: ['pipe', 'pipe', 'pipe'] })
     let error = ''
     const timer = setTimeout(() => child.kill('SIGINT'), run.timeoutMs ?? 60_000)
     createInterface({ input: child.stdout }).on('line', (raw) => { try { decoder.consume(JSON.parse(raw)) } catch { /* non-JSON diagnostic */ } })
