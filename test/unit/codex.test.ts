@@ -149,3 +149,25 @@ test('ChatGPT calls preserve the private Codex home without inherited API keys o
   assert.deepEqual(chatgptEnv(from), { CODEX_HOME: '/private-codex', PATH: '/bin' })
   assert.equal(from.CODEX_API_KEY, 'dummy', 'caller environment is not mutated')
 })
+
+test('shell envelopes decode adjacent literal quotes but never evaluate expansions or hide operators', () => {
+  assert.equal(commandText("/bin/bash -lc \"rg --files -g '\"'!.env*'\"'\""), "rg --files -g '!.env*'")
+  assert.equal(commandText("/bin/zsh -lc 'rg --files -g '\"'\"'!.env*'\"'\"''"), "rg --files -g '!.env*'")
+  assert.equal(commandText("/bin/sh -c 'npm test; exit 0'"), "npm test; exit 0")
+  assert.equal(commandText("/bin/sh -c \"echo \\$HOME\""), "echo $HOME")
+  assert.equal(commandText("/bin/sh -c \"echo $HOME\""), "/bin/sh -c \"echo $HOME\"")
+  assert.equal(commandText("/bin/sh -c \"$(echo true)\""), "/bin/sh -c \"$(echo true)\"")
+  assert.equal(commandText("/bin/sh -c 'npm test' extra"), "/bin/sh -c 'npm test' extra")
+  assert.equal(commandText("/bin/sh -c 'npm test' && true"), "/bin/sh -c 'npm test' && true")
+  assert.equal(commandText("/bin/sh -c \"echo \\\\$HOME\""), "/bin/sh -c \"echo \\\\$HOME\"")
+  assert.equal(commandText("/bin/sh -c 'unclosed"), "/bin/sh -c 'unclosed")
+})
+
+test('failed native commands retain their measured nonzero exit instead of becoming unknown', () => {
+  const decoder = new CodexEvents()
+  const lines = decoder.consume({ type: 'item.completed', item: { id: 'failure', type: 'command_execution', command: 'node check.mjs', status: 'failed', exit_code: 1, aggregated_output: 'assertion failed' } })
+  assert.equal(lines.at(-1)?.tool_use_result.interrupted, false)
+  assert.match(lines.at(-1)?.message.content[0].content, /^Exit code 1/)
+  const unknown = decoder.consume({ type: 'item.completed', item: { id: 'unknown', type: 'command_execution', command: 'node check.mjs', status: 'failed', exit_code: null } })
+  assert.equal(unknown.at(-1)?.tool_use_result.interrupted, true)
+})

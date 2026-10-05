@@ -79,14 +79,33 @@ export function commandText(command: string): string {
   const m = /^(?:\/(?:bin|usr\/bin)\/)?(?:bash|zsh|sh) -l?c (.*)$/s.exec(command)
   if (!m) return command
   const s = m[1]
-  if (/^[a-zA-Z0-9_./=-]+$/.test(s)) return s
-  if (s.startsWith("'") && s.endsWith("'")) {
-    const body = s.slice(1, -1)
-    // A single shell-quoted argument, including the standard escaped-apostrophe sequence.
-    if (!body.replaceAll("'\\''", '').includes("'")) return body.replaceAll("'\\''", "'")
+  let quote: "'" | '"' | null = null, out = '', started = false
+  // Decode one literal shell word, including adjacent quoted fragments (shlex-style apostrophes).
+  // Any expansion, operator or second argument keeps the original envelope; never evaluate shell text.
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (quote === "'") { if (c === "'") quote = null; else out += c; continue }
+    if (quote === '"') {
+      if (c === '"') { quote = null; continue }
+      if (c === '$' || c === '`') return command
+      if (c === '\\') {
+        const next = s[++i]
+        if (next === undefined || next === '\n' || next === '\r') return command
+        out += '"\\$`'.includes(next) ? next : '\\' + next
+      } else out += c
+      continue
+    }
+    started = true
+    if (c === "'" || c === '"') { quote = c; continue }
+    if (c === '\\') {
+      const next = s[++i]
+      if (next === undefined || next === '\n' || next === '\r') return command
+      out += next; continue
+    }
+    if (!/[a-zA-Z0-9_./=:+,!%-]/.test(c)) return command
+    out += c
   }
-  if (s.startsWith('"') && s.endsWith('"') && !/(?<!\\)["$`]/.test(s.slice(1, -1))) return s.slice(1, -1).replace(/\\(["\\$`])/g, '$1')
-  return command
+  return quote === null && started ? out : command
 }
 
 type Event = Record<string, any>
@@ -114,7 +133,8 @@ export class CodexEvents {
       const call = { type: 'assistant', message: { content: [{ type: 'tool_use', id: item.id, name: 'Bash', input: { command } }] } }
       if (line.type === 'item.started') return [call]
       if (line.type === 'item.completed') {
-        const exit = item.status === 'completed' && Number.isInteger(item.exit_code) ? item.exit_code : null
+        const finished = item.status === 'completed' || (item.status === 'failed' && item.exit_code !== 0)
+        const exit = finished && Number.isInteger(item.exit_code) && item.exit_code >= 0 ? item.exit_code : null
         return [call, { type: 'user', tool_use_result: { interrupted: exit === null }, message: { content: [{ type: 'tool_result', tool_use_id: item.id,
           is_error: exit !== 0, content: exit === null ? 'Unknown exit code' : exit === 0 ? String(item.aggregated_output ?? '') : `Exit code ${exit}\n${item.aggregated_output ?? ''}` }] } }]
       }

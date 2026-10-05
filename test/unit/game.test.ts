@@ -195,3 +195,26 @@ test('release gate restores the integrated candidate, retains playable files and
     } finally { await h.close(); rmSync(f.root, { recursive: true, force: true }) }
   })
 })
+
+test('invalid collect reviews retry the preserved report and expose it to the game leader', async () => {
+  const h = harness()
+  try {
+    const spec = task('A', { role: 'collect', grade: 'L2', owns: [], brief: '[[FAKE:review=manualall]]',
+      acceptance: [{ id: 'R', text: '조사 근거를 확인한다', check: 'manual', kind: 'new' }], review: { model: 'opus', brief: '조사 검토' } })
+    const id = h.plan([spec]); await h.approve(id)
+    await h.waitFor(() => h.store.task(`${id}.A`)?.status === 'blocked', 'invalid reviews')
+    const before = h.store.task(`${id}.A`)!
+    const evidence = h.runner.gameTaskEvidence(before.id)
+    assert.match(evidence, /## 봉인 조사 보고서/)
+    assert.doesNotMatch(evidence, /현재 세대의 검증된 조사 보고서 없음/)
+    assert.match(evidence, /검토/)
+    // Only change the fake review's response; the completed work and its report stay untouched.
+    h.store.updateTask(before.id, { spec: JSON.stringify({ ...spec, brief: '[[FAKE:review=pass]]' }) })
+    assert.equal(h.runner.decideTask(before.id, 'retry', before.block_count), null)
+    assert.equal(h.store.task(before.id)?.status, 'reviewing')
+    assert.equal(h.store.task(before.id)?.report_sha, before.report_sha)
+    await h.waitFor(() => h.store.task(before.id)?.status === 'passed', 'new independent review passes')
+    assert.equal(h.store.attempts(before.id).filter(a => a.kind === 'work').length, 1)
+    assert.equal(h.store.attempts(before.id).filter(a => a.kind === 'review').length, 3)
+  } finally { await h.close() }
+})

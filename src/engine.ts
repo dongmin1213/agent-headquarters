@@ -90,7 +90,7 @@ export class RequestEngine {
         const questions = this.store.taskQuestions(t.id).filter(q => q.answer === null)
         const result = await runJsonTurn({ codexBin: this.runner.cfg.codexBin, runtimeHome: this.runner.home, model: this.runner.cfg.models.opus,
           cwd: t.worktree ?? p.path, sessionId: randomUUID(), resume: false, addDirs: [], timeoutMs: 5 * 60_000,
-          prompt: `너는 게임팀장이다. 사용자에게 세부 기획을 떠넘기지 않고 결정한다. 외부 결제/게시/권한 변경은 하지 않는다. 요청: ${r.text}\n작업: ${t.spec}\n상태: ${t.status}\n문제: ${t.note}\n진단: ${t.diagnosis}\n질문: ${JSON.stringify(questions)}\n현재 작업 파일과 선행 기획을 읽고 구체적인 답변 또는 수정 방향을 결정한다. 실행 불가능하거나 외부 권한이 필요하면 proceed=false와 정확한 이유를 보고한다. 단순 재시도는 다른 해결 방법이 있을 때만 선택한다. answer는 작업자가 따라 실행할 수 있는 구체적인 결정이다.`,
+          prompt: `너는 게임팀장이다. 사용자에게 세부 기획을 떠넘기지 않고 결정한다. 외부 결제/게시/권한 변경은 하지 않는다. 요청: ${r.text}\n작업: ${t.spec}\n상태: ${t.status}\n문제: ${t.note}\n진단: ${t.diagnosis}\n질문: ${JSON.stringify(questions)}\n현재 작업 파일과 선행 기획을 읽고 구체적인 답변 또는 수정 방향을 결정한다. 실행 불가능하거나 외부 권한이 필요하면 proceed=false와 정확한 이유를 보고한다. 단순 재시도는 다른 해결 방법이 있을 때만 선택한다. answer는 작업자가 따라 실행할 수 있는 구체적인 결정이다. 너는 읽기 전용 판단 세션이며 실제 수정은 별도 작업자가 수행하므로 이 세션의 쓰기 금지를 제작 불가능으로 오인하지 않는다.\n${this.runner.gameTaskEvidence(t.id)}`,
           schema: { type: 'object', additionalProperties: false, required: ['proceed', 'answer'], properties: { proceed: { type: 'boolean' }, answer: { type: 'string' } } },
           onLine: line => { if (line.type === 'rate_limit_event') this.runner.observe(line) } })
         if (result.limited) { this.runner.limitBackoff(); return true }

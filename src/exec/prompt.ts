@@ -151,6 +151,7 @@ export interface ReviewPromptInput {
   manualTails?: Record<string, { candidate: string; base: string }>
   /** Sealed collect report (collect tasks are reviewed on their report, §10). */
   report?: string | null
+  previousIssue?: string | null
 }
 
 function manualTailLines(x: { candidate: string; base: string } | undefined): string[] {
@@ -171,6 +172,8 @@ export function reviewPrompt(o: ReviewPromptInput): string {
     '',
     '## 회장의 요청', o.requestText.replace(/\s+/g, ' ').slice(0, 1000),
     '', '## 원 지시서', t.brief,
+    ...(t.role === 'collect' ? ['', '이 작업은 읽기 전용 조사(collect)다. 산출물은 아래 HQ 봉인 보고서이며 저장소에 docs 파일을 만들지 않는 것이 정상이다. owns에 예정 파일명이 있더라도 파일 부재만으로 반려하지 않는다. 보고서 내용과 출처를 독립 검증한다. 환경 제약은 관측한 세션 범위로 판정한다. 게임 프로젝트는 이미지 생성이 art 직군에만 활성화되므로 research 세션에 도구가 없는 것은 정상이며 제작 전체의 부재를 뜻하지 않는다.'] : []),
+    ...(o.previousIssue ? ['', '## 이전 검토 문제와 수정 방향', o.previousIssue, '같은 형식 오류를 반복하지 않는다. 이번 세션에서 직접 실행한 단일 명령만 tests_run에 기록한다. 따옴표 안의 세미콜론/줄바꿈도 허용되지 않는다. Python -c 대신 필요시 임시 스크립트 파일을 만들어 한 명령으로 실행한다.'] : []),
     '', '## 수정 가능 범위 (owns)', bullet(t.owns),
     '', '## 수용 기준',
     ...t.acceptance.flatMap((a) => [`- [${a.id}] (${a.kind === 'new' ? '새 동작' : '기존 동작 유지'}) ${a.text} — 확인: ${a.check.trim() === 'manual' ? 'manual' : o.manualIds?.includes(a.id) ? `manual (\`${a.check}\`가 base에서도 실패한 기존 실패 — 악화 없음을 증거로 판정)` : `\`${a.check}\``}`,
