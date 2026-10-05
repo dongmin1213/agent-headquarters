@@ -11,6 +11,12 @@ export const GAME_CHECKS = ['boot', 'movement', 'combat', 'progression', 'save-l
 export const gameEnabled = (store: Store, project: string) => store.get(`game.enabled:${project}`) !== 'false'
 export const GAME_MANIFEST = 'release/game-release.json'
 
+export const GAME_ECONOMY_RULES = `사용량 절약 원칙(완료 기준은 그대로 유지):
+- 먼저 변경 파일 목록과 필요한 인터페이스를 찾고 관련 파일/줄 범위만 읽는다. 같은 문서·전체 저장소·장시간 로그를 반복 출력하지 않는다. 이미지/오디오 바이너리, base64, 대형 관측 JSONL은 본문에 덤프하지 않는다.
+- 필수 실행 검사와 독립 검토는 생략하지 않는다. 동일 코드·환경에서 이미 확인한 동일 검사를 이유 없이 반복하지 않는다. 변경·실패·새 의심이 생기면 관련 회귀 검사를 다시 실행한다.
+- 재작업은 기존 산출물과 반려 근거를 먼저 읽고 결함을 고친다. 통과한 아트·음향·기획을 새로 만들거나 이미 결정한 콘셉트를 다시 조사하지 않는다.
+- 로그와 상세 관측은 파일에 보존하고 대화에는 종료 코드·핵심 실패·증거 경로만 출력한다. 보고서에는 필수 요약과 모든 수용 기준별 결과·재현 명령·근거·미확인 사항을 간결히 기록한다. 증거를 버리거나 미확인을 성공으로 꾸미지 않는다.`
+
 export function gamePlanProblem(plan: CeoPlan, project: string): string | null {
   const ts = plan.tasks
   if (ts.length > 20) return '게임팀 작업은 최대 20개입니다'

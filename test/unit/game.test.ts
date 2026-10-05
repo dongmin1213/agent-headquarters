@@ -122,18 +122,23 @@ test('one game request creates and starts a reviewed profession plan without ask
   } finally { h.engine.stop(); await h.close() }
 })
 
-test('game team leader answers a worker question and records its decision without user input', async () => {
-  const h = harness()
-  try {
-    h.projects[0].workflow = 'game'
-    const id = h.plan([task('A', { department: 'gameplay', brief: '[[FAKE:outcome=question]]' })])
-    await h.approve(id)
-    await h.waitFor(() => h.store.task(`${id}.A`)?.status === 'question')
-    assert.equal(h.runner.views().decisions.some(d => d.kind === 'worker_question'), false)
-    await h.engine.tick()
-    assert.match(h.store.taskQuestions(`${id}.A`)[0].answer ?? '', /게임팀장 결정/)
-    assert.ok(h.store.get(`game.decision:${id}.A:1`))
-  } finally { await h.close() }
+test('game team leader uses Sol first and escalates repeated decisions to Astra', async () => {
+  for (const rounds of [0, 1]) {
+    const h = harness()
+    try {
+      h.projects[0].workflow = 'game'
+      const id = h.plan([task('A', { department: 'gameplay', brief: '[[FAKE:outcome=question]]' })])
+      await h.approve(id)
+      await h.waitFor(() => h.store.task(`${id}.A`)?.status === 'question')
+      assert.equal(h.runner.views().decisions.some(d => d.kind === 'worker_question'), false)
+      if (rounds) h.store.set(`game.decisions:${id}.A`, String(rounds))
+      await h.engine.tick()
+      assert.match(h.store.taskQuestions(`${id}.A`)[0].answer ?? '', /게임팀장 결정/)
+      const decision = JSON.parse(h.store.get(`game.decision:${id}.A:${rounds + 1}`)!)
+      assert.equal(decision.model, rounds ? 'opus' : 'sonnet')
+      assert.equal(decision.proceed, true)
+    } finally { await h.close() }
+  }
 })
 
 test('team switches require master auth, persist over scheduler restart and appear in snapshots', async () => {
