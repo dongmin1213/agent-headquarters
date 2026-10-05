@@ -36,7 +36,7 @@ const raw = (o: unknown) => process.stdout.write(JSON.stringify(o) + '\n')
 // Behaviour fixtures use the stable engine vocabulary; the process emits only the native Codex protocol.
 const calls = new Map<string, string>()
 const emit = (o: any) => {
-  if (o.type === 'system') { raw({type:'thread.started', thread_id:sid, argv, cwd:process.cwd()}); raw({type:'turn.started'}); return }
+  if (o.type === 'system') { raw({type:'thread.started', thread_id:sid, argv, cwd:process.cwd(), codex_home:process.env.CODEX_HOME}); raw({type:'turn.started'}); return }
   if (o.type === 'rate_limit_event') { raw(o); return } // explicit quota injection for the engine's quota tests
   if (o.type === 'result') {
     if (o.is_error) { raw({type:'turn.failed', error:{message:o.result ?? o.subtype ?? 'error', status_code:o.api_error_status}}); return }

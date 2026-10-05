@@ -10,7 +10,7 @@ import { cacheEnv, childEnv, isCacheDir, makeCacheDir, sandboxProfile, wrap, typ
 
 export type Role = 'implement' | 'collect' | 'review'
 /** `cacheDir`: the per-launch package-manager cache (§6.2), removed once the attempt's process group is gone. */
-export interface ProcessInfo { pid: number; startedAt: string; sessionId: string; lstart: string | null; cacheDir?: string }
+export interface ProcessInfo { codexHomeKey?: string; pid: number; startedAt: string; sessionId: string; lstart: string | null; cacheDir?: string }
 
 const modelArg = (cfg: HqConfig, m: string) => cfg.models[m as keyof HqConfig['models']] ?? m
 
@@ -185,12 +185,13 @@ export class LaunchAborted extends Error {}
  * as its own process group, and records process.json atomically. Throws when the process cannot start.
  * `proceed` is asked right before the spawn (there is no await between the two); false → LaunchAborted, nothing spawned.
  */
-export async function launch(o: { codexBin: string; argv: string[]; cwd: string; hqDir: string; outDir: string | null; prompt: string; sessionId: string; spec: object; schema?: object; sandbox: SandboxOpts; proceed?: () => boolean }, ps: PsLstart = psLstart): Promise<Launched> {
+export async function launch(o: { codexBin: string; argv: string[]; cwd: string; hqDir: string; outDir: string | null; prompt: string; sessionId: string; spec: object; schema?: object; codexHomeKey?: string; sandbox: SandboxOpts; proceed?: () => boolean }, ps: PsLstart = psLstart): Promise<Launched> {
   mkdirSync(o.hqDir, { recursive: true })
   if (o.outDir) mkdirSync(o.outDir, { recursive: true })
   atomicWrite(join(o.hqDir, 'prompt.md'), o.prompt)
   const profile = join(o.hqDir, 'sandbox.sb')
-  const codexHome = prepareCodexHome(o.sandbox.hqHome, o.cwd)
+  const codexHomeKey = o.codexHomeKey ?? o.cwd
+  const codexHome = prepareCodexHome(o.sandbox.hqHome, codexHomeKey)
   const schemaPath = o.schema ? join(codexHome, 'output-schema.json') : null
   if (schemaPath) atomicJson(schemaPath, strictSchema(o.schema))
   atomicWrite(profile, sandboxProfile({ ...o.sandbox, codexHome }))
@@ -221,7 +222,7 @@ export async function launch(o: { codexBin: string; argv: string[]; cwd: string;
   child.unref()
   // ps may be unavailable (e.g. setuid exec denied inside a sandbox); the worker is already running and must be tracked.
   // A null lstart makes its identity `unknown` after the handle is gone (e.g. after a restart): never signalled.
-  const info: ProcessInfo = { pid, startedAt: new Date().toISOString(), sessionId: o.sessionId, lstart: exit.exited ? null : await safeLstart(ps, pid), cacheDir }
+  const info: ProcessInfo = { codexHomeKey, pid, startedAt: new Date().toISOString(), sessionId: o.sessionId, lstart: exit.exited ? null : await safeLstart(ps, pid), cacheDir }
   atomicJson(join(o.hqDir, 'process.json'), info)
   return { info, child, exit }
 }

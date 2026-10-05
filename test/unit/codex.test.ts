@@ -87,10 +87,20 @@ test('private Codex home: credentials only, protected modes, refreshed auth reta
     assert.match(readFileSync(join(home, 'auth.json'), 'utf8'), /refreshed/)
     const victim = join(root, 'victim'); writeFileSync(victim, 'untouched')
     rmSync(join(home, 'auth.json')); symlinkSync(victim, join(home, 'auth.json'))
+    // Even an unchanged source must replace a missing or symlinked destination.
+    prepareCodexHome(join(root, 'hq'), 'task-a', source)
+    assert.equal(statSync(join(home, 'auth.json')).isFile(), true)
+    assert.equal(readFileSync(victim, 'utf8'), 'untouched')
+    rmSync(join(home, 'auth.json'))
+    prepareCodexHome(join(root, 'hq'), 'task-a', source)
+    assert.equal(existsSync(join(home, 'auth.json')), true)
     writeFileSync(join(source, 'auth.json'), '{"dummy":2}')
     prepareCodexHome(join(root, 'hq'), 'task-a', source)
     assert.equal(readFileSync(victim, 'utf8'), 'untouched')
     assert.notEqual(prepareCodexHome(join(root, 'hq'), 'task-b', source), home)
+    rmSync(join(source, 'auth.json'))
+    prepareCodexHome(join(root, 'hq'), 'task-a', source)
+    assert.equal(existsSync(join(home, 'auth.json')), false, 'source logout clears the private login')
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 

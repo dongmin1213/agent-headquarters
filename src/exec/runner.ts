@@ -1009,18 +1009,21 @@ export class Runner {
         if (envMsg) throw new Setup(envMsg)
       }
       const role = t.role === 'collect' ? 'collect' : 'implement'
-      let prompt: string
+      const request = this.store.request(t.request_id)!
+      t = this.store.task(t.id)!
+      // A legacy thread starts fresh in Codex; every resume also needs the current checkout and full brief.
+      let prompt = workPrompt({ task: specOf(t), requestText: request.text, projectName: project.name, cwd, branch: role === 'implement' ? 'hq-work' : null, base: t.base_sha!,
+        out, token: att.attempt_token, rework: t.note && prev ? this.reworkText(t, prev) : null, dirtyNotice: null, upstream: this.upstream(t) })
       if (resume) {
-        const answers = prev ? this.store.taskQuestions(t.id, prev.id).filter((q) => q.answer !== null).map((q) => ({ question: q.question, answer: q.answer! })) : []
-        prompt = resumePrompt({ answers, out, token: att.attempt_token, role, base: t.base_sha! })
-      } else {
-        const request = this.store.request(t.request_id)!
-        prompt = workPrompt({ task: specOf(t), requestText: request.text, projectName: project.name, cwd, branch: role === 'implement' ? 'hq-work' : null, base: t.base_sha!,
-          out, token: att.attempt_token, rework: t.note && prev ? this.reworkText(t, prev) : null, dirtyNotice: null, upstream: this.upstream(t) })
+        const answers = this.store.taskQuestions(t.id).filter(q => q.answer !== null).map(q => ({ question: q.question, answer: q.answer! }))
+        prompt += '\n\n' + resumePrompt({ answers, out, token: att.attempt_token, role, base: t.base_sha! })
       }
+      // Collect creates a new read-only checkout per attempt, but the Codex thread stays in the original private home.
+      const codexHomeKey = resume && prev ? readProcessInfo(hqDirOf(prev))?.codexHomeKey
+        ?? readJson<{ cwd?: string }>(join(hqDirOf(prev), 'spec.json'))?.cwd : undefined
       const argv = codexArgs(this.cfg, { role, model: att.model, sessionId: att.session_id, resume, out })
       gate()
-      const { info, child, exit } = await launch({ codexBin: this.cfg.codexBin, argv, cwd, hqDir: hq, outDir: out, prompt, sessionId: att.session_id,
+      const { info, child, exit } = await launch({ codexBin: this.cfg.codexBin, argv, cwd, hqDir: hq, outDir: out, prompt, sessionId: att.session_id, codexHomeKey,
         sandbox: { ...this.sandboxFor(cwd, out, t.project), readOnlyWorktree: role === 'collect' }, proceed: () => !this.startBlocker(attemptId, 'running'),
         spec: { attemptId, kind: 'work', role, model: att.model, base: t.base_sha, generation: att.generation, attempt_token: att.attempt_token, resume, startedAt: this.iso() } })
       const startedAt = this.iso()

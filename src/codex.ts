@@ -2,7 +2,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import type { Store } from './store.ts'
@@ -27,12 +27,12 @@ export function prepareCodexHome(root: string, key: string, source = process.env
   if (!lstatSync(dir).isDirectory() || lstatSync(dir).isSymbolicLink()) throw new Error('Codex 실행 폴더가 실제 디렉터리가 아닙니다')
   chmodSync(dir, 0o700)
   const auth = join(source, 'auth.json')
+  const dest = join(dir, 'auth.json'), stamp = join(dir, '.source-auth-hash')
   if (existsSync(auth)) {
     const data = readFileSync(auth)
     const hash = createHash('sha256').update(data).digest('hex')
-    const stamp = join(dir, '.source-auth-hash')
     // Preserve a token refreshed by this isolated CLI unless the user's login changed.
-    if (!existsSync(stamp) || lstatSync(stamp).isSymbolicLink() || lstatSync(stamp).size !== 64 || readFileSync(stamp, 'utf8') !== hash) {
+    if (!existsSync(dest) || lstatSync(dest).isSymbolicLink() || !lstatSync(dest).isFile() || !existsSync(stamp) || lstatSync(stamp).isSymbolicLink() || lstatSync(stamp).size !== 64 || readFileSync(stamp, 'utf8') !== hash) {
       // Rename replaces a malicious destination symlink rather than following it outside this directory.
       const tmp = join(dir, `.auth-${process.pid}-${randomUUID()}`)
       writeFileSync(tmp, data, { mode: 0o600, flag: 'wx' })
@@ -40,6 +40,10 @@ export function prepareCodexHome(root: string, key: string, source = process.env
       writeFileSync(tmp, hash, { mode: 0o600, flag: 'wx' })
       renameSync(tmp, stamp)
     }
+  } else {
+    // A source logout must not leave an authenticated private copy behind.
+    rmSync(dest, { force: true })
+    rmSync(stamp, { force: true })
   }
   return dir
 }
