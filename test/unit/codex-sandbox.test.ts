@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { teamProfile } from '../../src/scheduler.ts'
 import { sandboxProfile } from '../../src/exec/sandbox.ts'
 import { runSandboxed } from '../../src/exec/checks.ts'
 import { NESTED_SKIP, nestedSandbox } from '../nested.ts'
@@ -26,5 +27,25 @@ test('Codex profile grants only its isolated state; collect cannot write checkou
     assert.equal((await run(`echo x > '${join(out, 'report.md')}'`)).pass, true)
     assert.equal((await run(`echo x > '${join(own, 'session.json')}'`)).pass, true)
     assert.equal((await run(`echo x > '${join(home, '.codex/settings.json')}'`)).pass, false)
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test('Codex team state is isolated from personal Codex and legacy Claude sessions', { skip: nestedSandbox && NESTED_SKIP }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'hq-codex-team-'))
+  const home = join(root, 'user'), hqHome = join(root, 'hq'), cwd = join(root, 'repo'), codexHome = join(hqHome, 'codex/own')
+  const denied = [join(home, '.codex/auth.json'), join(home, '.claude/projects/legacy/session.json'), join(hqHome, 'codex/other/auth.json')]
+  for (const p of [cwd, codexHome, ...denied.map(f => join(f, '..'))]) mkdirSync(p, { recursive: true })
+  for (const f of denied) writeFileSync(f, 'dummy')
+  const profile = join(root, 'team.sb')
+  writeFileSync(profile, teamProfile({ home, hqHome, cwd, codexHome, tokenDir: join(root, 'tokens') }))
+  const run = (cmd: string) => runSandboxed(cmd, cwd, 5000, profile)
+  try {
+    for (const f of denied) {
+      assert.equal((await run(`cat '${f}'`)).pass, false, f)
+      assert.equal((await run(`echo x > '${f}'`)).pass, false, f)
+    }
+    assert.equal((await run(`echo x > '${join(codexHome, 'session.json')}'`)).pass, true)
+    assert.equal((await run(`cat '${join(codexHome, 'session.json')}'`)).pass, true)
+    assert.equal((await run(`echo x > '${join(cwd, 'facts.json')}'`)).pass, true)
   } finally { rmSync(root, { recursive: true, force: true }) }
 })

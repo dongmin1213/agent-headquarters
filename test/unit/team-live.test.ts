@@ -1,12 +1,12 @@
-// Legacy external pipeline contract; not part of HQ Codex runtime smoke tests.
+// The registered revenue pipeline uses the same Codex provider as HQ.
 // Opt-in (HQ_LIVE_PIPELINE=1): the revenue team's real shape under the team Seatbelt profile, without touching the real repo.
 // The pipeline repo (~/Desktop/side/pipeline, override with HQ_PIPELINE) is git-cloned into a temp folder under $HOME
 // (so the ~ read deny-by-default is exercised; episodes/, state/, config secrets are gitignored and stay behind), its
 // .venv is symlinked read-only from the real repo, and everything runs through the scheduler's own profile builder.
 //   (a) .venv python imports lib.state and lib.llm
 //   (b) hq_team.py through a real Scheduler run against a fake hq whose quota mode is 'save' → exit 0 + STATUS line
-//   (c) one real `claude -p --model haiku --max-turns 1` in the clone (as lib/llm.py calls it: default setting sources)
-// The clone, its ~/.claude/projects/<cwd>/ folder and the per-run caches are removed afterwards.
+//   (c) real pipeline ask_json calls, with and without live web search, under the team profile
+// The clone, private authentication copy and per-run caches are removed afterwards.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync, spawn } from 'node:child_process'
@@ -16,15 +16,16 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { Bus } from '../../src/bus.ts'
 import { Scheduler, teamProfile, teamSandboxPaths } from '../../src/scheduler.ts'
-import { cacheEnv, claudeProjectDir, makeCacheDir, real, wrap } from '../../src/exec/sandbox.ts'
+import { cacheEnv, makeCacheDir, real, wrap } from '../../src/exec/sandbox.ts'
 import { removeCacheDir } from '../../src/exec/worker.ts'
+import { prepareCodexHome } from '../../src/codex.ts'
 import { Store } from '../../src/store.ts'
 import type { TeamConfig } from '../../src/types.ts'
 import { tmp } from './helpers.ts'
 import { NESTED_SKIP, nestedSandbox } from '../nested.ts'
 
 const PIPELINE = process.env.HQ_PIPELINE ?? join(homedir(), 'Desktop/side/pipeline')
-const skip = (nestedSandbox && NESTED_SKIP) || (!process.env.HQ_LIVE_PIPELINE && 'HQ_LIVE_PIPELINE=1 일 때만 실제 파이프라인·claude CLI로 실행')
+const skip = (nestedSandbox && NESTED_SKIP) || (!process.env.HQ_LIVE_PIPELINE && 'HQ_LIVE_PIPELINE=1 일 때만 실제 파이프라인·Codex CLI로 실행')
   || (!existsSync(join(PIPELINE, 'hq_team.py')) && `파이프라인 저장소 없음: ${PIPELINE}`)
 
 function run(argv: string[], cwd: string, env: NodeJS.ProcessEnv, ms = 180_000): Promise<{ code: number | null; out: string }> {
@@ -37,13 +38,12 @@ function run(argv: string[], cwd: string, env: NodeJS.ProcessEnv, ms = 180_000):
   })
 }
 
-test('live: the revenue pipeline (clone) under the team profile — imports, hq_team.py via the scheduler, claude -p', { skip }, async (t) => {
+test('live: the revenue pipeline (clone) under the team profile — imports, hq_team.py via the scheduler, Codex research', { skip }, async (t) => {
   const root = mkdtempSync(join(real(homedir()), '.hq-live-team-'))
   const clone = join(root, 'pipeline')
   const dir = tmp('hq-team-live-')
   const hqHome = join(dir, 'hq'), tokenDir = join(dir, 'tok')
   const venv = realpathSync(join(PIPELINE, '.venv'))
-  const claudeDir = join(real(homedir()), '.claude', 'projects', claudeProjectDir(real(clone)).name)
   const seen: string[] = []
   const server = createServer((req, res) => {
     seen.push(`${req.method} ${req.url}`)
@@ -61,9 +61,10 @@ test('live: the revenue pipeline (clone) under the team profile — imports, hq_
       everyMinutes: 30, enabled: true, sandbox: { readable: [venv] } }
     const paths = teamSandboxPaths(team)
     assert.notEqual(paths, 'none')
+    const codexHome = prepareCodexHome(hqHome, 'team:revenue', process.env.HQ_CODEX_AUTH_SOURCE)
     const profile = join(dir, 'team.sb')
-    writeFileSync(profile, teamProfile({ cwd: clone, hqHome, tokenDir, ...(paths as { readable: string[]; writable: string[] }) }))
-    const env = () => { const c = makeCacheDir(); caches.push(c); const e: NodeJS.ProcessEnv = { ...process.env, ...cacheEnv(c) }; delete e.CLAUDECODE; return e }
+    writeFileSync(profile, teamProfile({ codexHome, cwd: clone, hqHome, tokenDir, ...(paths as { readable: string[]; writable: string[] }) }))
+    const env = () => { const c = makeCacheDir(); caches.push(c); const e: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: codexHome, ...cacheEnv(c) }; delete e.CLAUDECODE; return e }
 
     // (a)
     const a = await run(wrap([join(clone, '.venv/bin/python'), '-c', 'import lib.state, lib.llm; print("IMPORT-OK")'], profile), clone, env())
@@ -85,18 +86,23 @@ test('live: the revenue pipeline (clone) under the team profile — imports, hq_
       assert.equal(sched.views()[0].bubble, '사용량 절약 중이라 쉬어요 (hq 모드: save)')
     } finally { sched.stop(); store.close() }
 
-    // (c) as lib/llm.py runs it (no --setting-sources): the CLI must work with ~/.claude.json and settings unreadable.
-    const bin = execFileSync('/bin/sh', ['-c', 'command -v claude'], { encoding: 'utf8' }).trim()
-    const c = await run(wrap([bin, '-p', 'reply OK', '--model', 'haiku', '--max-turns', '1', '--output-format', 'json'], profile), clone, env())
+    // (c) Exercise the actual Python backend and configured model, not a separately assembled CLI command.
+    const script = `from lib.llm import ask_json
+v, m = ask_json('JSON으로 답하라.', 'answer 키에 PIPELINE CODEX OK를 넣어라.', timeout=90)
+assert v == {'answer': 'PIPELINE CODEX OK'}, v
+assert m['backend'] == 'codex' and m['web_searches'] == 0, m
+v, m = ask_json('웹에서 확인한 뒤 JSON으로 답하라.', '웹 도구로 https://example.com 페이지를 열고 title과 url을 반환하라.', web_search=True, timeout=120)
+assert 'example' in v.get('title', '').lower(), v
+assert m['web_searches'] > 0, m
+print('CODEX-PIPELINE-OK', m['model'], m['web_searches'])`
+    const c = await run(wrap([join(clone, '.venv/bin/python'), '-c', script], profile), clone, env())
     t.diagnostic(`(c) exit ${c.code}: ${c.out.trim().slice(-600)}`)
     assert.equal(c.code, 0, c.out)
-    const res = JSON.parse(c.out.trim().split('\n').at(-1)!)
-    assert.equal(res.is_error, false, c.out)
-    assert.match(String(res.result), /OK/)
+    assert.match(c.out, /CODEX-PIPELINE-OK/)
+
   } finally {
     server.close()
     rmSync(root, { recursive: true, force: true })
-    rmSync(claudeDir, { recursive: true, force: true })
     for (const c of caches) removeCacheDir(c)
     rmSync(dir, { recursive: true, force: true })
   }

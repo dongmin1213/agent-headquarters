@@ -1,6 +1,6 @@
 // Runs each team's command on its schedule. Exit-code contract for team commands:
 //   0  = did work or nothing to do     3  = waiting for chairman approval
-//   75 = hit the Claude usage limit (EX_TEMPFAIL)   other = error
+//   75 = hit the Codex usage limit (EX_TEMPFAIL)   other = error
 // A team reports progress by printing lines starting with "STATUS:" (shown as the pet's bubble).
 //
 // Least privilege (teams are trusted user code, but they read the web): each run gets a scoped API token (quota +
@@ -141,6 +141,7 @@ export function teamProfile(o: TeamProfileOpts): string {
     ...claudeWriteRules(home, claude),
     `(deny file-read-data file-write* ${[...new Set([o.tokenDir, o.hqHome].map(subpathOf))].join(' ')} ${homeSecretFilters(home).join(' ')})`,
     ...(o.codexHome ? ['(allow mach-lookup (global-name "com.apple.trustd.agent")) ; Codex TLS certificate validation', `(allow file-read-data file-write* ${subpathOf(o.codexHome)})`] : []),
+    ...(o.codexHome ? [`(deny file-read-data file-write* ${subpathOf(join(home, '.claude'))} ${subpathOf(join(home, '.codex'))})`] : []),
     ...launchRules(),
     ...(o.hqRoot ? [`(deny file-write* ${subpathOf(o.hqRoot)}) ; the hq repository (daemon code, teams.json)`] : []),
     '',
