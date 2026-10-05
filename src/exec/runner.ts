@@ -1906,7 +1906,7 @@ export class Runner {
     const now = this.store.task(t.id)
     if (!now || now.status !== 'revising' || now.generation !== t.generation || this.store.request(t.request_id)?.status !== 'executing') return
     this.store.updateTask(t.id, { revise_turns: t.revise_turns + 1 })
-    const res = await runReviseTurn({ codexBin: this.cfg.codexBin, runtimeHome: this.cfg.home, model: this.cfg.models.sonnet, hqRoot: this.hqRoot, project, projects: this.projects, requestText: r.text, task: spec, report, diffStat: stat, answers,
+    const res = await runReviseTurn({ codexBin: this.cfg.codexBin, runtimeHome: this.cfg.home, model: this.cfg.models.sonnet, hqRoot: this.hqRoot, project, projects: this.projects, worktree: t.worktree, requestText: r.text, task: spec, report, diffStat: stat, answers,
       onLine: (line) => { if (line.type === 'rate_limit_event') this.observe(line) } })
     if (res.limited) { this.store.updateTask(t.id, { revise_turns: t.revise_turns }); if (this.quota().mode !== 'hold') this.limitBackoff(); return } // not counted
     const cur = this.store.task(t.id)

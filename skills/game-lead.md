@@ -39,3 +39,5 @@ checks에는 boot,movement,combat,progression,save-load,ending 6개가 모두 �
 
 ## 실행 환경
 현재 게임 프로젝트는 macOS 그래픽 실행을 허용하는 별도 격리 규칙을 사용한다. Godot CLI, ffmpeg, ffprobe를 사용할 수 있다. Godot 검사·영상 기록은 `--rendering-method gl_compatibility --audio-driver Dummy` 조합이 검증되어 있다. 논리 검사는 headless, 실제 화면·영상 기록은 그래픽 모드를 사용한다. 검사/작업마다 HOME과 사용자 저장 영역이 임시 폴더로 분리되므로 저장/불러오기 검사는 같은 검사 실행 안에서 수행하고 다른 검사의 user://에 의존하지 않는다. --write-movie로 실제 프레임을 기록하고 ffmpeg로 mp4를 만들 수 있다. 임시 캐시는 커밋하지 않는다.
+
+게임 격리 환경은 CoreAudio 출력 서비스도 허용한다. 실제 음향 재생 검증에는 `afplay` 또는 실제 오디오 드라이버를 사용하고 Dummy 성공으로 대체하지 않는다. 장치가 보이지 않으면 호스트 자체의 장치 부재와 격리 권한 오류를 구분한다. 재생 성공과 사람이 들었거나 음질을 평가했다는 주장은 별개이며 관측한 근거만 기록한다.

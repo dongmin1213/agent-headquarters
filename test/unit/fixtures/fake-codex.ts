@@ -81,6 +81,7 @@ if (schema && prompt.includes('# 교차 검토')) {
 if (schema && prompt.includes('## 이번 턴: 지시서 수정')) {
   const m = /## 원래 작업 \(PlanTask JSON\)\n```json\n([\s\S]*?)\n```/.exec(prompt)
   const task = JSON.parse(m![1])
+  if (mk('reviseread')) task.brief += ` (checkout evidence: ${readFileSync(mk('reviseread')!, 'utf8').trim()})`
   const mode = mk('revise') ?? 'same'
   const answered = /## 회장이 답한 질문\n((?:- .*\n?)+)/.exec(prompt)?.[1].trim()
   if (mode === 'question' && !answered) result({ structured_output: { revised_task: null, questions: [{ question: '어느 쪽?', options: ['A', 'B'], default: 'A', reason: '모호' }] } })

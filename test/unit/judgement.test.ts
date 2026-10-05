@@ -14,7 +14,7 @@ import { ensureMirror, fetchWork, newWorkClone, verifyWorktree } from '../../src
 import { checkVerdict } from '../../src/exec/review.ts'
 import * as revise from '../../src/exec/revise.ts'
 import type { SandboxOpts } from '../../src/exec/sandbox.ts'
-import { commitFile, harness, makeRepo, req, sh, task, tmp, tsk, type Harness } from './helpers.ts'
+import { commitFile, harness, makeRepo, req, sh, task, tmp, tsk, ROOT, type Harness } from './helpers.ts'
 import { useFakeSandboxIfNested } from '../nested.ts'
 
 useFakeSandboxIfNested()
@@ -306,6 +306,18 @@ test('F10. revise cannot change id, project or role', async () => {
 })
 
 // ----- F16 -----
+test('brief revision reads the worker checkout containing submitted evidence', async () => {
+  const h = harness()
+  try {
+    const wt = makeRepo(join(h.dir, 'submitted'), { 'artifact.txt': 'existing audio evidence' })
+    const res = await revise.runReviseTurn({ codexBin: h.cfg.codexBin, runtimeHome: h.cfg.home, hqRoot: ROOT,
+      project: h.projects[0], projects: h.projects, worktree: wt, requestText: 'inspect existing output',
+      task: task('A', { brief: '[[FAKE:reviseread=artifact.txt]]' }), report: 'artifact.txt exists in worker checkout', diffStat: 'artifact.txt | 1 +' })
+    assert.equal(res.ok, true, res.error ?? '')
+    assert.match(res.output!.revised_task!.brief, /checkout evidence: existing audio evidence/)
+  } finally { await h.close() }
+})
+
 test('F16. revise questions become task questions; answering re-runs the revise turn with the answers', async () => {
   const h = harness()
   try {

@@ -33,7 +33,7 @@ export interface SandboxOpts {
   /** Dedicated Codex auth/session store; never the personal ~/.codex. */
   codexHome?: string
   readOnlyWorktree?: boolean
-  /** Explicit game-project capability: render a local game, without enabling LaunchServices/app launch. */
+  /** Explicit game-project capability: render/play local game audio, without enabling LaunchServices/app launch. */
   graphics?: boolean
 }
 
@@ -79,8 +79,9 @@ export const TEAM_MACH_ALLOWED: [string, string][] = [
   ['com.apple.trustd.agent', 'certificate validation for Security.framework TLS clients (e.g. Go binaries such as the Higgsfield CLI)'],
 ]
 
-/** Measured Godot OpenGL viewport capture on macOS. Only opted-in game projects receive these. */
-export const GAME_MACH_SERVICES = ['com.apple.hiservices-xpcservice', 'com.apple.windowserver.active', 'com.apple.windowserver', 'com.apple.CARenderServer', 'com.apple.MTLCompilerService']
+/** Measured Godot rendering and afplay output on macOS. Only opted-in game projects receive these. */
+export const GAME_MACH_SERVICES = ['com.apple.hiservices-xpcservice', 'com.apple.windowserver.active', 'com.apple.windowserver', 'com.apple.CARenderServer', 'com.apple.MTLCompilerService',
+  'com.apple.audio.audiohald', 'com.apple.audio.AudioComponentRegistrar']
 
 /**
  * ~ entries the sandbox may read; everything else under $HOME (~/.codex, ~/.config/*, ~/Library/Application Support,

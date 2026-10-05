@@ -17,6 +17,35 @@ test('graphics capability is limited to game profiles and keeps launch tools den
   assert.ok(!sandboxProfile({ ...o, graphics: true }).includes('allow mach-lookup (global-name "com.apple.coreservices.launchservicesd")'))
 })
 
+test('live game sandbox plays real audio while regular workers and HQ secrets stay isolated', {
+  skip: !process.env.HQ_LIVE_GAME_AUDIO && 'HQ_LIVE_GAME_AUDIO=1 requires a local audio output device', timeout: 30_000,
+}, async () => {
+  const root = tmp('hq-game-audio-'), cwd = join(root, 'game'), tokenDir = join(root, 'tokens')
+  mkdirSync(cwd); mkdirSync(tokenDir)
+  const secret = join(tokenDir, 'token'); writeFileSync(secret, 'test-only-secret')
+  // A quiet 0.2-second PCM tone; this checks real output, not subjective sound quality.
+  const rate = 22050, frames = 4410, wav = Buffer.alloc(44 + frames * 2)
+  wav.write('RIFF'); wav.writeUInt32LE(wav.length - 8, 4); wav.write('WAVEfmt ', 8)
+  wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22)
+  wav.writeUInt32LE(rate, 24); wav.writeUInt32LE(rate * 2, 28); wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34)
+  wav.write('data', 36); wav.writeUInt32LE(frames * 2, 40)
+  for (let i = 0; i < frames; i++) wav.writeInt16LE(Math.round(300 * Math.sin(2 * Math.PI * 440 * i / rate)), 44 + i * 2)
+  writeFileSync(join(cwd, 'tone.wav'), wav)
+  const profile = join(root, 'sandbox.sb')
+  const options = { worktree: cwd, out: null, hqHome: join(root, 'hq'), tokenDir, hqPort: 18649, extraWritable: [], projects: [] }
+  try {
+    writeFileSync(profile, sandboxProfile(options))
+    const denied = await runSandboxed('/usr/bin/afplay -v 0.1 tone.wav', cwd, 5000, profile, 'audio-denied', undefined, true)
+    assert.equal(denied.pass, false, 'ordinary workers do not acquire audio access')
+    writeFileSync(profile, sandboxProfile({ ...options, graphics: true }))
+    const played = await runSandboxed('/usr/bin/afplay -v 0.1 tone.wav', cwd, 5000, profile, 'audio-output', undefined, true)
+    assert.equal(played.pass, true, played.outputTail)
+    const readSecret = await runSandboxed(`/bin/cat ${secret}`, cwd, 5000, profile, 'secret', undefined, true)
+    assert.equal(readSecret.pass, false)
+    assert.ok(!readSecret.outputTail.includes('test-only-secret'))
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 test('live game sandbox renders a viewport, records a playable video and denies HQ secrets', {
   skip: !process.env.HQ_LIVE_GAME_RENDER && 'HQ_LIVE_GAME_RENDER=1 requires Godot, ffmpeg and a local display', timeout: 60_000,
 }, async () => {
