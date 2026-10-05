@@ -26,10 +26,13 @@ export interface SandboxOpts {
   projects: string[]
   /** The hq bare mirror the worktree borrows objects from (read-only), or null. */
   mirror?: string | null
-  /** Extra read-only roots, e.g. the folder of a configured absolute `claudeBin` (see claudeBinReadable). */
+  /** Extra read-only roots, e.g. the folder of a configured absolute `codexBin` (see codexBinReadable). */
   readable?: string[]
   /** Home directory for ~ paths (tests use a fake one). */
   home?: string
+  /** Dedicated Codex auth/session store; never the personal ~/.codex. */
+  codexHome?: string
+  readOnlyWorktree?: boolean
 }
 
 /** Seatbelt matches resolved paths (/var → /private/var); resolve the deepest existing ancestor. */
@@ -205,14 +208,17 @@ export function sandboxProfile(o: SandboxOpts): string {
     `(deny file-write* ${[sub(hq), ...projects.map(sub)].join(' ')})`,
     `(allow file-write* ${own.map(sub).join(' ')})`,
     ...claudeWriteRules(home, claude),
+    ...(o.codexHome ? ['(allow mach-lookup (global-name "com.apple.trustd.agent")) ; Codex TLS certificate validation', `(allow file-read-data file-write* ${sub(real(o.codexHome))})`] : []),
+    ...(o.codexHome ? [`(deny file-read-data file-write* ${sub(join(home, '.claude'))} ${rx(`^${reEsc(home)}/\\.claude\\.json`)} ${sub(join(home, '.codex'))})`] : []),
+    ...(o.readOnlyWorktree ? [`(deny file-write* ${sub(real(o.worktree))})`] : []),
     ...launchRules(),
     hqPortRule(o.hqPort),
     '',
   ].join('\n')
 }
 
-/** Read root for a configured absolute `claudeBin` outside the allow-list (its resolved folder), else nothing. */
-export function claudeBinReadable(bin: string): string[] {
+/** Read root for a configured absolute `codexBin` outside the allow-list (its resolved folder), else nothing. */
+export function codexBinReadable(bin: string): string[] {
   if (!bin.startsWith('/') || !existsSync(bin)) return []
   return [dirname(realpathSync(bin))]
 }

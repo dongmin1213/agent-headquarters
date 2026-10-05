@@ -6,6 +6,7 @@
 //   review: review=pass|block|invalid|faketest|badexit|manualall (every criterion answered `manual`)
 //   revise: revise=same|widen|question (questions until the prompt carries the chairman's answers)|role (changes the role)
 //   work:   evilgit (adds a commit whose tree has an entry named `.git`)
+import { randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -13,11 +14,13 @@ import { tmpdir } from 'node:os'
 
 const argv = process.argv.slice(2)
 const arg = (f: string) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : null }
-const resume = argv.includes('--resume')
-const sid = arg('--session-id') ?? arg('--resume') ?? 'no-session'
-const schema = argv.includes('--json-schema')
+if (argv[0] !== 'exec' || !argv.includes('--json') || argv.some(a => ['-p','--json-schema','--session-id','--allowedTools','--permission-mode'].includes(a))) throw new Error('Expected native codex exec argv: ' + JSON.stringify(argv))
+const resume = argv.includes('resume')
+const sid = arg('resume') ?? randomUUID()
+const schema = argv.includes('--output-schema')
+if (schema) JSON.parse(readFileSync(arg('--output-schema')!, 'utf8'))
 const prompt = readFileSync(0, 'utf8')
-const stateFile = join(process.env.TMPDIR ?? tmpdir(), `fake-claude-${sid}.json`)
+const stateFile = join(process.env.TMPDIR ?? tmpdir(), `fake-codex-${sid}.json`)
 
 const parse = (text: string) => {
   const m: Record<string, string[]> = {}
@@ -29,7 +32,23 @@ if (resume && existsSync(stateFile)) marks = { ...JSON.parse(readFileSync(stateF
 else if (!schema) { try { writeFileSync(stateFile, JSON.stringify(marks)) } catch { /* sandbox */ } }
 const mk = (k: string) => marks[k]?.[0] ?? null
 
-const emit = (o: unknown) => process.stdout.write(JSON.stringify(o) + '\n')
+const raw = (o: unknown) => process.stdout.write(JSON.stringify(o) + '\n')
+// Behaviour fixtures use the stable engine vocabulary; the process emits only the native Codex protocol.
+const calls = new Map<string, string>()
+const emit = (o: any) => {
+  if (o.type === 'system') { raw({type:'thread.started', thread_id:sid, argv, cwd:process.cwd()}); raw({type:'turn.started'}); return }
+  if (o.type === 'rate_limit_event') { raw(o); return } // explicit quota injection for the engine's quota tests
+  if (o.type === 'result') {
+    if (o.is_error) { raw({type:'turn.failed', error:{message:o.result ?? o.subtype ?? 'error', status_code:o.api_error_status}}); return }
+    raw({type:'item.completed', item:{id:'final', type:'agent_message', text:o.structured_output ? JSON.stringify(o.structured_output) : o.result}})
+    raw({type:'turn.completed', usage:o.usage}); return
+  }
+  for (const c of o.message?.content ?? []) {
+    if(c.type==='text') raw({type:'item.completed',item:{id:'text',type:'agent_message',text:c.text}})
+    if(c.type==='tool_use') { calls.set(c.id,c.input.command); raw({type:'item.started',item:{id:c.id,type:'command_execution',command:c.input.command,status:'in_progress'}}) }
+    if(c.type==='tool_result') raw({type:'item.completed',item:{id:c.tool_use_id,type:'command_execution',command:calls.get(c.tool_use_id),status:'completed',exit_code:c.is_error ? Number(/^Exit code (\d+)/.exec(c.content)?.[1] ?? 1) : 0,aggregated_output:c.content}})
+  }
+}
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const now = Math.floor(Date.now() / 1000)
 emit({ type: 'system', subtype: 'init', session_id: sid, argv, cwd: process.cwd() })

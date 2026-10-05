@@ -83,32 +83,30 @@ export async function runDoctor(ctx: Ctx, p: Probes): Promise<Check[]> {
   if (major(nv) >= MIN_NODE) add('node', 'Node', 'ok', `Node ${nv}`)
   else add('node', 'Node', 'fail', `Node ${nv} (필요: ${MIN_NODE} 이상)`, `Node ${MIN_NODE}+ 설치: brew install node 또는 https://nodejs.org`)
 
-  // Config (also tells us which claude binary the daemon will use)
-  let claudeName = 'claude'
+  // Config (also tells us which Codex binary the daemon will use)
+  let codexName = 'codex'
   try {
     const c = loadConfig(ctx.root, ctx.env)
-    claudeName = c.claudeBin
+    codexName = c.codexBin
     add('config', '설정 (config/hq.json)', 'ok', existsSync(join(ctx.root, 'config/hq.json')) ? '유효함' : '파일 없음 → 기본값 사용')
   } catch (e) {
     add('config', '설정 (config/hq.json)', 'fail', (e as Error).message, 'config/hq.json을 고치세요 (docs/SETUP.md "설정" 참고). 모든 키는 선택입니다')
   }
 
-  // Claude CLI
-  const claude = p.findBin(claudeName)
-  if (!claude) {
-    add('claude', 'Claude CLI', 'fail', `'${claudeName}' 실행 파일을 PATH에서 찾지 못함`, 'Claude Code 설치: npm install -g @anthropic-ai/claude-code (설치 후 claude 한 번 실행해 로그인)')
-    add('claude-auth', 'Claude 로그인', 'fail', 'CLI가 없어 확인 불가', 'Claude CLI 설치 후 `claude` 실행 → /login')
+  // Codex CLI
+  const codex = p.findBin(codexName)
+  if (!codex) {
+    add('codex', 'Codex CLI', 'fail', `'${codexName}' 실행 파일을 PATH에서 찾지 못함`, 'Codex CLI 설치: npm install -g @openai/codex (설치 후 codex login으로 로그인)')
+    add('codex-auth', 'Codex 로그인', 'fail', 'CLI가 없어 확인 불가', 'Codex CLI 설치 후 `codex login`')
   } else {
-    const ver = await p.run(claude, ['--version'])
-    add('claude', 'Claude CLI', ver.code === 0 ? 'ok' : 'fail', ver.code === 0 ? `${firstLine(ver.stdout)} (${claude})` : `실행 실패 (exit ${ver.code})`,
-      'Claude Code를 다시 설치하세요: npm install -g @anthropic-ai/claude-code')
-    const auth = await p.run(claude, ['auth', 'status'])
-    let loggedIn: boolean | null = null
-    try { loggedIn = JSON.parse(auth.stdout).loggedIn === true } catch { loggedIn = null }
-    // Only the boolean is reported: auth status also prints the account e-mail and org, which never leave this function.
-    if (loggedIn === true) add('claude-auth', 'Claude 로그인', 'ok', '로그인됨')
-    else if (loggedIn === false) add('claude-auth', 'Claude 로그인', 'fail', '로그인 안 됨', '`claude` 실행 후 /login 으로 구독 계정에 로그인하세요')
-    else add('claude-auth', 'Claude 로그인', 'warn', '`claude auth status` 결과를 해석하지 못함', 'Claude CLI를 최신으로 업데이트하고 `claude auth status`를 확인하세요')
+    const ver = await p.run(codex, ['--version'])
+    add('codex', 'Codex CLI', ver.code === 0 ? 'ok' : 'fail', ver.code === 0 ? `${firstLine(ver.stdout)} (${codex})` : `실행 실패 (exit ${ver.code})`,
+      'Codex CLI를 다시 설치하세요: npm install -g @openai/codex')
+    const auth = await p.run(codex, ['login', 'status'])
+    const status = `${auth.stdout} ${auth.stderr}`
+    if (auth.code === 0 && /logged in/i.test(status)) add('codex-auth', 'Codex 로그인', 'ok', '로그인됨')
+    else if (/not logged in/i.test(status)) add('codex-auth', 'Codex 로그인', 'fail', '로그인 안 됨', '`codex login`으로 ChatGPT 계정에 로그인하세요')
+    else add('codex-auth', 'Codex 로그인', 'fail', '로그인 상태를 확인하지 못함', '`codex login status`를 확인하세요')
   }
 
   // git

@@ -16,8 +16,8 @@ function probes(over: Partial<Probes> = {}): Probes {
     nodeVersion: () => '26.4.0',
     findBin: (n) => `/fake/bin/${n}`,
     run: async (cmd, args) => {
-      if (cmd.endsWith('claude') && args[0] === '--version') return { code: 0, stdout: '2.1.285 (Claude Code)\n', stderr: '' }
-      if (cmd.endsWith('claude') && args[0] === 'auth') return { code: 0, stdout: JSON.stringify({ loggedIn: true, email: SECRET_EMAIL, orgId: 'org-1' }), stderr: '' }
+      if (cmd.endsWith('codex') && args[0] === '--version') return { code: 0, stdout: '2.1.285 (Claude Code)\n', stderr: '' }
+      if (cmd.endsWith('codex') && args[0] === 'login') return { code: 0, stdout: 'Logged in using ChatGPT\n' + SECRET_EMAIL, stderr: '' }
       if (cmd.endsWith('git') && args[0] === '--version') return { code: 0, stdout: 'git version 2.50.1\n', stderr: '' }
       if (cmd.endsWith('git') && args.includes('--is-inside-work-tree')) return { code: 0, stdout: 'true\n', stderr: '' }
       if (cmd.endsWith('git') && args.includes('--verify')) return { code: 0, stdout: 'abc123\n', stderr: '' }
@@ -80,12 +80,12 @@ test('failures → exit 5, every failure has a fix line', async () => {
   writeFileSync(join(ctx.root, 'config/projects.json'), JSON.stringify([{ id: 'gone', name: 'G', path: '~/gone' }]))
   const p = probes({
     nodeVersion: () => '22.1.0', macVersion: async () => '13.6',
-    findBin: (n) => (n === 'claude' ? null : `/fake/bin/${n}`),
+    findBin: (n) => (n === 'codex' ? null : `/fake/bin/${n}`),
     hq: async () => ({ kind: 'other', status: 404 }),
   })
   const checks = await runDoctor(ctx, p)
   const failed = checks.filter((c) => c.status === 'fail').map((c) => c.id)
-  for (const id of ['macos', 'node', 'config', 'claude', 'claude-auth', 'project:gone', 'token', 'port']) assert.ok(failed.includes(id), `${id} should fail: ${failed}`)
+  for (const id of ['macos', 'node', 'config', 'codex', 'codex-auth', 'project:gone', 'token', 'port']) assert.ok(failed.includes(id), `${id} should fail: ${failed}`)
   for (const c of checks) if (c.status !== 'ok') assert.ok(c.fix, `${c.id} needs a fix`)
   assert.match(checks.find((c) => c.id === 'token')!.fix!, /chmod 600/)
   const code = await doctorCommand(ctx, { json: false, probes: p })
@@ -97,12 +97,12 @@ test('failures → exit 5, every failure has a fix line', async () => {
 test('claude logged out, token mismatch on port', async () => {
   const ctx = healthy()
   const p = probes({
-    run: async (cmd, args) => cmd.endsWith('claude') && args[0] === 'auth' ? { code: 1, stdout: '{"loggedIn":false}', stderr: '' } : probes().run(cmd, args),
+    run: async (cmd, args) => cmd.endsWith('codex') && args[0] === 'login' ? { code: 1, stdout: 'Not logged in', stderr: '' } : probes().run(cmd, args),
     hq: async () => ({ kind: 'unauthorized' }),
   })
   const checks = await runDoctor(ctx, p)
-  assert.equal(checks.find((c) => c.id === 'claude-auth')!.status, 'fail')
-  assert.match(checks.find((c) => c.id === 'claude-auth')!.fix!, /login/)
+  assert.equal(checks.find((c) => c.id === 'codex-auth')!.status, 'fail')
+  assert.match(checks.find((c) => c.id === 'codex-auth')!.fix!, /login/)
   assert.equal(checks.find((c) => c.id === 'port')!.status, 'fail')
 })
 

@@ -56,7 +56,7 @@ test('18. decision items: kind order plan → ceo_question → worker_question �
     s.putApproval({ id: 'accept:req-accept01', teamId: 'hq', subjectId: 'req-accept01', title: 'accept', body: '', options: ['수락', '반려'], subjectHash: 'a' })
     mk('req-integ001', 'blocked')
     s.putApproval({ id: 'integration:req-integ001:p', teamId: 'hq', subjectId: 'req-integ001', title: 'integration', body: '', options: ['다시 통합', '해당 작업 재작업', '요청 중단'], subjectHash: 'i' })
-    s.putApproval({ id: 'system:login', teamId: 'hq', subjectId: '', title: 'Claude 로그인 필요', body: 'Not logged in', options: ['다시 확인'], subjectHash: 'l' })
+    s.putApproval({ id: 'system:login', teamId: 'hq', subjectId: '', title: 'Codex 로그인 필요', body: 'Not logged in', options: ['다시 확인'], subjectHash: 'l' })
     const id = h.plan([task('A'), task('B'), task('C')])
     await h.approve(id)
     s.updateTask(`${id}.A`, { status: 'blocked', note: '3번 실패', block_count: 2 })
@@ -123,7 +123,7 @@ test('U1/U3/U4. cards: Korean cause + raw detail, inline confirms for irreversib
     const s = h.store
     const mk = (id: string, status: string) => { s.addRequest(id, 'p', id); s.updateRequest(id, { status }) }
     // system/login: raw CLI text → Korean cause; raw kept as detail; recommendation names the real option.
-    s.putApproval({ id: 'system:login', teamId: 'hq', subjectId: '', title: 'Claude 로그인 필요', body: 'Not logged in · Please run /login', options: ['다시 확인'], subjectHash: 'l' })
+    s.putApproval({ id: 'system:login', teamId: 'hq', subjectId: '', title: 'Codex 로그인 필요', body: 'Not logged in · Please run /login', options: ['다시 확인'], subjectHash: 'l' })
     // integration with raw git output in the merge note.
     mk('req-integ002', 'blocked')
     const raw = "미러 갱신 실패: Error: git fetch -q --no-tags 실패: fatal: bad object 0123456789"
@@ -142,9 +142,9 @@ test('U1/U3/U4. cards: Korean cause + raw detail, inline confirms for irreversib
     const items = decisionItems(s, h.clock.t, { revenue: '수익자동화' })
     const by = (k: string) => items.find((d) => d.kind === k)!
     const sys = by('system')
-    assert.equal(sys.cause, 'Claude에 로그인되어 있지 않아요 · 터미널에서 claude를 실행해 로그인해 주세요')
+    assert.equal(sys.cause, 'Codex에 로그인되어 있지 않아요 · 터미널에서 codex login으로 로그인해 주세요')
     assert.equal(sys.detail, 'Not logged in · Please run /login')
-    assert.deepEqual(sys.recommendation, { option: '다시 확인', reason: "터미널에서 claude를 실행해 로그인한 뒤 '다시 확인'을 눌러 주세요" })
+    assert.deepEqual(sys.recommendation, { option: '다시 확인', reason: "터미널에서 codex login으로 로그인한 뒤 '다시 확인'을 눌러 주세요" })
     assert.ok(sys.options.includes(sys.recommendation!.option))
 
     const integ = by('integration')

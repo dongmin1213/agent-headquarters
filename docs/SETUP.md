@@ -7,7 +7,7 @@ hq(agent-headquarters)를 내 맥에 설치하고, 첫 요청을 보내고, 문�
 | --- | --- | --- |
 | macOS | 14 이상 | `sw_vers -productVersion` |
 | Node | 26 이상 (TypeScript를 빌드 없이 실행) | `node --version` |
-| Claude Code CLI | 로그인된 개인 구독 | `claude --version`, `claude auth status` |
+| Codex CLI | 0.159.2에서 검증, ChatGPT 로그인 | `codex --version`, `codex login status` |
 | git | Xcode Command Line Tools에 포함 | `git --version` |
 | swiftc | Xcode Command Line Tools (펫 빌드) | `xcode-select -p` |
 | sandbox-exec | macOS 기본 포함 (작업자 격리) | `hq doctor`가 실제로 격리되는지 시험 |
@@ -85,17 +85,17 @@ setup이 만든 추적되지 않는 파일·무시된 파일(검증 worktree 기
 | `home` | `~/.hq` | 실행 데이터 폴더 (환경 변수 `HQ_HOME`이 우선) |
 | `maxWorkers` | `2` | 동시에 도는 작업자 수 |
 | `attemptWallMinutes` | `{L0:20, L1:45, L2:90, L3:120}` | 등급별 시도 1회 시간 한도(분) |
-| `maxTurns` | `200` | 작업자 1회 최대 턴 |
+| `maxTurns` | `200` | Codex 도구 실행 시작 수의 상한(기존 키 유지). 실행기 감시 틱에서 초과 시 종료 |
 | `checkTimeoutMinutes` | `15` | 수용 기준 재실행 시간 한도(분) |
-| `models` | `{haiku, sonnet, opus}` | 별칭 → `claude --model` 값 |
+| `models` | `{haiku:"gpt-6-luna", sonnet:"gpt-6.1-sol", opus:"gpt-6-astra"}` | 기존 등급 키 → `codex exec --model` 값 |
 | `ladder` | `["haiku","sonnet","opus"]` | 재작업 때 올라가는 모델 순서 (`models`의 키) |
 | `maxAttempts` | `3` | 작업당 최대 시도 |
 | `quota` | `{saveAt:0.85, holdAt:0.95}` | 구독 사용률 기준: saveAt 이상이면 동시 1개로 절약, holdAt 이상이면 모든 시작 보류 (0 < saveAt ≤ holdAt ≤ 1). v1의 `reviewOnlyAt`은 없어졌습니다 |
 | `protectedPaths` | 테스트·`package.json`·잠금 파일·`.github/**`·`tsconfig*.json`·`**/*.config.*` 등 | 이 경로가 바뀌면 검토자와 결과 카드에 항상 표시 |
-| `sandbox.extraWritable` | `["~/.npm", "~/.cache", "~/Library/Caches"]` | 작업자 샌드박스에서 추가로 쓸 수 있는 폴더 (패키지 캐시 등) |
-| `workerDisallowedTools` | push·remote·.env 접근 금지 | 작업자에게 막는 도구 (가드레일) |
+| `sandbox.extraWritable` | `[]` | 작업자 샌드박스에서 추가로 쓸 수 있는 폴더 (패키지 캐시 등) |
+| `workerDisallowedTools` | 기존 값 유지 | 구형 설정 호환용. Codex에는 Claude 도구 규칙을 전달하지 않으며 OS 격리·Git 설정·완료 검증으로 제한 |
 | `notify` | `true` | macOS 알림 |
-| `claudeBin` | `claude` | Claude CLI 경로 (환경 변수 `HQ_CLAUDE_BIN`이 우선) |
+| `codexBin` | `codex` | Codex CLI 경로 (환경 변수 `HQ_CODEX_BIN`이 우선) |
 
 모르는 키가 있으면 데몬이 시작을 거부하고 `hq doctor`가 `설정` 항목에서 그 오류 문장을 그대로 보여 줍니다.
 
@@ -106,9 +106,9 @@ setup이 만든 추적되지 않는 파일·무시된 파일(검증 worktree 기
   - `~/.local/bin`, `~/.local/share/claude`: `claude` 실행 파일과 그 버전 폴더.
   - `~/.gitconfig`, `~/.config/git`: git 사용자 설정과 전역 ignore.
   - `~/.npm`: npm 캐시(읽기만, 쓰기는 실행별 캐시로 감).
-  - 자기 작업 폴더와 `out/`, hq 미러(읽기만), `sandbox.extraWritable`, 절대 경로로 지정한 `claudeBin`의 폴더, 자기 `~/.claude/projects/<cwd를 바꾼 이름>/`.
+  - 자기 작업 폴더와 `out/`, hq 미러(읽기만), `sandbox.extraWritable`, 절대 경로로 지정한 `codexBin`의 폴더, 자기 Codex 저장소 `$HQ_HOME/codex/<작업 경로 해시>/`.
   - `~/.claude`의 나머지(다른 프로젝트 기록, 설정, 메모리)와 `~/.claude.json`은 읽을 수 없습니다. `$HQ_HOME`과 등록된 프로젝트 원본 폴더도 읽을 수 없습니다(작업자는 hq 미러에서 만든 자기 clone만 씁니다).
-- **쓰기**: 자기 clone(작업 폴더), 자기 제출 폴더(`out/`: 보고서와 완료 파일만), 임시 폴더(`/private/tmp`와 이 사용자의 임시 폴더 `/var/folders/<x>/<y>/T`. 옆의 `C/` 캐시 폴더는 제외), `/dev`, `sandbox.extraWritable`, 자기 `~/.claude/projects/<cwd>/`(그 안의 `memory/`는 제외: 다음 세션에 읽히는 지시를 심지 못하게). `~/.claude`의 다른 곳, `~/.claude.json`, 설정·`CLAUDE.md`·skills·agents·commands·plugins·hooks는 쓸 수 없습니다.
+- **쓰기**: 자기 clone(작업 폴더), 자기 제출 폴더(`out/`: 보고서와 완료 파일만), 임시 폴더(`/private/tmp`와 이 사용자의 임시 폴더 `/var/folders/<x>/<y>/T`. 옆의 `C/` 캐시 폴더는 제외), `/dev`, `sandbox.extraWritable`, 자기 Codex 저장소. Codex 작업에서 개인 `~/.codex`와 `~/.claude`는 읽기·쓰기가 모두 차단됩니다. collect 작업은 clone 쓰기도 차단합니다. `~/.claude`의 다른 곳, `~/.claude.json`, 설정·`CLAUDE.md`·skills·agents·commands·plugins·hooks는 쓸 수 없습니다.
 - **어떤 설정으로도 열리지 않는 곳**: `~/.config/hq`(API 토큰), `$HQ_HOME`의 DB·`runs`·`logs`·`work`, `~/.ssh`·`~/.aws`·`~/.config/gh`·`~/.netrc`·`~/.docker/config.json`, 등록된 프로젝트의 `.env*` 파일.
 - **실행별 캐시**: `npm_config_cache`·`XDG_CACHE_HOME`·`PIP_CACHE_DIR`은 실행마다 새로 만든 임시 폴더를 가리키고, 작업자 프로세스 그룹이 끝나면 지웁니다. 샌드박스 안에서 만든 캐시를 나중에 샌드박스 밖 프로그램이 읽는 일을 막기 위해서입니다.
 - **신호**: 같은 샌드박스 안의 프로세스에만 신호를 보낼 수 있습니다(hq, 사용자 셸, 다른 작업자에게는 못 보냄).
@@ -119,9 +119,12 @@ setup이 만든 추적되지 않는 파일·무시된 파일(검증 worktree 기
 - **알려진 한계** (v4에서도 남는 것):
   - **키체인 항목**: 로그인 토큰 때문에 키체인 폴더와 securityd가 열려 있습니다. 항목마다의 접근 제어는 그대로지만, 접근 제어 없이 저장된 항목은 작업자도 요청할 수 있습니다.
   - **`~/.gitconfig` 내용**: 읽을 수 있으므로 이 파일에 토큰이나 비밀이 든 URL을 적어 두지 마세요.
+  - **Codex 인증**: CLI 인증을 위해 개인 `auth.json`만 작업별 저장소에 0600으로 복사합니다(폴더 0700). 개인 세션·설정·플러그인은 복사하지 않습니다. 작업 프로세스는 자기 인증 사본을 읽을 수 있으므로 OpenAI 인증 자체를 모델 명령에서 숨기는 경계는 아닙니다. 이 데이터 폴더를 공유하거나 저장소에 커밋하지 마세요.
   - **공유 임시 폴더**: `/private/tmp`와 사용자 임시 폴더는 다른 작업자와 사용자 프로그램도 같이 씁니다. 비밀을 임시 폴더에 두지 마세요.
   - **`setsid` 탈출**: 작업자가 `setsid`로 새 프로세스 그룹을 만들면 hq의 그룹 종료(시간 초과·취소)에 걸리지 않고 남을 수 있습니다. 그 프로세스도 샌드박스 규칙은 그대로 받습니다.
 - **반복 팀**: 팀 명령도 같은 v4 규칙 조각(신호·mach 허용 목록·홈 읽기 기본 거부·`~/.claude` 쓰기 제한·실행 차단)으로 만든 프로필 안에서 돕니다. 차이는 팀 폴더(`cwd`) 읽기·쓰기, 설정한 추가 경로(`sandbox.readable`·`writable`·`mach`), 열려 있는 hq 포트(범위 토큰으로만 접속)이고, 마지막 규칙으로 hq 저장소 쓰기를 막습니다. 자세한 내용은 아래 "반복 팀"에 있습니다.
+
+Codex 실행에는 `com.apple.trustd.agent`를 추가 허용합니다(TLS 인증서 검증). 작업자·검토자는 HQ의 외부 Seatbelt 안에서 실행하므로 Codex의 내부 샌드박스 우회 플래그를 사용합니다. 이를 HQ 밖에서 단독 실행하는 예제로 쓰지 마세요. 사장·수정·진단 턴은 Codex의 `read-only`와 `approval_policy="never"`를 사용합니다.
 
 ### 비밀 파일
 비밀값(`.env`, 개인 키, 인증서)을 **커밋해 둔 저장소는 등록을 지원하지 않습니다**. 작업자는 자기 clone에서 git이 추적하는 파일을 모두 읽을 수 있고, 샌드박스는 추적 파일을 가리지 않습니다. `hq doctor`는 등록된 프로젝트에서 `git ls-files`로(읽기만) `.env*`, `*.pem`, `id_rsa*`, `*.p12`, `*.key`에 맞는 추적 파일을 찾아 `비밀 파일 <id>` 경고를 냅니다. 해결: `git rm --cached <파일>`로 추적을 멈추고 `.gitignore`에 넣은 뒤, 이미 커밋된 값은 새 값으로 바꾸세요(이력에 남아 있으므로).
@@ -172,8 +175,8 @@ setup이 만든 추적되지 않는 파일·무시된 파일(검증 worktree 기
 | macOS | 실패: 14 미만 | macOS 업데이트 (Swift 6 펫 빌드에 필요) |
 | Node | 실패: 26 미만 | `brew install node` 또는 nodejs.org에서 26+ 설치 |
 | 설정 | 실패: 알 수 없는 키·잘못된 값 | 메시지에 나온 키를 `config/hq.json`에서 고치기 (위 표 참고) |
-| Claude CLI | 실패: 없음 | `npm install -g @anthropic-ai/claude-code`, 다른 경로면 `claudeBin` 설정 |
-| Claude 로그인 | 실패: 로그인 안 됨 | `claude` 실행 후 `/login` |
+| Codex CLI | 실패: 없음 | `npm install -g @openai/codex`, 다른 경로면 `codexBin` 설정 |
+| Codex 로그인 | 실패: 로그인 안 됨 | `codex login` |
 | git / swiftc | 실패 | `xcode-select --install` |
 | sandbox-exec / 샌드박스 시험 | 실패 | macOS 샌드박스가 동작하지 않아 작업자를 격리할 수 없음 → macOS 업데이트, 다른 샌드박스(컨테이너·원격 셸) 안에서 hq를 돌리고 있지 않은지 확인 |
 | 팀 <이름> | 경고: 샌드박스 없이 실행돼요 | `config/teams.json`에서 그 팀의 `"sandbox": "none"`을 지우기. 더 필요한 경로는 `"sandbox": {"readable": [...], "writable": [...]}`로 허용 (위 "반복 팀") |
@@ -218,5 +221,29 @@ hq uninstall --purge --yes   # $HQ_HOME의 hq 데이터(DB·worktree·증거), �
 ## 8. 릴리스 전 확인 (개발자)
 - `npx tsc --noEmit` 오류 없음
 - `npm test` 실패 0
-- `HQ_LIVE=1 npm test`: 실제 Claude CLI(haiku 한 번)로 샌드박스 계약을 확인합니다. 로그인된 구독이 필요하고 사용량이 조금 듭니다.
+- `HQ_LIVE=1 node --test test/unit/codex-live.test.ts`: 실제 Codex 호출·명령 실행·JSON 응답·세션 재개를 검증합니다. ChatGPT 로그인과 사용량이 필요합니다. 외부 파이프라인의 구형 Claude 계약 시험은 별도 `HQ_LIVE_PIPELINE=1`일 때만 실행합니다.
 - `hq doctor`가 이 맥에서 `[실패]` 없음
+
+
+### Codex로 전환
+
+```sh
+npm install -g @openai/codex
+codex login
+codex login status
+./bin/hq doctor
+./bin/hq restart
+```
+
+기본 실행 경로는 모두 Codex입니다: 사장 계획, 작업자, 검토자, 지시서 수정, 막힘 진단, 내장 smoke 팀. 별도 OpenAI API 키를 요구하지 않고 ChatGPT 로그인을 사용합니다. CLI가 키체인 전용으로 인증을 저장했다면 `codex -c cli_auth_credentials_store='"file"' login`으로 파일 인증을 만들거나 별도 `CODEX_HOME`에 로그인하세요. 새 구독이 반영되지 않으면 `codex login` 후 `codex login status`를 다시 확인합니다. HQ는 CLI의 구독 권한을 따르며 자체적으로 플랜을 바꾸지 않습니다.
+
+- `config/hq.json`의 기존 `claudeBin`은 더 이상 사용하지 않습니다. `codexBin` 또는 `HQ_CODEX_BIN`을 사용하세요. 예전 모델 값 `haiku`/`sonnet`/`opus`와 `claude-*`는 같은 작업 등급의 기본 GPT 모델로 바꿔 읽습니다. 파일 자체를 덮어쓰지는 않습니다.
+- 등급 키는 기존 계획·작업·승인 해시를 보존하기 위해 유지합니다. 실제 모델은 위 `models` 표대로 호출되며 원하는 Codex 지원 모델로 설정할 수 있습니다.
+- 개인 `CODEX_HOME`(기본 `~/.codex`)에서 인증 파일만 읽고, 작업·팀별 저장소에 복사합니다. 사용자 대화·config·hooks·MCP 설정을 복사하지 않습니다. 계정 로그인 파일이 바뀌면 다음 실행에 반영하고, 각 저장소에서 갱신된 토큰은 유지합니다.
+- Codex 세션은 DB에 `codex:<thread_id>`로 기록하고 같은 작업 경로에서 재개합니다. 기존 Claude 세션 ID를 Codex에 전달하지 않습니다. 새 세션에는 HQ가 저장한 지시·질문 답변을 다시 전달합니다.
+- Codex `--json`의 실제 `command_execution` 종료 코드로 검토 증거를 대조합니다. 종료 코드가 없거나 실행이 완료되지 않으면 성공으로 추정하지 않습니다. 구형 Claude 스트림은 과거 증거를 읽기 위해 계속 해석합니다.
+- 처음 Codex 데몬을 시작할 때 이전 Claude의 한도·로그인 보류만 초기화합니다. 요청·작업·승인·검증 이력은 유지하며, 이후 재시작에서는 Codex 한도를 초기화하지 않습니다.
+- Codex가 구독 사용률·리셋 시각을 내보내지 않으면 이를 추정하지 않고 미관측으로 둡니다. 명시적 사용 한도 오류에는 기존 15/30/60분 대기를 적용합니다. 구독 실행에 API 달러 비용을 지어내지 않습니다.
+- 등록된 외부 팀 명령은 임의의 프로그램입니다. 외부 저장소의 `claude` 호출까지 HQ가 자동으로 바꾸지는 않습니다. 해당 파이프라인은 별도로 Codex 연결을 수정해야 합니다. 팀에는 자신의 `CODEX_HOME`이 전달됩니다.
+
+참고: [Codex 비대화형 실행](https://learn.chatgpt.com/docs/non-interactive-mode), [GPT 모델 안내](https://developers.openai.com/api/docs/guides/latest-model).

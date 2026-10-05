@@ -1,7 +1,7 @@
 # agent-headquarters (hq) — 1인 AI 회사 본부
 
-**나는 회장, Claude는 CEO, 작업은 팀이 한다.**
-맥 한 대와 개인 Claude 구독으로 돌아가는 멀티 프로젝트 에이전트 오케스트레이터입니다. 진행 상황은 데스크톱 펫으로 봅니다.
+**나는 회장, Codex는 CEO, 작업은 팀이 한다.**
+맥 한 대와 ChatGPT 구독과 Codex CLI으로 돌아가는 멀티 프로젝트 에이전트 오케스트레이터입니다. 진행 상황은 데스크톱 펫으로 봅니다.
 
 **Multi-agent orchestration runtime with human approval, sandboxed execution, independent verification, and controlled merge.**
 
@@ -11,14 +11,16 @@
 </p>
 
 ```
-회장(나) ──요청──▶ CEO (Claude, 판단·계획·배정만)
+회장(나) ──요청──▶ CEO (Codex, 판단·계획·배정만)
                      │  질문 ≤3개 또는 계획+작업 지시서
                      ▼
-               승인(해시 고정, 만료) ──▶ 작업 팀 (worktree별 Claude 작업자)
+               승인(해시 고정, 만료) ──▶ 작업 팀 (worktree별 Codex 작업자)
                                           │ 완료 계약 → 기계 검증 → 교차 검토
                                           ▼
                                    결과 수락 ──▶ 별도 병합 승인
 ```
+
+Codex CLI **0.159.2**에서 실제 실행·JSON 출력·세션 재개를 검증했습니다. 설치와 기존 Claude 설정 전환은 [실행 안내](docs/SETUP.md#codex로-전환)를 참고하세요.
 
 ## 화면
 화면은 저장소의 목업 데몬(`test/pet/mock-daemon.ts`, `test/web/dev-server.ts`)으로 띄워 실제 코드에서 캡처했습니다. 펫 캐릭터는 스프라이트 없이 기본 아이콘으로 표시됩니다.
@@ -26,7 +28,7 @@
 | 새 요청 | 사용량 |
 | --- | --- |
 | <img src="docs/images/pet-new-request.png" width="400" alt="펫의 새 요청 탭"> | <img src="docs/images/pet-usage.png" width="400" alt="펫의 사용량 탭"> |
-| 한 줄로 요청하고 프로젝트를 고릅니다. 최근 결과(수락·병합·실패)도 함께 보입니다. | 구독 한도(5시간·7일·7일 Opus)와 리셋 시각, 현재 모드(보통·절약·보류)를 보여 줍니다. |
+| 한 줄로 요청하고 프로젝트를 고릅니다. 최근 결과(수락·병합·실패)도 함께 보입니다. | 관측된 사용 한도와 보류 상태를 보여 줍니다. Codex가 사용률을 제공하지 않으면 미관측으로 표시합니다. |
 
 <img src="docs/images/web-overview.png" alt="웹 화면: 요청 목록, 계획과 가정, 작업 열(대기·진행·검증·검토·완료·막힘)">
 <sub>웹 화면(`hq open`) · 지금 일하는 작업자, 요청 목록, 사장의 계획·가정, 작업을 상태별 열(대기 · 진행 · 검증·검토 · 완료 · 막힘)로 보여 줍니다.</sub>
@@ -37,7 +39,7 @@
 - 개인 구독 한도 안에서 돌아가야 하므로, 반복 작업은 코드(데몬)가 하고 모델 토큰은 판단에만 씁니다.
 
 ## 어떻게 믿을 수 있나
-- **작업자는 macOS Seatbelt 안에서만 실행됩니다.** 작업자·검토자·검사 명령 모두 비밀 파일, hq 토큰·DB, 다른 작업자 경로, hq 제어 포트, `open`/`osascript`에 접근할 수 없습니다.
+- **작업자는 macOS Seatbelt 안에서만 실행됩니다.** 작업자·검토자·검사 명령 모두 hq 토큰·DB, 다른 작업자 경로, hq 제어 포트, `open`/`osascript`에 접근할 수 없습니다. Codex 인증은 작업별 전용 저장소에 복사되며, 개인 Codex 대화·설정은 공유하지 않습니다.
 - **작업자의 "다 했어요"를 믿지 않습니다.** 완료 계약을 받은 뒤 hq가 전용 미러에서 수락 기준의 검사 명령을 직접 다시 돌려 판정합니다.
 - **검토는 새 세션이 합니다.** 구현한 세션과 다른 새 작업자가 교차 검토하고, 검토자가 "실행했다"고 적은 테스트는 실제 스트림 기록과 정확히 일치하는지 대조합니다.
 - **환경 실패를 '기존 실패'로 넘기지 않습니다.** 설정 실패·시간 초과·exit 126/127은 작업자를 띄우기 전에 멈추고, 기준선에서 실패했다는 이유로 검사를 면제하지 않습니다.
@@ -81,6 +83,6 @@ bin/hq open                         # 웹 화면
 npm test                            # 테스트 (단위·웹·CLI·펫)
 ```
 자세한 설치·운영·문제 해결은 [SETUP](docs/SETUP.md), 실행 계약은 [설계 문서](docs/design/execution.md)에 있습니다.
-요구 사항: macOS 14+, Node 26+, Claude Code CLI(로그인된 구독), Xcode Command Line Tools.
+요구 사항: macOS 14+, Node 26+, Codex CLI(ChatGPT 로그인), Xcode Command Line Tools.
 
 펫 스프라이트(포켓몬·디지몬)는 제3자 저작물이라 저장소에 포함하지 않습니다. `fetch-packs.sh`가 공개 스프라이트 저장소에서 개인 로컬 용도로 내려받습니다.

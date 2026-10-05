@@ -254,7 +254,7 @@ test('v3-15. "Not logged in" → global hold and one system:login card (first in
     assert.equal(items[0].requestId, '')
     assert.equal(items[0].taskId, null)
     assert.deepEqual(items[0].options, ['다시 확인'])
-    assert.equal(items[0].situation, 'Claude CLI에 로그인되어 있지 않아 모든 작업을 멈췄어요')
+    assert.equal(items[0].situation, 'Codex CLI에 로그인되어 있지 않아 모든 작업을 멈췄어요')
     assert.equal(items[0].causeConfirmed, true)
     assert.deepEqual(items[0].optionHelp, { '다시 확인': '로그인 후 누르면 다음 작업부터 다시 시도해요' })
     assert.equal(h.runner.quota().mode, 'hold')

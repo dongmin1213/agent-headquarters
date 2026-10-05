@@ -18,7 +18,7 @@ async function launchSleep(ps: (pid: number) => Promise<string | null>) {
   const dir = tmp('hq-worker-')
   const home = join(dir, 'home'), wt = join(dir, 'wt'), hqDir = join(dir, 'run', 'hq')
   mkdirSync(wt, { recursive: true }); mkdirSync(join(dir, 'tok'), { recursive: true })
-  const l = await launch({ claudeBin: '/bin/sleep', argv: ['30'], cwd: wt, hqDir, outDir: null, prompt: 'x', sessionId: 's1', spec: {},
+  const l = await launch({ codexBin: '/bin/sleep', argv: ['30'], cwd: wt, hqDir, outDir: null, prompt: 'x', sessionId: 's1', spec: {},
     sandbox: { worktree: wt, out: null, hqHome: home, tokenDir: join(dir, 'tok'), hqPort: 17999, extraWritable: [], projects: [] } }, ps)
   return { l, hqDir }
 }

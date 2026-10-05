@@ -41,7 +41,7 @@ function integrationHelp(store: Store, requestId: string, project: string, optio
   return { ...INTEGRATION_HELP, [ACCEPT_KNOWN]: `이 검사들은 작업 전부터 실패했고 검토자가 악화 없음으로 판정했어요 · 통합본(${sha})을 그대로 병합 단계로 넘겨요` }
 }
 const SYSTEM_HELP = { '다시 확인': '로그인 후 누르면 다음 작업부터 다시 시도해요' }
-const LOGIN_RECOMMENDATION = { option: '다시 확인', reason: "터미널에서 claude를 실행해 로그인한 뒤 '다시 확인'을 눌러 주세요" }
+const LOGIN_RECOMMENDATION = { option: '다시 확인', reason: "터미널에서 codex login으로 로그인한 뒤 '다시 확인'을 눌러 주세요" }
 /** Inline confirm for choices that cannot be undone (web and pet ask once more before sending). */
 export const CONFIRM_STOP = '정말 중단할까요? · 되돌릴 수 없어요'
 export const confirmMerge = (target: string) => `${target}에 병합할까요?`
@@ -116,7 +116,7 @@ export function decisionItems(store: Store, now = Date.now(), teamNames: Record<
     let detail = a.body
     let confirm: Record<string, string> | undefined
     if (a.kind === 'system') {
-      ex = { situation: 'Claude CLI에 로그인되어 있지 않아 모든 작업을 멈췄어요', cause: a.body ? explainError(a.body).cause : 'Claude CLI가 로그인되어 있지 않다고 답했어요', causeConfirmed: true,
+      ex = { situation: 'Codex CLI에 로그인되어 있지 않아 모든 작업을 멈췄어요', cause: a.body ? explainError(a.body).cause : 'Codex CLI가 로그인되어 있지 않다고 답했어요', causeConfirmed: true,
         recommendation: a.options.includes(LOGIN_RECOMMENDATION.option) ? LOGIN_RECOMMENDATION : null, optionHelp: SYSTEM_HELP }
     } else if (a.kind === 'plan') {
       const plan = store.request(requestId)?.plan

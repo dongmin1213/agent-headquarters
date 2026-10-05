@@ -99,7 +99,7 @@ test('launch: a child that exits before ps answers is observed as exited (exit w
   const wt = join(dir, 'wt'), hqDir = join(dir, 'run', 'hq')
   mkdirSync(wt, { recursive: true }); mkdirSync(join(dir, 'tok'), { recursive: true })
   const slowPs = async (pid: number) => { await sleep(400); return psLstart(pid) }
-  const l = await launch({ claudeBin: '/usr/bin/true', argv: [], cwd: wt, hqDir, outDir: null, prompt: 'x', sessionId: 's', spec: {},
+  const l = await launch({ codexBin: '/usr/bin/true', argv: [], cwd: wt, hqDir, outDir: null, prompt: 'x', sessionId: 's', spec: {},
     sandbox: { worktree: wt, out: null, hqHome: join(dir, 'home'), tokenDir: join(dir, 'tok'), hqPort: 17999, extraWritable: [], projects: [] } }, slowPs)
   assert.equal(l.exit.exited, true, 'exit seen although it happened before launch() returned')
   assert.equal(l.exit.code, 0)
@@ -199,7 +199,7 @@ test('lingering pid whose command line is our worker (claude bin + --session-id 
   const h = harness()
   const session = randomUUID()
   // `sh -c 'sleep 30; :' <bin> --session-id <s>`: argv shows the claude binary name and the attempt's session.
-  const o = owner(['-c', 'sleep 30; :', 'fake-claude.ts', '--session-id', session], '/bin/sh')
+  const o = owner(['-c', 'sleep 30; :', 'fake-codex.ts', '--session-id', session], '/bin/sh')
   try {
     await sleep(100)
     const { r, tid } = await lingeringBlocked(h, o.pid!, session)
@@ -219,7 +219,7 @@ test('lingering pid whose command line is our worker (claude bin + --session-id 
 
 test('lingering pid: same binary name but another session → no kill hint; ps failing → 확인할 수 없음 and no hint; release without lingering → refused', { skip: nestedSandbox && NESTED_PS_SKIP }, async () => {
   const h = harness()
-  const o = owner(['-c', 'sleep 30; :', 'fake-claude.ts', '--session-id', randomUUID()], '/bin/sh')
+  const o = owner(['-c', 'sleep 30; :', 'fake-codex.ts', '--session-id', randomUUID()], '/bin/sh')
   try {
     await sleep(100)
     const { r, tid } = await lingeringBlocked(h, o.pid!, randomUUID())

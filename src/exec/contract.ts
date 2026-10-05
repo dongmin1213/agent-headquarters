@@ -132,14 +132,14 @@ export function reportProblem(report: string | null): string | null {
 /** "Not logged in" stops every start until the chairman re-checks (§13); it is not a task failure. */
 export function isNotLoggedIn(result: Record<string, unknown> | null, stderr = ''): boolean {
   const text = `${result?.is_error === true ? String(result.result ?? '') : ''}\n${result ? '' : stderr}`
-  return /Not logged in/i.test(text)
+  return /Not logged in|authentication|unauthorized|\b401\b|refresh.token/i.test(text)
 }
 
 export function judgeWork(f: WorkFacts): Judgement {
   const j = (outcome: WorkOutcome, reasons: string[], done: DoneJson | null = null, prot: string[] = []): Judgement => ({ outcome, reasons, done, protectedChanges: prot })
   // hq's own kill wins over any earlier limit event in the same stream (§13).
   if (f.runaway) return j('runaway', ['폭주 감시로 중단됨'])
-  if (isNotLoggedIn(f.result, f.stderr)) return { ...j('limited', ['Claude 로그인 필요']), login: true }
+  if (isNotLoggedIn(f.result, f.stderr)) return { ...j('limited', ['Codex 로그인 필요']), login: true }
   if (isLimited(f.result, f.stderr, f.rejectedSeen)) return j('limited', ['사용 한도'])
   if (isTransient(f.result)) return j('transient', [`일시 오류 (API ${String(f.result!.api_error_status)})`])
   if (f.result?.subtype === 'error_max_turns') return j('failed', ['턴 상한 도달'])

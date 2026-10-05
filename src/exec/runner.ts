@@ -25,9 +25,9 @@ import { isAllowedEvent, quotaState, quotaView, recordRateLimit, rejectedWithout
 import { ensureMirror, fetchWork, hqGit, hqGitOk, mirrorChanged, mirrorPath, mirrorRev, newWorkClone, removeMirrorWorktree, verifyWorktree, wtGit, wtMerge, wtStatus } from './repos.ts'
 import { canAutoApply, reviseDiff, reviseProblem, runReviseTurn } from './revise.ts'
 import { checkVerdict, ladderUp, VERDICT_SCHEMA } from './review.ts'
-import { claudeBinReadable, real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
+import { codexBinReadable, real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
 import { extractBashRuns, lastActivityOf, StreamTail } from './stream.ts'
-import { claudeArgs, defaultProbe, findOrphan, identify, killGroup, launch, LaunchAborted, looksLikeWorker, pidAlive, psInfo, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
+import { codexArgs, defaultProbe, findOrphan, identify, killGroup, launch, LaunchAborted, looksLikeWorker, pidAlive, psInfo, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
 import { reconcile as reconcileInvariants, recover as recoverState, type Violation } from './reconcile.ts'
 
 export type Notify = (title: string, body: string) => void
@@ -232,7 +232,7 @@ export class Runner {
   /** `projectId` names the mirror the worktree borrows objects from — the only part of $HQ_HOME it may read. */
   sandboxFor(worktree: string, out: string | null, projectId: string): SandboxOpts {
     return { worktree, out, hqHome: this.home, tokenDir: this.tokenDir, hqPort: this.hqPort, extraWritable: this.cfg.sandbox.extraWritable,
-      projects: this.projects.map((p) => p.path), mirror: this.mirror(projectId), readable: claudeBinReadable(this.cfg.claudeBin) }
+      projects: this.projects.map((p) => p.path), mirror: this.mirror(projectId), readable: codexBinReadable(this.cfg.codexBin) }
   }
 
   /**
@@ -299,10 +299,10 @@ export class Runner {
     if (this.store.get('login.required')) return
     this.store.tx(() => {
       this.store.set('login.required', this.iso())
-      this.store.putApproval({ id: LOGIN_CARD, teamId: 'hq', subjectId: '', kind: 'system', title: 'Claude 로그인 필요', body: reason.slice(0, 500),
+      this.store.putApproval({ id: LOGIN_CARD, teamId: 'hq', subjectId: '', kind: 'system', title: 'Codex 로그인 필요', body: reason.slice(0, 500),
         options: ['다시 확인'], subjectHash: sha256(`login:${this.iso()}`) })
     })
-    this.bus.emit({ kind: 'limit', text: 'Claude CLI 로그인이 필요해요 — 모든 시작을 멈췄어요' })
+    this.bus.emit({ kind: 'limit', text: 'Codex CLI 로그인이 필요해요 — 모든 시작을 멈췄어요' })
   }
 
   emitTask(t: { id: string; request_id: string }, text: string): void {
@@ -539,7 +539,7 @@ export class Runner {
       if (!l) continue // not adopted (reconcile reports it)
       const task = this.store.task(att.task_id)
       l.tail.poll((line, s) => {
-        if (s.sessionId && s.sessionId !== att.session_id && att.kind === 'work') { this.store.updateAttempt(att.id, { session_id: s.sessionId }); att.session_id = s.sessionId }
+        if (s.sessionId && s.sessionId !== att.session_id) { this.store.updateAttempt(att.id, { session_id: s.sessionId }); att.session_id = s.sessionId }
         if (s.rateLimit) this.observe(line)
       })
       const id = await this.identityOf(l)
@@ -560,9 +560,9 @@ export class Runner {
         const wall = this.wallMs(task)
         const elapsed = now - Date.parse(att.started_at ?? new Date(now).toISOString())
         const total = att.kind === 'work' && task ? this.spentMs(task, att.id) + elapsed : elapsed
-        if (!att.outcome && (elapsed > wall || total > 3 * wall || l.tail.sameErrorCount >= 3)) {
+        if (!att.outcome && (elapsed > wall || total > 3 * wall || l.tail.sameErrorCount >= 3 || l.tail.toolCount > this.cfg.maxTurns)) {
           const why = elapsed > wall ? `시간 초과 (${Math.round(elapsed / 60_000)}분 > ${wall / 60_000}분)`
-            : total > 3 * wall ? `작업 누적 시간 초과 (${Math.round(total / 60_000)}분 > ${3 * wall / 60_000}분)` : `같은 도구 오류 3회 연속: ${l.tail.lastActivity ?? ''}`
+            : total > 3 * wall ? `작업 누적 시간 초과 (${Math.round(total / 60_000)}분 > ${3 * wall / 60_000}분)` : l.tail.toolCount > this.cfg.maxTurns ? `도구 실행 상한 (${this.cfg.maxTurns}) 초과` : `같은 도구 오류 3회 연속: ${l.tail.lastActivity ?? ''}`
           this.store.updateAttempt(att.id, { outcome: 'runaway', reason: why })
           att.outcome = 'runaway'
           this.bus.emit({ kind: 'attempt', text: `폭주 감시: ${why}`, data: { id: att.id } })
@@ -640,7 +640,7 @@ export class Runner {
     let ps: string | null = null
     try { ps = await (this.probe.info ?? psInfo)(l.pid) } catch { ps = null }
     const sessions = this.store.attempts(t.id).filter((a) => a.pid === l.pid || !a.pid).map((a) => a.session_id)
-    const ours = ps !== null && looksLikeWorker(ps, { bin: basename(this.cfg.claudeBin), paths: t.worktree ? [t.worktree] : [], sessions })
+    const ours = ps !== null && looksLikeWorker(ps, { bin: basename(this.cfg.codexBin), paths: t.worktree ? [t.worktree] : [], sessions })
     const rec: LingeringPs = { lingering: t.lingering!, ps: ps?.slice(0, 2000) ?? null, ours }
     const v = JSON.stringify(rec)
     this.store.tx(() => { if (this.store.task(t.id)?.lingering === t.lingering && this.store.get(lingeringPsKey(t.id)) !== v) this.store.set(lingeringPsKey(t.id), v) })
@@ -737,7 +737,7 @@ export class Runner {
           break
         }
         case 'limited': {
-          if (j.login) { this.tset(t, { status: 'held', resume_session: att.session_id, note: 'Claude 로그인 필요' }); break }
+          if (j.login) { this.tset(t, { status: 'held', resume_session: att.session_id, note: 'Codex 로그인 필요' }); break }
           const streak = t.limited_streak + 1
           if (streak >= MAX_LIMITED_STREAK) { this.tset(t, { limited_streak: streak }); this.block(this.store.task(t.id)!, `사용 한도로 ${streak}번 연속 중단됐어요`) }
           else this.tset(t, { status: 'held', limited_streak: streak, resume_session: att.session_id, note: '사용 한도로 보류' })
@@ -1018,10 +1018,10 @@ export class Runner {
         prompt = workPrompt({ task: specOf(t), requestText: request.text, projectName: project.name, cwd, branch: role === 'implement' ? 'hq-work' : null, base: t.base_sha!,
           out, token: att.attempt_token, rework: t.note && prev ? this.reworkText(t, prev) : null, dirtyNotice: null, upstream: this.upstream(t) })
       }
-      const argv = claudeArgs(this.cfg, { role, model: att.model, sessionId: att.session_id, resume, out })
+      const argv = codexArgs(this.cfg, { role, model: att.model, sessionId: att.session_id, resume, out })
       gate()
-      const { info, child, exit } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd, hqDir: hq, outDir: out, prompt, sessionId: att.session_id,
-        sandbox: this.sandboxFor(cwd, out, t.project), proceed: () => !this.startBlocker(attemptId, 'running'),
+      const { info, child, exit } = await launch({ codexBin: this.cfg.codexBin, argv, cwd, hqDir: hq, outDir: out, prompt, sessionId: att.session_id,
+        sandbox: { ...this.sandboxFor(cwd, out, t.project), readOnlyWorktree: role === 'collect' }, proceed: () => !this.startBlocker(attemptId, 'running'),
         spec: { attemptId, kind: 'work', role, model: att.model, base: t.base_sha, generation: att.generation, attempt_token: att.attempt_token, resume, startedAt: this.iso() } })
       const startedAt = this.iso()
       // Spawned: from here the attempt is a live process; a cancel that lands now is handled by pollLive (SIGTERM).
@@ -1263,9 +1263,9 @@ export class Runner {
       const prompt = reviewPrompt({ task: specOf(t), requestText: this.store.request(t.request_id)!.text, base: t.base_sha!, head: t.head_sha!, diffStat: stat.stdout,
         checks, protectedChanges: result?.protectedChanges ?? [], manualIds: checks?.manual ?? [], report,
         manualTails: Object.fromEntries((checks?.manual ?? []).map((id) => [id, { candidate: checks!.checks.find((c) => c.id === id)?.outputTail ?? '', base: checks!.baseTails?.[id] ?? '' }])) })
-      const argv = claudeArgs(this.cfg, { role: 'review', model: att.model, sessionId: att.session_id, resume: false, out: null, schema: VERDICT_SCHEMA })
+      const argv = codexArgs(this.cfg, { role: 'review', model: att.model, sessionId: att.session_id, resume: false, out: null, schema: VERDICT_SCHEMA })
       gate()
-      const { info, child, exit } = await launch({ claudeBin: this.cfg.claudeBin, argv, cwd: wt.path, hqDir: hq, outDir: null, prompt, sessionId: att.session_id,
+      const { info, child, exit } = await launch({ codexBin: this.cfg.codexBin, argv, cwd: wt.path, hqDir: hq, outDir: null, prompt, sessionId: att.session_id, schema: VERDICT_SCHEMA,
         sandbox: this.sandboxFor(wt.path, null, t.project), proceed: () => !this.startBlocker(attemptId, 'reviewing'),
         spec: { attemptId, kind: 'review', model: att.model, head_sha: t.head_sha, base_sha: t.base_sha, worktree: wt.path, generation: att.generation, startedAt: this.iso() } })
       const startedAt = this.iso()
@@ -1769,7 +1769,7 @@ export class Runner {
     const now = this.store.task(t.id)
     if (!now || now.status !== 'revising' || now.generation !== t.generation || this.store.request(t.request_id)?.status !== 'executing') return
     this.store.updateTask(t.id, { revise_turns: t.revise_turns + 1 })
-    const res = await runReviseTurn({ claudeBin: this.cfg.claudeBin, hqRoot: this.hqRoot, project, projects: this.projects, requestText: r.text, task: spec, report, diffStat: stat, answers,
+    const res = await runReviseTurn({ codexBin: this.cfg.codexBin, runtimeHome: this.cfg.home, model: this.cfg.models.sonnet, hqRoot: this.hqRoot, project, projects: this.projects, requestText: r.text, task: spec, report, diffStat: stat, answers,
       onLine: (line) => { if (line.type === 'rate_limit_event') this.observe(line) } })
     if (res.limited) { this.store.updateTask(t.id, { revise_turns: t.revise_turns }); if (this.quota().mode !== 'hold') this.limitBackoff(); return } // not counted
     const cur = this.store.task(t.id)
@@ -1866,7 +1866,7 @@ export class Runner {
       { title: '검토 blocking', body: verdict?.blocking.map((b) => `- [${b.id}] ${b.summary} — ${b.evidence}`).join('\n') || '(없음)' },
       { title: '작업자 보고서 요약', body: summary },
     ]
-    const res = await runDiagnoseTurn({ claudeBin: this.cfg.claudeBin, hqRoot: this.hqRoot, project, kind: 'blocked', options: BLOCKED_OPTIONS, evidence,
+    const res = await runDiagnoseTurn({ codexBin: this.cfg.codexBin, runtimeHome: this.cfg.home, model: this.cfg.models.sonnet, hqRoot: this.hqRoot, project, kind: 'blocked', options: BLOCKED_OPTIONS, evidence,
       onLine: (line) => { if (line.type === 'rate_limit_event') this.observe(line) } })
     if (res.limited) return // retried after the hold
     this.store.tx(() => {
@@ -1885,7 +1885,7 @@ export class Runner {
       { title: '합친 작업', body: tasks.map((t) => `- ${t.key} ${t.title} @ ${t.head_sha}\n  owns: ${specOf(t).owns.join(', ')}`).join('\n') },
       { title: '실패한 검사', body: m.state === 'failed' ? this.checksEvidence(checks) : '(충돌이라 검사 전)' },
     ]
-    const res = await runDiagnoseTurn({ claudeBin: this.cfg.claudeBin, hqRoot: this.hqRoot, project, kind: 'integration', options: INTEGRATION_OPTIONS, evidence,
+    const res = await runDiagnoseTurn({ codexBin: this.cfg.codexBin, runtimeHome: this.cfg.home, model: this.cfg.models.sonnet, hqRoot: this.hqRoot, project, kind: 'integration', options: INTEGRATION_OPTIONS, evidence,
       onLine: (line) => { if (line.type === 'rate_limit_event') this.observe(line) } })
     if (res.limited) return
     this.store.tx(() => {

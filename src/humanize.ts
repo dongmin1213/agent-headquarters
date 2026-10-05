@@ -6,8 +6,8 @@ export const SERVER_ERROR = '서버에서 문제가 생겼어요 · hq logs로 �
 
 /** Known patterns, checked in order; the first match wins. Each text says what happened and what to do. */
 export const ERROR_PATTERNS: [RegExp, string][] = [
-  [/Not logged in|Please run \/login|Invalid API key|authentication_error|\b401\b|Unauthorized/i, 'Claude에 로그인되어 있지 않아요 · 터미널에서 claude를 실행해 로그인해 주세요'],
-  [/rate[ _-]?limit|usage limit|\b429\b/i, 'Claude 사용 한도에 걸렸어요 · 한도가 풀리면 다시 시도할 수 있어요'],
+  [/Not logged in|Please run \/login|Invalid API key|authentication_error|\b401\b|Unauthorized/i, 'Codex에 로그인되어 있지 않아요 · 터미널에서 codex login으로 로그인해 주세요'],
+  [/rate[ _-]?limit|usage limit|\b429\b/i, 'Codex 사용 한도에 걸렸어요 · 한도가 풀리면 다시 시도할 수 있어요'],
   [/index\.lock/, '다른 git 작업이 저장소를 잠그고 있어요 · 진행 중인 git 명령이 없으면 .git/index.lock을 지운 뒤 다시 시도해 주세요'],
   [/\bCONFLICT\b|Automatic merge failed|merge conflict/, '합치는 중에 같은 부분을 서로 다르게 고친 충돌이 났어요 · 해당 작업을 다시 하거나 직접 합쳐 주세요'],
   [/not something we can merge/, '합칠 커밋을 찾지 못했어요 · 다시 통합해 주세요'],

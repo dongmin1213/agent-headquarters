@@ -13,7 +13,7 @@ import { Store } from '../../src/store.ts'
 
 process.env.HQ_NO_NOTIFY = '1'
 export const ROOT = resolve(import.meta.dirname, '../..')
-export const FAKE = resolve(import.meta.dirname, 'fixtures/fake-claude.ts')
+export const FAKE = resolve(import.meta.dirname, 'fixtures/fake-codex.ts')
 
 export const sh = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim()
 
@@ -53,7 +53,7 @@ export interface Harness {
 export function harness(o: { cfg?: Partial<HqConfig>; repoFiles?: Record<string, string>; setup?: string } = {}): Harness {
   const dir = tmp()
   const repo = makeRepo(join(dir, 'proj'), o.repoFiles)
-  const cfg: HqConfig = { ...DEFAULTS, home: join(dir, 'home'), claudeBin: FAKE, sandbox: { extraWritable: [] }, ...o.cfg }
+  const cfg: HqConfig = { ...DEFAULTS, home: join(dir, 'home'), codexBin: FAKE, sandbox: { extraWritable: [] }, ...o.cfg }
   const store = new Store(join(cfg.home, 'hq.db'))
   const bus = new Bus(store)
   const clock = { t: Date.now() }

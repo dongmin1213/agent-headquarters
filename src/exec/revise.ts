@@ -13,7 +13,7 @@ export interface ReviseOutput { revised_task: PlanTask | null; questions: CeoQue
 export interface ReviseTurn { ok: boolean; output: ReviseOutput | null; error: string | null; limited: boolean; costUsd: number | null }
 
 export interface ReviseInput {
-  claudeBin: string; hqRoot: string; project: Project; projects: Project[]
+  codexBin: string; runtimeHome?: string; model?: string; hqRoot: string; project: Project; projects: Project[]
   requestText: string; task: PlanTask; report: string | null; diffStat: string
   /** The chairman's answers to this revision's earlier questions (F16). */
   answers?: { question: string; answer: string }[]
@@ -35,7 +35,7 @@ export async function runReviseTurn(i: ReviseInput): Promise<ReviseTurn> {
     ...(i.answers?.length ? ['', '## 회장이 답한 질문', ...i.answers.map((a) => `- ${a.question.replace(/\s+/g, ' ')} → ${a.answer.replace(/\s+/g, ' ')}`),
       '위 답을 반영해 고친 작업(`revised_task`)을 낸다. 답으로도 정할 수 없을 때만 다시 묻는다.'] : []),
   ].join('\n')
-  const t = await runJsonTurn({ claudeBin: i.claudeBin, cwd: i.project.path, prompt, schema: REVISE_SCHEMA, sessionId: randomUUID(), resume: false,
+  const t = await runJsonTurn({ codexBin: i.codexBin, runtimeHome: i.runtimeHome, model: i.model, cwd: i.project.path, prompt, schema: REVISE_SCHEMA, sessionId: randomUUID(), resume: false,
     addDirs: [], onLine: i.onLine })
   const out = t.output as ReviseOutput | null
   if (!t.ok || !out || !Array.isArray(out.questions)) return { ok: false, output: null, error: t.error ?? '출력 형식 오류', limited: t.limited, costUsd: t.costUsd }

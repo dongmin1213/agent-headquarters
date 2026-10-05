@@ -10,6 +10,7 @@
 // A live pid whose identity cannot be confirmed is never signalled; the chairman gets a card to release it (N3).
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { accessSync, closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { prepareCodexHome } from './codex.ts'
 import { createHash, randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -89,6 +90,7 @@ export function teamEnv(extra: Record<string, string>, from: NodeJS.ProcessEnv =
 }
 
 export interface TeamProfileOpts {
+  codexHome?: string
   /** The team repo: readable and writable. */
   cwd: string
   hqHome: string
@@ -138,6 +140,7 @@ export function teamProfile(o: TeamProfileOpts): string {
     `(deny file-write* (require-not (require-any ${w.join(' ')} ${claude.own})))`,
     ...claudeWriteRules(home, claude),
     `(deny file-read-data file-write* ${[...new Set([o.tokenDir, o.hqHome].map(subpathOf))].join(' ')} ${homeSecretFilters(home).join(' ')})`,
+    ...(o.codexHome ? ['(allow mach-lookup (global-name "com.apple.trustd.agent")) ; Codex TLS certificate validation', `(allow file-read-data file-write* ${subpathOf(o.codexHome)})`] : []),
     ...launchRules(),
     ...(o.hqRoot ? [`(deny file-write* ${subpathOf(o.hqRoot)}) ; the hq repository (daemon code, teams.json)`] : []),
     '',
@@ -341,9 +344,10 @@ export class Scheduler {
       let fd: number | null = null
       try {
         const paths = teamSandboxPaths(t)
+        const codexHome = prepareCodexHome(this.iso.hqHome, `team:${t.id}`)
         // Per-run package caches (S4), recorded next to the log so a later daemon can remove them too.
         a.cacheDir = makeCacheDir()
-        const env = teamEnv({ ...cacheEnv(a.cacheDir), HQ_URL: this.hqUrl, HQ_TOKEN: token, HQ_TEAM: t.id })
+        const env = teamEnv({ CODEX_HOME: codexHome, ...cacheEnv(a.cacheDir), HQ_URL: this.hqUrl, HQ_TOKEN: token, HQ_TEAM: t.id })
         const exe = resolveCommand(cmd, t.cwd, env.PATH)
         const dir = this.logDir(t)
         mkdirSync(dir, { recursive: true })
@@ -352,7 +356,7 @@ export class Scheduler {
         let argv = [exe, ...args]
         if (paths !== 'none') {
           const profile = join(dir, `${runId}.sb`)
-          writeFileSync(profile, teamProfile({ cwd: t.cwd, hqHome: this.iso.hqHome, tokenDir: this.iso.tokenDir, hqRoot: this.iso.hqRoot, ...paths }))
+          writeFileSync(profile, teamProfile({ codexHome, cwd: t.cwd, hqHome: this.iso.hqHome, tokenDir: this.iso.tokenDir, hqRoot: this.iso.hqRoot, ...paths }))
           argv = wrap(argv, profile)
         }
         fd = openSync(a.log, 'a')

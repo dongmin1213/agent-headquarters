@@ -65,7 +65,7 @@ export class RequestEngine {
     this.bus.emit({ kind: 'request', text: '사장이 검토 중', data: { id, state: 'thinking' } })
 
     const answers = this.store.questions(id).filter((q) => q.answer !== null).map((q) => ({ question: q.question, answer: q.answer! }))
-    const base = { request: r.text, answers, project, projects: this.projects, hqRoot: this.hqRoot, claudeBin: this.runner.cfg.claudeBin,
+    const base = { request: r.text, answers, project, projects: this.projects, hqRoot: this.hqRoot, codexBin: this.runner.cfg.codexBin, runtimeHome: this.runner.cfg.home, model: this.runner.cfg.models.sonnet,
       onLine: (line: Record<string, unknown>) => { if (line.type === 'rate_limit_event') this.runner.observe(line) } }
     let t = await runCeoTurn({ ...base, correction: r.note && r.corrections > 0 ? r.note : null, resumeSessionId: r.session_id })
     // A failed resume falls back once to a fresh session that gets the stored conversation (request + answers).
@@ -73,8 +73,8 @@ export class RequestEngine {
     if (this.store.request(id)?.status !== 'thinking') return // cancelled meanwhile
     this.store.updateRequest(id, { session_id: t.sessionId, cost_usd: r.cost_usd + (t.costUsd ?? 0) })
 
-    if (!t.ok && /Not logged in/i.test(t.error ?? '')) {
-      this.store.updateRequest(id, { status: 'queued', note: 'Claude 로그인 필요, 대기' })
+    if (!t.ok && /Not logged in|authentication|unauthorized|401|refresh.token/i.test(t.error ?? '')) {
+      this.store.updateRequest(id, { status: 'queued', note: 'Codex 로그인 필요, 대기' })
       this.runner.requireLogin(t.error ?? 'Not logged in')
       return
     }

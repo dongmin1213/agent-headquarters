@@ -12,7 +12,7 @@ import { createServer } from 'node:net'
 import { runSandboxed } from '../../src/exec/checks.ts'
 import { atomicWrite } from '../../src/exec/fsx.ts'
 import { cacheEnv, childEnv, claudeProjectDir, HOME_READABLE, MACH_SERVICES, real, sandboxProfile, tempRoots, type SandboxOpts } from '../../src/exec/sandbox.ts'
-import { claudeArgs, killGroup, launch, removeCacheDir } from '../../src/exec/worker.ts'
+import { codexArgs, killGroup, launch, removeCacheDir } from '../../src/exec/worker.ts'
 import { DEFAULTS } from '../../src/config.ts'
 import { makeRepo, sh, tmp } from './helpers.ts'
 import { NESTED_SKIP, nestedSandbox } from '../nested.ts'
@@ -198,7 +198,9 @@ test('worker profile text is byte-identical to the v4 snapshot (shared rule piec
     { worktree: `${R}/hq/verify/${'x'.repeat(220)}`, out: null, hqHome: `${R}/hq`, tokenDir: `${R}/cfg/hq`, hqPort: 1234, extraWritable: [], projects: [], home: `${R}/home` },
   ]
   const userTemp = tempRoots().filter((p) => p !== '/private/tmp')
-  const got = inputs.map((o) => userTemp.reduce((text, p) => text.split(p).join('<USER_TEMP>'), sandboxProfile(o)))
+  // An overridden TMPDIR may add a second temp root. Collapse only the identical normalized filters.
+  const got = inputs.map((o) => userTemp.reduce((text, p) => text.split(p).join('<USER_TEMP>'), sandboxProfile(o))
+    .replaceAll('(subpath "<USER_TEMP>") (subpath "<USER_TEMP>")', '(subpath "<USER_TEMP>")'))
   const want = JSON.parse(readFileSync(new URL('./fixtures/worker-profile.snap.json', import.meta.url), 'utf8')) as string[]
   assert.deepEqual(got, want)
 })
@@ -230,36 +232,7 @@ test('sandbox env: no HQ_TOKEN, API keys or SSH agent; caches point at the per-r
   } finally { delete process.env.HQ_TOKEN; s.server.close() }
 })
 
-// Opt-in (HQ_LIVE=1): the real CLI through launch() in the v4 profile — one small haiku run, then --resume.
-test('live contract: real claude -p (haiku) works in the profile and writes only its own transcript folder', { skip: skip || (!process.env.HQ_LIVE && 'HQ_LIVE=1 일 때만 실제 claude CLI로 실행') }, async () => {
-  const s = await setup()
-  const own = join(HOME, '.claude', 'projects', claudeProjectDir(real(s.wt)).name)
-  const sid = randomUUID()
-  const cfg = { ...DEFAULTS, maxTurns: 6, home: s.home, claudeBin: 'claude' }
-  const bin = execFileSync('/bin/sh', ['-c', 'command -v claude'], { encoding: 'utf8' }).trim()
-  const run = async (resume: boolean, prompt: string, hqDir: string) => {
-    const l = await launch({ claudeBin: bin, argv: claudeArgs(cfg, { role: 'implement', model: 'haiku', sessionId: sid, resume, out: s.out }), cwd: s.wt, hqDir,
-      outDir: s.out, prompt, sessionId: sid, spec: {}, sandbox: s.opts })
-    try { await new Promise((r) => l.child.once('exit', r)) } finally { killGroup(l.info.pid, 'SIGKILL') }
-    const lines = readFileSync(join(hqDir, 'stream.jsonl'), 'utf8').trim().split('\n').map((x) => JSON.parse(x))
-    return { res: lines.findLast((x) => x.type === 'result'), cacheDir: l.info.cacheDir }
-  }
-  try {
-    const a = await run(false, 'Use tools: Read README.md, run `git status` with Bash, and Write note.txt containing ok. Then reply DONE.', join(s.dir, 'r1', 'hq'))
-    assert.equal(a.res?.is_error, false, JSON.stringify(a.res))
-    assert.equal(readFileSync(join(s.wt, 'note.txt'), 'utf8').trim(), 'ok')
-    const b = await run(true, 'Reply with the single word RESUMED.', join(s.dir, 'r2', 'hq'))
-    assert.equal(b.res?.is_error, false, JSON.stringify(b.res))
-    assert.match(String(b.res?.result), /RESUMED/)
-    // The session left traces only in its own projects/<cwd>/ folder (session-env, other projects, … were denied).
-    const hits = spawnSync('/usr/bin/find', [join(HOME, '.claude'), '-name', `*${sid}*`], { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean)
-    assert.ok(hits.length > 0, 'transcript written')
-    for (const h of hits) assert.ok(h.startsWith(own + '/'), `unexpected write outside the own transcript folder: ${h}`)
-    assert.ok(readdirSync(own).some((f) => f.startsWith(sid)))
-    assert.equal(existsSync(join(own, 'memory', 'MEMORY.md')), false, 'no memory written')
-    for (const c of [a.cacheDir, b.cacheDir]) removeCacheDir(c)
-  } finally { rmSync(own, { recursive: true, force: true }); s.server.close() }
-})
+// Real Codex exec + resume contract lives in codex-live.test.ts.
 
 test('docs/SETUP.md worker sandbox section names every HOME_READABLE entry and every MACH_SERVICES name (no drift)', () => {
   const doc = readFileSync(join(import.meta.dirname, '../../docs/SETUP.md'), 'utf8')

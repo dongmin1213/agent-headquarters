@@ -32,7 +32,7 @@ function startingAttempt(h: Harness, taskId: string, sessionId: string): string 
 test('13. starting row without pid + a live process with that session id → adopted, no duplicate start', async () => {
   const h = harness()
   const sid = randomUUID()
-  const orphan = spawn(FAKE, ['-p', '--session-id', sid], { stdio: ['pipe', 'ignore', 'ignore'], detached: true })
+  const orphan = spawn(FAKE, ['exec', '--json', '--output-last-message', `/tmp/hq-session-${sid}.txt`, '-'], { stdio: ['pipe', 'ignore', 'ignore'], detached: true })
   orphan.stdin!.end('[[FAKE:sleep=20000]]')
   try {
     const id = h.plan([task('A')])

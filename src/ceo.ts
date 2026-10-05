@@ -1,9 +1,12 @@
-// One CEO judgment turn: headless `claude -p` with read-only tools and a JSON schema (schema v2, execution.md §3).
+// One CEO judgment turn: `codex exec` in read-only mode and a JSON schema (schema v2, execution.md §3).
 // The CEO never writes files or starts work; hq stores its questions or plan.
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { readFileSync } from 'node:fs'
-import { matchesGlob, resolve } from 'node:path'
+import { readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { CodexEvents, execArgs, prepareCodexHome, strictSchema } from './codex.ts'
+import { DEFAULTS } from './config.ts'
+import { join, matchesGlob, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
 import { isLimited } from './exec/contract.ts'
 import { josa, particle } from './josa.ts'
@@ -148,7 +151,9 @@ export function validateTasks(tasks: PlanTask[], projects: Project[]): string | 
 // ----- running a structured (JSON schema) turn over stream-json -----
 
 export interface JsonTurnInput {
-  claudeBin: string
+  codexBin: string
+  runtimeHome?: string
+  model?: string
   cwd: string
   prompt: string
   schema: object
@@ -162,15 +167,16 @@ export interface JsonTurnInput {
 export interface JsonTurn { ok: boolean; output: unknown; sessionId: string; error: string | null; limited: boolean; costUsd: number | null }
 
 export function runJsonTurn(i: JsonTurnInput): Promise<JsonTurn> {
-  const args = ['-p', '--output-format', 'stream-json', '--verbose', '--json-schema', JSON.stringify(i.schema),
-    '--tools', 'Read,Glob,Grep', '--disallowedTools', 'Read(**/.env*)',
-    '--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--max-turns', '30',
-    ...i.addDirs.flatMap((d) => ['--add-dir', d]),
-    ...(i.resume ? ['--resume', i.sessionId] : ['--session-id', i.sessionId])]
-  const env = { ...process.env }
-  delete env.CLAUDECODE
+  const codexHome = prepareCodexHome(i.runtimeHome ?? process.env.HQ_HOME ?? join(homedir(), '.hq'), `coordinator:${i.cwd}`)
+  const schemaPath = join(codexHome, `schema-${randomUUID()}.json`)
+  writeFileSync(schemaPath, JSON.stringify(strictSchema(i.schema)), { mode: 0o600 })
+  const args = execArgs({ model: i.model ?? DEFAULTS.models.sonnet, sessionId: i.sessionId, resume: i.resume, schemaPath })
+  const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: codexHome }
+  delete env.OPENAI_API_KEY
+  delete env.ANTHROPIC_API_KEY
+  const decoder = new CodexEvents()
   return new Promise((done) => {
-    const child = spawn(i.claudeBin, args, { cwd: i.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    const child = spawn(i.codexBin, args, { cwd: i.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
     let result: Record<string, unknown> | null = null
     let err = '', rejected = false, sid = i.sessionId
     const timer = setTimeout(() => child.kill('SIGINT'), i.timeoutMs ?? 15 * 60_000)
@@ -178,22 +184,26 @@ export function runJsonTurn(i: JsonTurnInput): Promise<JsonTurn> {
       let line: Record<string, unknown>
       try { line = JSON.parse(raw) } catch { return }
       if (!line || typeof line !== 'object') return
+      for (const event of decoder.consume(line)) {
+      line = event
       if (line.type === 'result') result = line
       if (typeof line.session_id === 'string') sid = line.session_id
       if (line.type === 'rate_limit_event' && (line.rate_limit_info as Record<string, unknown> | undefined)?.status === 'rejected') rejected = true
       try { i.onLine?.(line) } catch { /* observer errors never break the turn */ }
+      }
     })
     child.stderr!.on('data', (b: Buffer) => { if (err.length < 20_000) err += b })
     child.on('error', (e) => { err += String(e) })
     child.stdin!.on('error', () => {})
     child.stdin!.end(i.prompt)
-    child.on('close', () => {
+    child.on('close', (code) => {
       clearTimeout(timer)
+      rmSync(schemaPath, { force: true })
       const r = result as Record<string, unknown> | null
       const limited = isLimited(r, err, rejected)
       const cost = typeof r?.total_cost_usd === 'number' ? r.total_cost_usd : null
       const so = r?.structured_output
-      if (!r || r.is_error || so === undefined || so === null) return done({ ok: false, output: null, sessionId: sid, error: r ? String(r.result ?? r.subtype ?? '오류') : (err.trim() || '출력 없음').slice(0, 500), limited, costUsd: cost })
+      if (code !== 0 || !r || r.is_error || so === undefined || so === null) return done({ ok: false, output: null, sessionId: sid, error: r ? String(r.result ?? r.subtype ?? '오류') : (err.trim() || '출력 없음').slice(0, 500), limited, costUsd: cost })
       done({ ok: true, output: so, sessionId: sid, error: null, limited: false, costUsd: cost })
     })
   })
@@ -201,7 +211,7 @@ export function runJsonTurn(i: JsonTurnInput): Promise<JsonTurn> {
 
 export interface TurnInput {
   request: string; answers: { question: string; answer: string }[]; correction: string | null; project: Project; projects: Project[]
-  resumeSessionId: string | null; hqRoot: string; claudeBin: string; onLine?: (line: Record<string, unknown>) => void
+  resumeSessionId: string | null; hqRoot: string; codexBin: string; runtimeHome?: string; model?: string; onLine?: (line: Record<string, unknown>) => void
 }
 
 export async function runCeoTurn(input: TurnInput): Promise<CeoTurn> {
@@ -217,7 +227,7 @@ export async function runCeoTurn(input: TurnInput): Promise<CeoTurn> {
     ...(input.answers.length ? ['## 회장이 답한 질문', ...input.answers.map((a) => `- ${a.question} → ${a.answer}`)] : []),
     ...(input.correction ? ['## 이전 출력이 거부된 이유 (고쳐서 다시 내라)', input.correction] : []),
   ].join('\n')
-  const t = await runJsonTurn({ claudeBin: input.claudeBin, cwd: input.project.path, prompt, schema: CEO_SCHEMA, sessionId, resume: !!input.resumeSessionId,
+  const t = await runJsonTurn({ codexBin: input.codexBin, runtimeHome: input.runtimeHome, model: input.model, cwd: input.project.path, prompt, schema: CEO_SCHEMA, sessionId, resume: !!input.resumeSessionId,
     addDirs: input.projects.filter((p) => p.id !== input.project.id).map((p) => p.path), onLine: input.onLine })
   const out = t.output as CeoOutput | null
   if (t.ok && (!out || !Array.isArray(out.questions))) return { ...t, ok: false, output: null, error: '출력 형식 오류' }

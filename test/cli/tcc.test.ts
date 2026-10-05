@@ -22,7 +22,7 @@ test('protectedFolders: exact folder or below, prefix-only names excluded, order
 const probes = (over: Partial<Probes> = {}): Probes => ({
   platform: () => 'darwin', macVersion: async () => '26.5', nodeVersion: () => '26.4.0',
   findBin: (n) => `/fake/bin/${n}`,
-  run: async (cmd, args) => ({ code: 0, stdout: cmd.endsWith('claude') && args[0] === 'auth' ? '{"loggedIn":true}' : args.includes('rev-parse') ? 'true' : '', stderr: '' }),
+  run: async (cmd, args) => ({ code: 0, stdout: cmd.endsWith('codex') && args[0] === 'login' ? 'Logged in using ChatGPT' : args.includes('rev-parse') ? 'true' : '', stderr: '' }),
   hq: async () => ({ kind: 'down' }), pgrep: async () => true, launchctlLoaded: async () => true,
   sandboxSmoke: async () => ({ ok: true, detail: 'ok' }), pidCommand: async () => null,
   ...over,

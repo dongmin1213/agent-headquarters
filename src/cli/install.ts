@@ -14,9 +14,9 @@ const hasSprites = (ctx: Ctx) => ['pokemon', 'digimon'].every((k) => {
 })
 
 export function buildPlists(ctx: Ctx) {
-  let claudeName = 'claude'
-  try { claudeName = loadConfig(ctx.root, ctx.env).claudeBin } catch { /* doctor already reported */ }
-  const path = launchPath([process.execPath, findBin(claudeName, ctx.env.PATH), findBin('git', ctx.env.PATH)])
+  let codexName = 'codex'
+  try { codexName = loadConfig(ctx.root, ctx.env).codexBin } catch { /* doctor already reported */ }
+  const path = launchPath([process.execPath, findBin(codexName, ctx.env.PATH), findBin('git', ctx.env.PATH)])
   return {
     daemon: daemonPlist({
       label: daemonLabel(ctx), nodePath: process.execPath, root: ctx.root, home: ctx.home, port: ctx.port, path, logFile: daemonLog(ctx),

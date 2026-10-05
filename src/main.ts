@@ -7,6 +7,7 @@ import { dirname, resolve } from 'node:path'
 import { Bus } from './bus.ts'
 import type { Project } from './ceo.ts'
 import { loadConfig } from './config.ts'
+import { activateCodexProvider } from './codex.ts'
 import { RequestEngine } from './engine.ts'
 import { Runner } from './exec/runner.ts'
 import { notify } from './notify.ts'
@@ -48,6 +49,7 @@ process.on('exit', releaseLock)
 const dbPath = resolve(cfg.home, 'hq.db')
 if (migrateDb(resolve(root, '.data/hq.db'), dbPath)) console.log(`DB 이전: .data/hq.db → ${dbPath}`)
 const store = new Store(dbPath)
+activateCodexProvider(store)
 const bus = new Bus(store)
 
 // Outside ~/Desktop so the pet app never triggers a macOS folder-access prompt.

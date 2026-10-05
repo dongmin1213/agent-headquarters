@@ -1,4 +1,5 @@
-// Opt-in (HQ_LIVE=1): the revenue team's real shape under the team Seatbelt profile, without touching the real repo.
+// Legacy external pipeline contract; not part of HQ Codex runtime smoke tests.
+// Opt-in (HQ_LIVE_PIPELINE=1): the revenue team's real shape under the team Seatbelt profile, without touching the real repo.
 // The pipeline repo (~/Desktop/side/pipeline, override with HQ_PIPELINE) is git-cloned into a temp folder under $HOME
 // (so the ~ read deny-by-default is exercised; episodes/, state/, config secrets are gitignored and stay behind), its
 // .venv is symlinked read-only from the real repo, and everything runs through the scheduler's own profile builder.
@@ -23,7 +24,7 @@ import { tmp } from './helpers.ts'
 import { NESTED_SKIP, nestedSandbox } from '../nested.ts'
 
 const PIPELINE = process.env.HQ_PIPELINE ?? join(homedir(), 'Desktop/side/pipeline')
-const skip = (nestedSandbox && NESTED_SKIP) || (!process.env.HQ_LIVE && 'HQ_LIVE=1 일 때만 실제 파이프라인·claude CLI로 실행')
+const skip = (nestedSandbox && NESTED_SKIP) || (!process.env.HQ_LIVE_PIPELINE && 'HQ_LIVE_PIPELINE=1 일 때만 실제 파이프라인·claude CLI로 실행')
   || (!existsSync(join(PIPELINE, 'hq_team.py')) && `파이프라인 저장소 없음: ${PIPELINE}`)
 
 function run(argv: string[], cwd: string, env: NodeJS.ProcessEnv, ms = 180_000): Promise<{ code: number | null; out: string }> {
@@ -101,7 +102,7 @@ test('live: the revenue pipeline (clone) under the team profile — imports, hq_
   }
 })
 
-// Informational (HQ_LIVE=1): the same profile reaches the web from Python (the pipeline calls web APIs with urllib).
+// Informational (HQ_LIVE_PIPELINE=1): the same profile reaches the web from Python (the pipeline calls web APIs with urllib).
 test('live: python https fetch works under the team profile (network stays open)', { skip }, async (t) => {
   const dir = tmp('hq-team-live-')
   const cwd = join(dir, 'repo')

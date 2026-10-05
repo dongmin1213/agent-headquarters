@@ -34,7 +34,7 @@ test('6. full success: plan → work → checks → review pass → integration 
     assert.equal(acc.detailPath, `/ui/#request=${id}`)
     const rv = h.store.attempts(t.id).find((a) => a.kind === 'review')!
     assert.equal(rv.status, 'succeeded')
-    assert.ok(firstArgv(rv.dir).includes('--json-schema'))
+    assert.ok(firstArgv(rv.dir).includes('--output-schema'))
     assert.equal(await h.decide(`accept:${id}`, '수락'), null)
     assert.equal(req(h, id).status, 'accepted')
     await h.waitFor(() => h.store.approval(`merge:${id}:p`)?.state === 'open', 'merge card')
@@ -140,7 +140,7 @@ test('9. worker questions: partial answer keeps question, stale revision is refu
     await h.waitFor(() => ['reviewing', 'passed'].includes(tsk(h, tid).status), 'resumed and succeeded')
     const [a1, a2] = h.store.attempts(tid).filter((a) => a.kind === 'work')
     const argv = firstArgv(a2.dir)
-    assert.equal(argv[argv.indexOf('--resume') + 1], a1.session_id)
+    assert.equal(argv[argv.indexOf('resume') + 1], a1.session_id.replace(/^codex:/, ''))
     assert.equal(tsk(h, tid).attempts, 1)
     assert.match(readFileSync(join(a2.dir, 'hq', 'prompt.md'), 'utf8'), /질문 2\? → 아니오/)
   } finally { await h.close() }
@@ -187,7 +187,7 @@ test('11. limits: rejected event → held, no new starts until the latest blocki
     const [a1, a2] = h.store.attempts(tid).filter((a) => a.kind === 'work')
     assert.equal(a1.status, 'limited')
     const argv = firstArgv(a2.dir)
-    assert.equal(argv[argv.indexOf('--resume') + 1], a1.session_id)
+    assert.equal(argv[argv.indexOf('resume') + 1], a1.session_id.replace(/^codex:/, ''))
     assert.equal(tsk(h, tid).attempts, 1)
   } finally { await h.close() }
   const h2 = harness()

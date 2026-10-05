@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { ERROR_PATTERNS, explainError, UNKNOWN_ERROR } from '../../src/humanize.ts'
 
 const say = (re: RegExp) => ERROR_PATTERNS.find(([r]) => r.source === re.source)?.[1]
-const LOGIN = 'Claude에 로그인되어 있지 않아요 · 터미널에서 claude를 실행해 로그인해 주세요'
+const LOGIN = 'Codex에 로그인되어 있지 않아요 · 터미널에서 codex login으로 로그인해 주세요'
 
 test('error mapping table: known patterns', () => {
   const rows: [string, RegExp][] = [
@@ -14,8 +14,8 @@ test('error mapping table: known patterns', () => {
     ["fatal: Unable to create '/x/.git/index.lock': File exists.", /index\.lock을 지운 뒤/],
     ["Error: ENOENT: no such file or directory, open '/x/y'", /필요한 파일이나 프로그램을 찾지 못했어요/],
     ["Error: EACCES: permission denied, open '/x/y'", /권한이 없어/],
-    ['Not logged in · Please run /login', /^Claude에 로그인되어 있지 않아요/],
-    ['API Error: 401 {"type":"error","error":{"type":"authentication_error"}}', /^Claude에 로그인되어 있지 않아요/],
+    ['Not logged in · Please run /login', /^Codex에 로그인되어 있지 않아요/],
+    ['API Error: 401 {"type":"error","error":{"type":"authentication_error"}}', /^Codex에 로그인되어 있지 않아요/],
     ['rate limit exceeded, retry later', /사용 한도에 걸렸어요/],
     ['Error: connect ECONNREFUSED 127.0.0.1:7777', /연결을 받지 않았어요/],
     ['Error: connect ETIMEDOUT 1.2.3.4:443', /네트워크 응답이 없어요/],

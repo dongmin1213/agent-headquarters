@@ -14,7 +14,7 @@ export interface HqConfig {
   attemptWallMinutes: Record<Grade, number>
   maxTurns: number
   checkTimeoutMinutes: number
-  /** Model alias → value passed to `claude --model`. */
+  /** Model alias → value passed to `codex exec --model`. */
   models: Record<ModelAlias, string>
   ladder: ModelAlias[]
   maxAttempts: number
@@ -25,16 +25,16 @@ export interface HqConfig {
   /** Extra writable (and readable) roots inside the worker sandbox (execution.md §6). Package-manager caches are per run, not here. */
   sandbox: { extraWritable: string[] }
   notify: boolean
-  /** Claude CLI executable (tests point this at a fake). */
-  claudeBin: string
+  /** Codex CLI executable (tests point this at a fake). */
+  codexBin: string
 }
 
-export const DEFAULTS: Omit<HqConfig, 'home' | 'claudeBin'> = {
+export const DEFAULTS: Omit<HqConfig, 'home' | 'codexBin'> = {
   maxWorkers: 2,
   attemptWallMinutes: { L0: 20, L1: 45, L2: 90, L3: 120 },
   maxTurns: 200,
   checkTimeoutMinutes: 15,
-  models: { haiku: 'haiku', sonnet: 'sonnet', opus: 'opus' },
+  models: { haiku: 'gpt-6-luna', sonnet: 'gpt-6.1-sol', opus: 'gpt-6-astra' },
   ladder: ['haiku', 'sonnet', 'opus'],
   maxAttempts: 3,
   quota: { saveAt: 0.85, holdAt: 0.95 },
@@ -50,7 +50,9 @@ const expand = (p: string) => p.replace(/^~(?=\/|$)/, homedir())
 export function loadConfig(root: string, env: NodeJS.ProcessEnv = process.env): HqConfig {
   const file = resolve(root, 'config/hq.json')
   const raw: Record<string, unknown> = existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : {}
-  const known = new Set([...Object.keys(DEFAULTS), 'home', 'claudeBin'])
+  // Legacy executable settings never cause a Claude binary to be invoked as Codex.
+  delete raw.claudeBin
+  const known = new Set([...Object.keys(DEFAULTS), 'home', 'codexBin'])
   for (const k of Object.keys(raw)) if (!known.has(k)) throw new Error(`config/hq.json: 알 수 없는 키 "${k}"`)
   // Nested objects are checked too, so removed keys (e.g. quota.reviewOnlyAt) surface instead of being ignored.
   const nested = { attemptWallMinutes: DEFAULTS.attemptWallMinutes, models: DEFAULTS.models, quota: DEFAULTS.quota, sandbox: DEFAULTS.sandbox } as Record<string, object>
@@ -67,8 +69,9 @@ export function loadConfig(root: string, env: NodeJS.ProcessEnv = process.env): 
     quota: { ...DEFAULTS.quota, ...(raw.quota as object | undefined) },
     sandbox: { ...DEFAULTS.sandbox, ...(raw.sandbox as object | undefined) },
     home: expand(env.HQ_HOME ?? (raw.home as string | undefined) ?? '~/.hq'),
-    claudeBin: env.HQ_CLAUDE_BIN ?? (raw.claudeBin as string | undefined) ?? 'claude',
+    codexBin: env.HQ_CODEX_BIN ?? (raw.codexBin as string | undefined) ?? 'codex',
   } as HqConfig
+  for (const k of Object.keys(c.models) as ModelAlias[]) if (/^(haiku|sonnet|opus)$|^claude-/.test(c.models[k])) c.models[k] = DEFAULTS.models[k]
   const posInt = (v: unknown) => Number.isInteger(v) && (v as number) > 0
   if (!posInt(c.maxWorkers)) throw new Error('config: maxWorkers는 양의 정수')
   if (!posInt(c.maxTurns)) throw new Error('config: maxTurns는 양의 정수')

@@ -1,0 +1,153 @@
+// Codex CLI boundary. Raw JSONL is retained; adapters expose the engine's stable event contract.
+import { createHash, randomUUID } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import { createInterface } from 'node:readline'
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import type { Store } from './store.ts'
+
+export const threadId = (id: string) => id.startsWith('codex:') ? id.slice(6) : null
+export const sessionMarker = (id: string) => `hq-session-${id.replace(/[^a-zA-Z0-9_-]/g, '_')}.txt`
+
+/** Old Claude quota/login holds do not describe the newly selected Codex account. Keep execution history. */
+export function activateCodexProvider(store: Store): void {
+  if (store.get('runtime.provider') === 'codex') return
+  store.tx(() => {
+    store.raw().exec("delete from quota; update approvals set state = 'superseded' where id = 'system:login' and state = 'open'")
+    for (const k of ['limit.backoffUntil', 'limit.backoffLevel', 'login.required']) store.set(k, null)
+    store.set('runtime.provider', 'codex')
+  })
+}
+
+/** Never point a worker at the user's sessions/config/plugins. Only its authentication is copied. */
+export function prepareCodexHome(root: string, key: string, source = process.env.CODEX_HOME ?? join(homedir(), '.codex')): string {
+  const dir = join(root, 'codex', createHash('sha256').update(key).digest('hex'))
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+  if (!lstatSync(dir).isDirectory() || lstatSync(dir).isSymbolicLink()) throw new Error('Codex 실행 폴더가 실제 디렉터리가 아닙니다')
+  chmodSync(dir, 0o700)
+  const auth = join(source, 'auth.json')
+  if (existsSync(auth)) {
+    const data = readFileSync(auth)
+    const hash = createHash('sha256').update(data).digest('hex')
+    const stamp = join(dir, '.source-auth-hash')
+    // Preserve a token refreshed by this isolated CLI unless the user's login changed.
+    if (!existsSync(stamp) || lstatSync(stamp).isSymbolicLink() || lstatSync(stamp).size !== 64 || readFileSync(stamp, 'utf8') !== hash) {
+      // Rename replaces a malicious destination symlink rather than following it outside this directory.
+      const tmp = join(dir, `.auth-${process.pid}-${randomUUID()}`)
+      writeFileSync(tmp, data, { mode: 0o600, flag: 'wx' })
+      renameSync(tmp, join(dir, 'auth.json'))
+      writeFileSync(tmp, hash, { mode: 0o600, flag: 'wx' })
+      renameSync(tmp, stamp)
+    }
+  }
+  return dir
+}
+
+/** OpenAI strict structured output requires all object keys; optional fields become nullable. */
+export function strictSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(strictSchema)
+  if (!value || typeof value !== 'object') return value
+  const out = Object.fromEntries(Object.entries(value).map(([k, v]) => [k, strictSchema(v)])) as Record<string, any>
+  if (out.type === 'object' && out.properties) {
+    const required = new Set(Array.isArray(out.required) ? out.required : [])
+    for (const k of Object.keys(out.properties)) if (!required.has(k)) out.properties[k] = { anyOf: [out.properties[k], { type: 'null' }] }
+    out.required = Object.keys(out.properties)
+    out.additionalProperties = false
+  }
+  return out
+}
+
+export function execArgs(o: { model?: string; sessionId?: string; resume?: boolean; schemaPath?: string; externalSandbox?: boolean }): string[] {
+  const resume = o.resume && o.sessionId ? threadId(o.sessionId) : null
+  return ['exec', ...(resume ? ['resume', resume] : []), '--json', '--ignore-user-config', '--ignore-rules',
+    '-c', 'approval_policy="never"', '-c', 'features.shell_snapshot=false', '-c', 'features.memories=false',
+    ...['apps', 'plugins', 'hooks', 'multi_agent', 'browser_use', 'computer_use', 'image_generation'].flatMap(f => ['-c', `features.${f}=false`]),
+    ...(o.externalSandbox ? ['--dangerously-bypass-approvals-and-sandbox'] : ['-c', 'sandbox_mode="read-only"']),
+    ...(o.model ? ['--model', o.model] : []), ...(o.schemaPath ? ['--output-schema', o.schemaPath] : []), '-']
+}
+
+/** Unwrap only the exact shell -c/-lc envelope, without executing or evaluating shell text. */
+export function commandText(command: string): string {
+  const m = /^(?:\/(?:bin|usr\/bin)\/)?(?:bash|zsh|sh) -l?c (.*)$/s.exec(command)
+  if (!m) return command
+  const s = m[1]
+  if (/^[a-zA-Z0-9_./=-]+$/.test(s)) return s
+  if (s.startsWith("'") && s.endsWith("'")) {
+    const body = s.slice(1, -1)
+    // A single shell-quoted argument, including the standard escaped-apostrophe sequence.
+    if (!body.replaceAll("'\\''", '').includes("'")) return body.replaceAll("'\\''", "'")
+  }
+  if (s.startsWith('"') && s.endsWith('"') && !/(?<!\\)["$`]/.test(s.slice(1, -1))) return s.slice(1, -1).replace(/\\(["\\$`])/g, '$1')
+  return command
+}
+
+type Event = Record<string, any>
+export class CodexEvents {
+  sessionId = ''
+  text = ''
+  result: Event | null = null
+  consume(line: Event): Event[] {
+    if (!line || typeof line !== 'object' || Array.isArray(line)) return []
+    // Historical evidence remains readable after migration; newly launched Codex emits the cases below.
+    if (!['thread.started', 'turn.started', 'turn.completed', 'turn.failed', 'error'].includes(line.type) && !String(line.type).startsWith('item.')) return [line]
+    if (line.type === 'thread.started') {
+      if (typeof line.thread_id !== 'string' || !line.thread_id) return []
+      this.sessionId = `codex:${line.thread_id}`
+      return [{ type: 'system', session_id: this.sessionId }]
+    }
+    if (line.type === 'turn.started') { this.text = ''; this.result = null; return [] }
+    const item = line.item
+    if (line.type === 'item.completed' && item?.type === 'agent_message') {
+      this.text = String(item.text ?? '')
+      return [{ type: 'assistant', message: { content: [{ type: 'text', text: this.text }] } }]
+    }
+    if (item?.type === 'command_execution') {
+      const command = commandText(String(item.command ?? ''))
+      const call = { type: 'assistant', message: { content: [{ type: 'tool_use', id: item.id, name: 'Bash', input: { command } }] } }
+      if (line.type === 'item.started') return [call]
+      if (line.type === 'item.completed') {
+        const exit = item.status === 'completed' && Number.isInteger(item.exit_code) ? item.exit_code : null
+        return [call, { type: 'user', tool_use_result: { interrupted: exit === null }, message: { content: [{ type: 'tool_result', tool_use_id: item.id,
+          is_error: exit !== 0, content: exit === null ? 'Unknown exit code' : exit === 0 ? String(item.aggregated_output ?? '') : `Exit code ${exit}\n${item.aggregated_output ?? ''}` }] } }]
+      }
+    }
+    if (line.type === 'turn.completed') {
+      let output: unknown
+      try { output = JSON.parse(this.text) } catch { /* normal work uses done.json, not a schema */ }
+      this.result = { type: 'result', subtype: 'success', is_error: false, session_id: this.sessionId, result: this.text, usage: line.usage ?? {},
+        ...(output === undefined ? {} : { structured_output: output }) }
+      return [this.result]
+    }
+    if (line.type === 'turn.failed' || line.type === 'error') {
+      const error = line.error ?? line
+      const message = String(error.message ?? 'Codex 실행 오류')
+      const code = /usage limit|rate.?limit|quota|\b429\b/i.test(message) ? 429 : Number(error.status_code ?? error.status ?? 0)
+      this.result = { type: 'result', subtype: 'error', is_error: true, session_id: this.sessionId, result: message, api_error_status: code, usage: {} }
+      return [this.result]
+    }
+    if (line.type === 'item.completed' && item) return [{ type: 'assistant', message: { content: [{ type: 'tool_use', name: item.type, input: { path: item.query ?? item.text ?? '' } }] } }]
+    return []
+  }
+}
+
+/** Small team helper. Scheduler supplies a private CODEX_HOME and the outer Seatbelt profile. */
+export function runCodex(run: { prompt: string; cwd: string; model?: string; timeoutMs?: number }): Promise<{ ok: boolean; text: string; limited: boolean }> {
+  return new Promise((resolve) => {
+    const decoder = new CodexEvents()
+    const child = spawn(process.env.HQ_CODEX_BIN ?? 'codex', execArgs({ model: run.model, externalSandbox: !!process.env.HQ_TEAM }),
+      { cwd: run.cwd, stdio: ['pipe', 'pipe', 'pipe'] })
+    let error = ''
+    const timer = setTimeout(() => child.kill('SIGINT'), run.timeoutMs ?? 60_000)
+    createInterface({ input: child.stdout }).on('line', (raw) => { try { decoder.consume(JSON.parse(raw)) } catch { /* non-JSON diagnostic */ } })
+    child.stderr.on('data', (b) => { error = (error + b).slice(-20_000) })
+    child.on('error', (e) => { error = e.message })
+    child.stdin.on('error', () => {})
+    child.stdin.end(run.prompt)
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      const r = decoder.result
+      resolve({ ok: code === 0 && !!r && !r.is_error, text: r?.result || error, limited: r?.api_error_status === 429 || (!r && /usage limit|rate.?limit|429/i.test(error)) })
+    })
+  })
+}

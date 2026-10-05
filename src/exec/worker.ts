@@ -1,8 +1,9 @@
-// Spawning and supervising detached, sandboxed `claude -p` processes (execution.md §6 §7 §13).
+// Spawning and supervising detached, sandboxed `codex exec` processes (execution.md §6 §7 §13).
 // The process outlives the daemon: stdin is the prompt file, stdout/stderr go straight to hq/ log files.
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { closeSync, mkdirSync, openSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
+import { execArgs, prepareCodexHome, sessionMarker, strictSchema } from '../codex.ts'
 import type { HqConfig } from '../config.ts'
 import { atomicJson, atomicWrite, readJson } from './fsx.ts'
 import { cacheEnv, childEnv, isCacheDir, makeCacheDir, sandboxProfile, wrap, type SandboxOpts } from './sandbox.ts'
@@ -14,17 +15,8 @@ export interface ProcessInfo { pid: number; startedAt: string; sessionId: string
 const modelArg = (cfg: HqConfig, m: string) => cfg.models[m as keyof HqConfig['models']] ?? m
 
 /** §6 argv per role. Tool rule lists are separate argv items (rules like `Bash(git push:*)` contain spaces). */
-export function claudeArgs(cfg: HqConfig, o: { role: Role; model: string; sessionId: string; resume: boolean; out: string | null; schema?: object }): string[] {
-  const base = ['-p', '--output-format', 'stream-json', '--verbose', '--model', modelArg(cfg, o.model),
-    ...(o.resume ? ['--resume', o.sessionId] : ['--session-id', o.sessionId]), '--max-turns', String(cfg.maxTurns)]
-  const guard = ['--setting-sources', '', '--strict-mcp-config', '--disable-slash-commands', '--disallowedTools', ...cfg.workerDisallowedTools]
-  if (o.role === 'implement') return [...base, '--tools', 'Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch',
-    // Without --allowedTools, `git commit` is denied as "requires approval" in -p mode (verified on 2.1.285); the sandbox is the boundary.
-    '--allowedTools', 'Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'WebFetch', 'WebSearch', '--permission-mode', 'acceptEdits', '--add-dir', o.out!, ...guard]
-  if (o.role === 'collect') return [...base, '--tools', 'Read,Glob,Grep,WebFetch,WebSearch,Write', '--permission-mode', 'dontAsk',
-    '--allowedTools', 'Read', 'Glob', 'Grep', 'WebFetch', 'WebSearch', `Write(/${o.out}/**)`, ...guard]
-  return [...base, '--tools', 'Bash,Read,Glob,Grep', '--permission-mode', 'dontAsk', '--allowedTools', 'Bash', 'Read', 'Glob', 'Grep',
-    '--json-schema', JSON.stringify(o.schema), ...guard]
+export function codexArgs(cfg: HqConfig, o: { role: Role; model: string; sessionId: string; resume: boolean; out: string | null; schema?: object; schemaPath?: string }): string[] {
+  return execArgs({ model: modelArg(cfg, o.model), sessionId: o.sessionId, resume: o.resume, schemaPath: o.schemaPath, externalSandbox: true })
 }
 
 /** Start time of a live pid, or null when the process is gone or `ps` cannot run (never rejects). */
@@ -50,12 +42,12 @@ export function psInfo(pid: number): Promise<string | null> {
 }
 
 /**
- * Whether a `ps` line looks like one of our workers: it names the claude binary and either one of the task's paths
- * (worktree/clone) or one of its attempt sessions (`--session-id <id>` / `--resume <id>`).
+ * Whether a `ps` line looks like one of our workers: it names the Codex binary and either one of the task's paths
+ * (worktree/clone) or one of its attempt sessions (the output marker or `resume <thread_id>`).
  */
 export function looksLikeWorker(line: string, o: { bin: string; paths: string[]; sessions: string[] }): boolean {
   if (!o.bin || !line.includes(o.bin)) return false
-  return o.paths.some((p) => !!p && line.includes(p)) || o.sessions.some((s) => !!s && (line.includes(`--session-id ${s}`) || line.includes(`--resume ${s}`)))
+  return o.paths.some((p) => !!p && line.includes(p)) || o.sessions.some((s) => !!s && (line.includes(`--session-id ${s}`) || line.includes(`resume ${s.replace(/^codex:/, '')}`) || line.includes(sessionMarker(s))))
 }
 
 /** Calls a ps function, turning a synchronous throw or a rejection into null. */
@@ -149,12 +141,11 @@ export async function terminateGroup(pid: number, lstart: string | null, graceMs
 
 /** A process still running this session (started before hq could record its pid). §7.3 */
 export function findOrphan(sessionId: string): Promise<number | null> {
-  const probe = (flag: string) => new Promise<number | null>((resolve) => execFile('pgrep', ['-f', '--', `${flag} ${sessionId}`], (err, out) => {
+  return new Promise((resolve) => execFile('pgrep', ['-f', '--', sessionMarker(sessionId).replaceAll('.', '\\.')], (err, out) => {
     if (err) return resolve(null)
     const pids = String(out).split('\n').map(Number).filter((p) => p > 0 && p !== process.pid)
     resolve(pids[0] ?? null)
   }))
-  return probe('--session-id').then((p) => p ?? probe('--resume'))
 }
 
 /** Exit of a spawned child, observed from spawn time on (a fast exit before tracking starts is never missed). */
@@ -194,17 +185,26 @@ export class LaunchAborted extends Error {}
  * as its own process group, and records process.json atomically. Throws when the process cannot start.
  * `proceed` is asked right before the spawn (there is no await between the two); false → LaunchAborted, nothing spawned.
  */
-export async function launch(o: { claudeBin: string; argv: string[]; cwd: string; hqDir: string; outDir: string | null; prompt: string; sessionId: string; spec: object; sandbox: SandboxOpts; proceed?: () => boolean }, ps: PsLstart = psLstart): Promise<Launched> {
+export async function launch(o: { codexBin: string; argv: string[]; cwd: string; hqDir: string; outDir: string | null; prompt: string; sessionId: string; spec: object; schema?: object; sandbox: SandboxOpts; proceed?: () => boolean }, ps: PsLstart = psLstart): Promise<Launched> {
   mkdirSync(o.hqDir, { recursive: true })
   if (o.outDir) mkdirSync(o.outDir, { recursive: true })
   atomicWrite(join(o.hqDir, 'prompt.md'), o.prompt)
   const profile = join(o.hqDir, 'sandbox.sb')
-  atomicWrite(profile, sandboxProfile(o.sandbox))
-  const argv = wrap([o.claudeBin, ...o.argv], profile)
+  const codexHome = prepareCodexHome(o.sandbox.hqHome, o.cwd)
+  const schemaPath = o.schema ? join(codexHome, 'output-schema.json') : null
+  if (schemaPath) atomicJson(schemaPath, strictSchema(o.schema))
+  atomicWrite(profile, sandboxProfile({ ...o.sandbox, codexHome }))
+  const args = [...o.argv]
+  const stdin = args.at(-1) === '-' ? args.pop() : null
+  if (schemaPath) args.push('--output-schema', schemaPath)
+  // A unique pathname in argv closes the spawn-before-process.json recovery gap.
+  if (args[0] === 'exec') args.push('--output-last-message', join(codexHome, sessionMarker(o.sessionId)))
+  if (stdin) args.push(stdin)
+  const argv = wrap([o.codexBin, ...args], profile)
   atomicJson(join(o.hqDir, 'spec.json'), { argv: argv.map((a) => (a.length > 2000 ? a.slice(0, 2000) + '…' : a)), cwd: o.cwd, ...o.spec })
   if (o.proceed && !o.proceed()) throw new LaunchAborted('시작 전에 취소됨')
   const cacheDir = makeCacheDir()
-  const env = childEnv({ ...cacheEnv(cacheDir), ...(o.outDir ? { HQ_ATTEMPT_OUT: o.outDir } : {}) })
+  const env = childEnv({ CODEX_HOME: codexHome, ...cacheEnv(cacheDir), ...(o.outDir ? { HQ_ATTEMPT_OUT: o.outDir } : {}) })
   const fin = openSync(join(o.hqDir, 'prompt.md'), 'r')
   const fout = openSync(join(o.hqDir, 'stream.jsonl'), 'a')
   const ferr = openSync(join(o.hqDir, 'stderr.log'), 'a')
