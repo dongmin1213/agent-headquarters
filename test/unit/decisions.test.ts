@@ -23,7 +23,7 @@ test('18. headline sentences', () => {
   const until = new Date(2026, 8, 30, 14, 5).toISOString()
   assert.equal(buildHeadline({ ...base, waiting: 1, quota: { mode: 'hold', until, window: 'five_hour', pct: 0.96 } }).text, '사용 한도 5시간 96% — 14:05까지 쉬어요')
   assert.equal(buildHeadline({ ...base, workers: [w({ state: 'held' })], quota: { mode: 'hold', until, window: 'seven_day', pct: 1 } }).text, '사용 한도 7일 100% — 14:05까지 쉬어요')
-  assert.equal(buildHeadline({ ...base, waiting: 2, quota: { ...q, mode: 'unobserved' } }).text, '한도 관측 전이라 하나씩 실행 중')
+  assert.equal(buildHeadline({ ...base, waiting: 2, quota: { ...q, mode: 'unobserved' } }).text, '사용량 미관측 · 실행 대기 2건')
   assert.equal(buildHeadline({ ...base, waiting: 2 }).text, '빈 자리 기다리는 중 (2건)')
   assert.equal(buildHeadline({ ...base, recentMerged: '로그인 개선' }).text, '병합 완료: 로그인 개선')
   assert.deepEqual(buildHeadline(base), { text: '지금 하실 일은 없어요', needsYou: 0 })

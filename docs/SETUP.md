@@ -265,3 +265,5 @@ codex login status
 검증: `node --test test/unit/game.test.ts test/unit/scheduler.test.ts`. 실제 이미지 생성·이미지 입력·게임팀 계획과 그래픽 실행은 구독/로컬 환경을 사용하는 별도 검증이며 전체 상용 게임 제작 검증과 구분합니다.
 
 게임 그래픽 프로필은 Godot 화면 캡처를 위해 `com.apple.hiservices-xpcservice`, `com.apple.windowserver.active`, `com.apple.windowserver`, `com.apple.CARenderServer`, `com.apple.MTLCompilerService`만 추가합니다. 일반 프로젝트에는 적용하지 않습니다. LaunchServices, open/osascript/launchctl 금지와 HQ 토큰·개인 인증 읽기 금지는 유지합니다. 게임 작업·검사에는 임시 HOME을 사용해 Godot 사용자 저장 데이터도 분리합니다. `HQ_LIVE_GAME_RENDER=1 node --test test/unit/game-render-live.test.ts`로 실제 움직이는 장면의 PNG 캡처·4초 영상·비밀 파일 읽기 거부를 시험합니다(잠깐 테스트 창이 열립니다).
+
+Codex 사용률 이벤트가 아직 관측되지 않은 경우에도 독립 작업·검토는 최대 `min(2, maxWorkers)`개를 병렬 실행합니다. 사용률을 0%로 간주하지는 않습니다. CEO 판단은 우선 처리하고, 실제 한도 오류·로그인 실패·한도 backoff가 발생하면 신규 실행을 보류합니다.

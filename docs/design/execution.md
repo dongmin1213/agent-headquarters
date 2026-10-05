@@ -180,9 +180,9 @@ schema_version: pragma user_version
 
 ## 13. 한도·동시성·폭주
 - quota: stream의 `rate_limit_event.rate_limit_info`(`status`, `resetsAt` epoch초, `unifiedWindows.{창}.{utilization,resetsAt}`)를 창별 행으로 저장. `resets_at`이 지난 창은 알 수 없음으로 본다.
-- 모드: `hold` = 최상위 `rate_limit_info.status == "rejected"`(창은 `rateLimitType`) 또는 어떤 창이든 ≥ holdAt → 모든 시작 중지(CEO 턴·팀 포함), 그 창의 resetsAt까지. **`overageStatus`는 신호가 아니다**(정상 이벤트에도 `"rejected"`가 들어 있음을 실측). resetsAt 없는 `rejected`·429 → 15분·30분·60분 지수 대기(타이머, 불변식 c). `save` = ≥ saveAt. 관측 없음 = save와 같다.
+- 모드: `hold` = 최상위 `rate_limit_info.status == "rejected"`(창은 `rateLimitType`) 또는 어떤 창이든 ≥ holdAt → 모든 시작 중지(CEO 턴·팀 포함), 그 창의 resetsAt까지. **`overageStatus`는 신호가 아니다**(정상 이벤트에도 `"rejected"`가 들어 있음을 실측). resetsAt 없는 `rejected`·429 → 15분·30분·60분 지수 대기(타이머, 불변식 c). `save` = ≥ saveAt. 관측 없음은 사용률을 추정하지 않으며 작업·검토를 최대 min(2, maxWorkers)개까지 허용한다.
 - 로그인 실패(result `is_error` + `"Not logged in"`) → 전역 hold + 결정 카드 1건 "Claude 로그인 필요"(작업별 unverifiable로 흩어지지 않게).
-- 동시성(모든 모델 실행이 같은 예산): normal = 작업·검토 `maxWorkers` + CEO 1. save·관측 없음 = **전체 1개, CEO 턴이 우선**(판단이 작업자보다 먼저 한도를 쓴다).
+- 동시성(모든 모델 실행이 같은 예산): normal = 작업·검토 `maxWorkers` + CEO 1. save = **전체 1개, CEO 턴이 우선**. 관측 없음은 작업·검토 최대 min(2, maxWorkers)개이며 CEO 대기/실행 시 신규 배정을 멈추고 CEO도 실행 중인 작업이 끝나기를 기다린다. 실제 한도 오류·로그인 실패·backoff는 계속 모든 신규 실행을 보류한다.
 - 검토 시도도 연속 limited 3 → blocked. 시간 예산: 시도당 `attemptWallMinutes[grade]`, 작업 누적(resume 포함) 3배 상한.
 - 판정 우선순위: hq가 폭주로 죽였으면 `runaway`(과거 한도 이벤트가 덮지 않음).
 - CEO 턴도 stream-json으로 실행해 관측을 얻는다. 팀 스케줄러도 hold를 따른다. 기존 `limit.blockedUntil`은 quota 관리자로 통합.
@@ -237,7 +237,7 @@ DecisionItem 순서: system(예: `system:login` — Claude 로그인 필요, req
 - `<작업>이 막혔어요: <사유 한 줄>`
 - `<작업> <구현|검토|검증> 중 · <모델> · 다음: <단계>` (+ `외 N명`)
 - `사장이 계획 중이에요` / `빈 자리 기다리는 중 (N건)`
-- `사용 한도 <창> <n>% — <HH:mm>까지 쉬어요` / `한도 관측 전이라 하나씩 실행 중`
+- `사용 한도 <창> <n>% — <HH:mm>까지 쉬어요` / `사용량 미관측 · 실행 대기 N건`
 - `병합 완료: <요청>` (완료 후 10분간)
 - `지금 하실 일은 없어요` / 데몬 끊김은 펫이 `hq 꺼짐`
 

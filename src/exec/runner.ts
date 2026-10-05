@@ -838,10 +838,14 @@ export class Runner {
   private async dispatch(): Promise<void> {
     const q = this.quota()
     if (q.mode === 'hold') return
-    const single = q.mode === 'save' || q.mode === 'unobserved'
-    // save / unobserved: one process in total, and the CEO goes first (§13).
-    if (single && (this.ceoLock.busy || this.ceoWaiting())) return
-    let free = (single ? 1 : this.cfg.maxWorkers) - this.store.liveAttempts().length
+    // Codex may provide no percentage events. Missing telemetry must not serialize
+    // independent work forever: allow two workers, while keeping CEO priority and
+    // all observed quota/login/backoff holds. A higher maxWorkers needs telemetry.
+    const unobserved = q.mode === 'unobserved'
+    const single = q.mode === 'save'
+    if ((single || unobserved) && (this.ceoLock.busy || this.ceoWaiting())) return
+    const capacity = single ? 1 : unobserved ? Math.min(2, this.cfg.maxWorkers) : this.cfg.maxWorkers
+    let free = capacity - this.store.liveAttempts().length
     for (const t of this.store.tasksByStatus(['reviewing'])) {
       if (free <= 0) return
       const r = this.store.request(t.request_id)

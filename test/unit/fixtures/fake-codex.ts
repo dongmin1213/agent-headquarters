@@ -53,7 +53,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 const now = Math.floor(Date.now() / 1000)
 emit({ type: 'system', subtype: 'init', session_id: sid, argv, cwd: process.cwd() })
 const rejected = mk('rejectalways') || (mk('rejectfirst') && !resume)
-emit({ type: 'rate_limit_event', rate_limit_info: { status: rejected ? 'rejected' : 'allowed', resetsAt: Number(mk('resets') ?? now + 3600), rateLimitType: 'five_hour',
+if (!mk('noquota')) emit({ type: 'rate_limit_event', rate_limit_info: { status: rejected ? 'rejected' : 'allowed', resetsAt: Number(mk('resets') ?? now + 3600), rateLimitType: 'five_hour',
   unifiedWindows: { five_hour: { utilization: rejected ? 1 : Number(mk('util') ?? 0.1), resetsAt: Number(mk('resets') ?? now + 3600) }, seven_day: { utilization: 0.05, resetsAt: now + 6 * 86400 } } } })
 const result = (extra: Record<string, unknown> = {}) => emit({ type: 'result', subtype: 'success', is_error: false, session_id: sid, total_cost_usd: 0.001,
   usage: { input_tokens: 10, output_tokens: 20 }, result: 'done', ...extra })

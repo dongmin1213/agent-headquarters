@@ -266,6 +266,34 @@ test('v3-15. "Not logged in" → global hold and one system:login card (first in
   } finally { await h.close() }
 })
 
+test('unobserved usage permits bounded parallel workers, preserving dependencies and CEO priority', async () => {
+  for (const maxWorkers of [1, 5]) {
+    const h = harness({ cfg: { maxWorkers } })
+    try {
+      const id = h.plan([
+        task('A', { brief: '[[FAKE:noquota]] [[FAKE:sleep=60000]]' }),
+        task('B', { brief: '[[FAKE:noquota]] [[FAKE:sleep=60000]]' }),
+        task('C', { brief: '[[FAKE:noquota]] [[FAKE:sleep=60000]]' }),
+        task('D', { depends_on: ['A'] }),
+      ])
+      await h.approve(id)
+      assert.equal(h.runner.quota().mode, 'unobserved')
+      h.store.addRequest('req-ceo00001', 'p', 'CEO 먼저')
+      await h.runner.tick()
+      assert.equal(h.store.liveAttempts().length, 0)
+      h.store.updateRequest('req-ceo00001', { status: 'cancelled' })
+      const capacity = Math.min(2, maxWorkers)
+      await h.waitFor(() => h.store.liveAttempts().filter(a => a.pid !== null).length === capacity, 'bounded concurrent workers')
+      await h.runner.tick()
+      assert.equal(h.runner.quota().mode, 'unobserved')
+      assert.equal(h.store.liveAttempts().length, capacity)
+      assert.equal(h.store.attempts(`${id}.C`).length, 0, 'unknown quota never allows more than two')
+      assert.equal(h.store.attempts(`${id}.D`).length, 0, 'dependent work still waits')
+      assert.equal(h.runner.canStartCeo(), false)
+    } finally { await h.close() }
+  }
+})
+
 test('v3-16. save mode: one process in total and the CEO goes first', async () => {
   const h = harness()
   try {

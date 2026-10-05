@@ -286,7 +286,7 @@ export function buildHeadline(h: HeadlineInput): Headline {
     const pct = Math.round((h.quota.pct ?? 1) * 100)
     return { text: `사용 한도 ${WINDOW_NAMES[h.quota.window ?? ''] ?? h.quota.window ?? ''} ${pct}% — ${hhmm(h.quota.until)}까지 쉬어요`, needsYou }
   }
-  if (h.waiting > 0) return { text: h.quota.mode === 'unobserved' ? '한도 관측 전이라 하나씩 실행 중' : `빈 자리 기다리는 중 (${h.waiting}건)`, needsYou }
+  if (h.waiting > 0) return { text: h.quota.mode === 'unobserved' ? `사용량 미관측 · 실행 대기 ${h.waiting}건` : `빈 자리 기다리는 중 (${h.waiting}건)`, needsYou }
   if (h.recentMerged) return { text: `병합 완료: ${h.recentMerged}`, needsYou }
   return { text: '지금 하실 일은 없어요', needsYou }
 }

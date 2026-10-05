@@ -14,7 +14,7 @@ WIP에서 작업자가 스스로 정한 15개 결정에 대한 판정:
 | 4 | attempts 증가 후 limited 등에서 감소 | 동작이 같으면 허용. 규칙은 §C "시도 카운트" |
 | 5·6 | 작업자 질문·invalid 횟수를 kv에 저장 | **변경**. 질문은 `task_questions` 테이블(§4), invalid 횟수·연속 limited는 tasks 컬럼 |
 | 7 | 한도 신호 없는 limited 시 kv blockedUntil +1h | **변경**. quota 테이블이 유일한 원천(§13). 구조화 신호 없는 한도 판정은 하지 않는다(§8.1) |
-| 8 | 한도 관측 전 동시 1 | 유지(§13) |
+| 8 | 한도 관측 전 동시 1 | Codex 전환 후 최대 min(2, maxWorkers), CEO 우선과 실제 hold 유지(§13) |
 | 9 | 시작 실패 3회 연속 → blocked | 유지 |
 | 10 | 다중 의존: 다른 의존을 조상으로 가진 head에서 분기, 없으면 blocked | **변경**. §11: hq가 의존 head들을 병합한 base 커밋을 만든다 |
 | 11 | process.json에 lstart, ±2초 대체 | 유지 + §7 pgrep 고아 탐지 추가 |
@@ -80,7 +80,7 @@ reconcile은 1분마다 실행한다.
 - 세지 않는 경우: resume 시작, 직전이 `limited | transient | start_failed | brief_blocked`였던 재시작.
 
 **배정**
-- 용량 = `(hold ? 0 : save·미관측 ? 1 : maxWorkers) − 살아 있는 작업·검토 수`. CEO 턴은 별도 1자리.
+- 용량 = `(hold ? 0 : save ? 1 : 미관측 ? min(2, maxWorkers) : maxWorkers) − 살아 있는 작업·검토 수`. CEO 턴은 별도 1자리.
 - 후보 순서: 요청 created_at → 계획 순. `reviewing`이면서 살아 있는 검토가 없는 작업이 먼저, 그 다음 `pending | rework | held`(held는 hold가 풀렸을 때)이면서 의존 모두 passed이고 요청이 `executing`인 작업.
 - 시작 전 준비
   - worktree 준비 → 필요하면 setup(샌드박스, 시도 아님, 실패 → blocked + 사유)
@@ -264,7 +264,7 @@ v2 구현(현재 main 통합본) 위에서 아래를 바꾼다. 판단은 여기
 ### V5. 한도·슬롯 (§13)
 - `overageStatus` 무시. rejected 판정은 최상위 `rate_limit_info.status` + `rateLimitType`로 한다. resetsAt 없는 rejected·429 → 15·30·60분 지수 대기(kv 타이머).
 - "Not logged in" 결과 → 전역 hold + DecisionItem kind `blocked` 대신 새 종류? → **types 변경 없이** 요청 무관 카드로 approval `system:login`(옵션 `다시 확인`)을 만든다. 결정하면 hold를 풀고 다음 시작에서 재확인한다.
-- 슬롯: normal은 `maxWorkers`(작업·검토) + CEO 1. save·관측 없음은 전체 1이고 CEO 턴이 우선한다(배정 전에 CEO 대기 큐 확인).
+- 슬롯: normal은 `maxWorkers`(작업·검토) + CEO 1. save는 전체 1이다. 관측 없음은 작업·검토 최대 min(2, maxWorkers)이며 CEO와 동시 실행하지 않는다. 두 모드 모두 CEO 턴이 우선한다(배정 전에 CEO 대기 큐 확인).
 - 검토 limited 연속 3 → blocked. 작업 누적 시간은 3×wall 상한. hq가 kill했으면 runaway가 우선한다.
 - 사람 retry는 **같은 모델**, attempts = maxAttempts−1, rework.
 
