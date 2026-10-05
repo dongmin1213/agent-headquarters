@@ -3,6 +3,8 @@
 **나는 회장, Claude는 CEO, 작업은 팀이 한다.**
 맥 한 대와 개인 Claude 구독으로 돌아가는 멀티 프로젝트 에이전트 오케스트레이터입니다. 진행 상황은 데스크톱 펫으로 봅니다.
 
+**Multi-agent orchestration runtime with human approval, sandboxed execution, independent verification, and controlled merge.**
+
 <p align="center">
   <img src="docs/images/pet-decisions.png" width="440" alt="데스크 펫의 사장 팝오버: 상황·원인(확인됨/추정)·추천·선택지별 결과가 적힌 결정 카드">
   <br><sub>펫의 사장 팝오버 · 결정이 필요한 순간에만 상황·원인·추천·선택지별 결과를 카드로 보여 줍니다</sub>
