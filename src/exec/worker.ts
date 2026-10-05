@@ -15,8 +15,8 @@ export interface ProcessInfo { codexHomeKey?: string; pid: number; startedAt: st
 const modelArg = (cfg: HqConfig, m: string) => cfg.models[m as keyof HqConfig['models']] ?? m
 
 /** §6 argv per role. Tool rule lists are separate argv items (rules like `Bash(git push:*)` contain spaces). */
-export function codexArgs(cfg: HqConfig, o: { role: Role; model: string; sessionId: string; resume: boolean; out: string | null; schema?: object; schemaPath?: string }): string[] {
-  return execArgs({ model: modelArg(cfg, o.model), sessionId: o.sessionId, resume: o.resume, schemaPath: o.schemaPath, externalSandbox: true })
+export function codexArgs(cfg: HqConfig, o: { role: Role; model: string; sessionId: string; resume: boolean; out: string | null; schema?: object; schemaPath?: string; imageGeneration?: boolean; webSearch?: boolean }): string[] {
+  return execArgs({ model: modelArg(cfg, o.model), sessionId: o.sessionId, resume: o.resume, schemaPath: o.schemaPath, externalSandbox: true, imageGeneration: o.imageGeneration, webSearch: o.webSearch })
 }
 
 /** Start time of a live pid, or null when the process is gone or `ps` cannot run (never rejects). */
@@ -205,7 +205,7 @@ export async function launch(o: { codexBin: string; argv: string[]; cwd: string;
   atomicJson(join(o.hqDir, 'spec.json'), { argv: argv.map((a) => (a.length > 2000 ? a.slice(0, 2000) + '…' : a)), cwd: o.cwd, ...o.spec })
   if (o.proceed && !o.proceed()) throw new LaunchAborted('시작 전에 취소됨')
   const cacheDir = makeCacheDir()
-  const env = childEnv({ CODEX_HOME: codexHome, ...cacheEnv(cacheDir), ...(o.outDir ? { HQ_ATTEMPT_OUT: o.outDir } : {}) })
+  const env = childEnv({ CODEX_HOME: codexHome, ...cacheEnv(cacheDir), ...(o.sandbox.graphics ? { HOME: cacheDir } : {}), ...(o.outDir ? { HQ_ATTEMPT_OUT: o.outDir } : {}) })
   const fin = openSync(join(o.hqDir, 'prompt.md'), 'r')
   const fout = openSync(join(o.hqDir, 'stream.jsonl'), 'a')
   const ferr = openSync(join(o.hqDir, 'stderr.log'), 'a')

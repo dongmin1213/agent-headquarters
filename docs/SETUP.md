@@ -249,3 +249,19 @@ codex login status
 - 등록된 외부 팀 명령은 임의의 프로그램입니다. 수익자동화 파이프라인(`side-pipeline`)의 리서치·대본 호출도 Codex로 전환했습니다. 새로운 외부 명령을 등록할 때는 그 프로그램의 LLM 연결을 별도로 확인합니다. 팀에는 자신의 `CODEX_HOME`이 전달됩니다.
 
 참고: [Codex 비대화형 실행](https://learn.chatgpt.com/docs/non-interactive-mode), [GPT 모델 안내](https://developers.openai.com/api/docs/guides/latest-model).
+
+### 게임 전담팀 (프로젝트별 선택 기능)
+
+`node scripts/setup-game.ts /게임/저장소/경로`로 별도 Git 프로젝트를 만들고 `workflow: "game"`으로 등록합니다. 기존 프로젝트와 외부 수익자동화 팀에는 이 규칙을 적용하지 않습니다. 설치는 제작 요청을 시작하지 않습니다. HQ 재시작 후 피카츄 → 새 요청 → 게임개발팀을 선택하고 목표를 입력합니다. 참고 화면은 게임 저장소 `references/`에 보관하고 배포물에는 포함하지 않습니다.
+
+- 팀장이 실제 조사 → 기획 → 게임플레이·아트·레벨 → QA → 통합·제출 순서의 작업 의존 관계를 정합니다. 모든 직군과 독립 검토가 있어야 계획이 시작됩니다. 조사 없는 기획, 기획 전 제작, 다른 프로젝트 수정, 외부 결제·배포 작업은 계획 검사에서 거부합니다.
+- 이 모드는 사용자가 기획·기술 선택을 위임한 프로젝트입니다. 검증된 계획의 내부 승인과 작업자의 세부 질문은 팀장이 처리합니다. 질문·재작업은 작업당 최대 3회, 요청 전체 실행 시도는 100회, 최종 감독 반려는 3회로 제한합니다. 소진되면 실패 이유를 알리며 완성으로 표시하지 않습니다. 구독 한도·로그인 문제는 기존 HQ 보류 절차를 따릅니다.
+- research 직군에만 실시간 웹 검색, art 직군에만 Codex 내장 이미지 생성을 추가합니다. 별도 API 키로 자동 전환하지 않습니다. 생성물은 작업 저장소로 옮겨 커밋하고, 이미지 원본·프롬프트·출처·프레임 정리 내용을 기록합니다. 이미지 도구 성공은 게임 아트 품질 보장이 아니며 QA와 감독이 실제 사용 결과를 확인합니다.
+- 팀장이 `release/game-release.json`을 제출해도 바로 수락 카드를 만들지 않습니다. HQ가 실행물·3초 이상의 플레이 영상·스크린샷·조사·기획·에셋 출처 파일의 경로와 SHA-256을 확인하고, boot/movement/combat/progression/save-load/ending 검사를 별도 실행합니다. 피카츄는 새 Codex 세션에 실제 스크린샷을 입력받고 코드·검사·콘텐츠를 읽어 독립 판정합니다. 모델의 통과 주장만 있고 도구를 실행한 근거가 없으면 반려합니다. 판정은 통합 SHA와 작업 세대에 묶이며 변경되면 다시 검사합니다.
+- 통과 시 사용자에게 플레이 평가용 출시 후보의 폴더·실행 명령·알려진 문제·검수 기록을 제공합니다. 수락과 원본 프로젝트 병합은 사용자가 결정합니다. 상용 성공·재미·무결함을 자동 보증하거나 스토어에 게시하지 않습니다.
+- `hq` 메뉴와 팀 상세 화면의 **팀 켜기/끄기**는 즉시 저장되며 데몬 재시작 후에도 유지됩니다. 끄기는 현재 실행을 강제 종료하지 않고 다음 실행/배정을 멈춥니다. 긴급 작업 중단은 해당 요청 취소를 사용합니다. 게임팀은 요청이 있을 때만 일하며 정기적으로 새 게임을 만들지 않습니다.
+- API: `POST /api/teams/:id/enabled`에 `{"enabled":false}`. 게임팀 id는 `game:<projectId>`입니다. master 인증이 필요하며 외부 팀 토큰은 조작할 수 없습니다.
+
+검증: `node --test test/unit/game.test.ts test/unit/scheduler.test.ts`. 실제 이미지 생성·이미지 입력·게임팀 계획과 그래픽 실행은 구독/로컬 환경을 사용하는 별도 검증이며 전체 상용 게임 제작 검증과 구분합니다.
+
+게임 그래픽 프로필은 Godot 화면 캡처를 위해 `com.apple.hiservices-xpcservice`, `com.apple.windowserver.active`, `com.apple.windowserver`, `com.apple.CARenderServer`, `com.apple.MTLCompilerService`만 추가합니다. 일반 프로젝트에는 적용하지 않습니다. LaunchServices, open/osascript/launchctl 금지와 HQ 토큰·개인 인증 읽기 금지는 유지합니다. 게임 작업·검사에는 임시 HOME을 사용해 Godot 사용자 저장 데이터도 분리합니다. `HQ_LIVE_GAME_RENDER=1 node --test test/unit/game-render-live.test.ts`로 실제 움직이는 장면의 PNG 캡처·4초 영상·비밀 파일 읽기 거부를 시험합니다(잠깐 테스트 창이 열립니다).

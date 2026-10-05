@@ -21,7 +21,7 @@ export interface ReviseInput {
 }
 
 export async function runReviseTurn(i: ReviseInput): Promise<ReviseTurn> {
-  const rules = readFileSync(resolve(i.hqRoot, 'skills/ceo.md'), 'utf8')
+  const rules = readFileSync(resolve(i.hqRoot, i.project.workflow === 'game' ? 'skills/game-lead.md' : 'skills/ceo.md'), 'utf8')
   const prompt = [
     rules,
     '## 이번 턴: 지시서 수정',

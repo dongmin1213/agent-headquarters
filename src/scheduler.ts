@@ -226,6 +226,8 @@ export class Scheduler {
     this.badCwd = new Set(teams.filter((t) => teamCwdOverlaps(t.cwd, this.iso.hqRoot, this.iso.hqHome)).map((t) => t.id))
     const pending: Promise<void>[] = []
     for (const t of teams) {
+      const enabled = store.get(`team.enabled:${t.id}`)
+      if (enabled !== null) t.enabled = enabled === 'true'
       const last = store.lastRun(t.id)
       if (last && !last.endedAt) {
         // An unfinished run: its process may still be alive (detached). Never start a second one before knowing.
@@ -270,7 +272,7 @@ export class Scheduler {
       const s = this.state.get(t.id)!
       const last = this.store.lastRun(t.id)
       const next = last?.endedAt ? new Date(Date.parse(last.endedAt) + t.everyMinutes * 60_000).toISOString() : null
-      return { id: t.id, name: t.name, pack: t.pack, state: s.state, bubble: s.bubble, lastRun: last, nextRunAt: t.enabled ? next : null }
+      return { id: t.id, name: t.name, pack: t.pack, enabled: t.enabled, kind: 'scheduled', state: !t.enabled && !s.running ? 'idle' : s.state, bubble: !t.enabled ? (s.running ? '꺼짐 · 진행 중인 실행을 마친 뒤 쉽니다' : '꺼짐') : s.bubble, lastRun: last, nextRunAt: t.enabled ? next : null }
     })
   }
 
@@ -291,6 +293,15 @@ export class Scheduler {
       const due = !last?.endedAt || Date.now() - Date.parse(last.endedAt) >= t.everyMinutes * 60_000
       if (due) void this.runTeam(t)
     }
+  }
+
+  setEnabled(teamId: string, enabled: boolean): boolean {
+    const t = this.teams.find(t => t.id === teamId)
+    if (!t) return false
+    t.enabled = enabled
+    this.store.set(`team.enabled:${teamId}`, String(enabled))
+    this.bus.emit({ kind: 'team', teamId, text: enabled ? '팀 켜짐' : '팀 꺼짐 · 현재 실행 종료 후 새 실행을 시작하지 않습니다' })
+    return true
   }
 
   runNow(teamId: string): boolean {

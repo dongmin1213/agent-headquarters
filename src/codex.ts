@@ -62,12 +62,15 @@ export function strictSchema(value: unknown): unknown {
   return out
 }
 
-export function execArgs(o: { model?: string; sessionId?: string; resume?: boolean; schemaPath?: string; externalSandbox?: boolean }): string[] {
+export function execArgs(o: { model?: string; sessionId?: string; resume?: boolean; schemaPath?: string; externalSandbox?: boolean; imageGeneration?: boolean; webSearch?: boolean; images?: string[] }): string[] {
   const resume = o.resume && o.sessionId ? threadId(o.sessionId) : null
   return ['exec', ...(resume ? ['resume', resume] : []), '--json', '--ignore-user-config', '--ignore-rules',
     '-c', 'approval_policy="never"', '-c', 'features.shell_snapshot=false', '-c', 'features.memories=false',
-    ...['apps', 'plugins', 'hooks', 'multi_agent', 'browser_use', 'computer_use', 'image_generation'].flatMap(f => ['-c', `features.${f}=false`]),
+    ...['apps', 'plugins', 'hooks', 'multi_agent', 'browser_use', 'computer_use'].flatMap(f => ['-c', `features.${f}=false`]),
+    '-c', `features.image_generation=${o.imageGeneration === true}`,
+    ...(o.webSearch ? ['-c', 'web_search="live"'] : []),
     ...(o.externalSandbox ? ['--dangerously-bypass-approvals-and-sandbox'] : ['-c', 'sandbox_mode="read-only"']),
+    ...(o.images ?? []).flatMap(path => ['--image', path]),
     ...(o.model ? ['--model', o.model] : []), ...(o.schemaPath ? ['--output-schema', o.schemaPath] : []), '-']
 }
 

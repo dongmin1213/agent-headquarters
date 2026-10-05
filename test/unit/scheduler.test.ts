@@ -133,11 +133,11 @@ test('restore: unfinished run → idle with 중단 bubble', () => {
   assert.equal(v.state, 'idle'); assert.equal(v.bubble, '지난 실행이 중단됐어요 · 다음 실행 때 이어서 해요')
 })
 
-test('restore: no runs → 대기 중; disabled team keeps 대기 중', () => {
+test('restore: no runs → 대기 중; disabled team shows 꺼짐', () => {
   const v = restarted(() => {})
   assert.equal(v.state, 'idle'); assert.equal(v.bubble, '대기 중')
   const d = restarted(finished(2, 'boom'), { enabled: false })
-  assert.equal(d.state, 'idle'); assert.equal(d.bubble, '대기 중')
+  assert.equal(d.state, 'idle'); assert.equal(d.bubble, '꺼짐')
 })
 
 test('summary keeps the last STATUS line even after 10 more lines; restore shows it', async () => {

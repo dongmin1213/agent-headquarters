@@ -11,11 +11,12 @@ import { createInterface } from 'node:readline'
 import { isLimited } from './exec/contract.ts'
 import { josa, particle } from './josa.ts'
 
-export interface Project { id: string; name: string; path: string; setup?: string }
+export interface Project { id: string; name: string; path: string; setup?: string; workflow?: 'game' }
 export interface CeoQuestion { question: string; options: string[]; default: string; reason: string }
 export interface Acceptance { id: string; text: string; check: string; kind: 'new' | 'regression' }
 export interface TaskReview { brief: string; model: 'sonnet' | 'opus' | 'none' }
 export interface PlanTask {
+  department?: import('./game.ts').GameDepartment | null
   id: string; title: string; project: string; role: 'collect' | 'implement'
   grade: 'L0' | 'L1' | 'L2' | 'L3'; model: 'haiku' | 'sonnet' | 'opus'
   owns: string[]; acceptance: Acceptance[]; brief: string; depends_on: string[]
@@ -33,6 +34,7 @@ export const QUESTIONS_SCHEMA = { type: 'array', maxItems: 3, items: { type: 'ob
 export const TASK_SCHEMA = { type: 'object', additionalProperties: false,
   required: ['id', 'title', 'project', 'role', 'grade', 'model', 'owns', 'acceptance', 'brief', 'depends_on'],
   properties: {
+    department: { enum: ['research', 'direction', 'gameplay', 'art', 'level', 'qa', 'delivery', null] },
     id: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,32}$' }, title: str, project: str,
     role: { enum: ['collect', 'implement'] }, grade: { enum: ['L0', 'L1', 'L2', 'L3'] },
     model: { enum: ['haiku', 'sonnet', 'opus'] }, owns: strArr,
@@ -163,6 +165,8 @@ export interface JsonTurnInput {
   /** Every stream line (the caller records rate_limit_event into the quota table). */
   onLine?: (line: Record<string, unknown>) => void
   timeoutMs?: number
+  webSearch?: boolean
+  images?: string[]
 }
 export interface JsonTurn { ok: boolean; output: unknown; sessionId: string; error: string | null; limited: boolean; costUsd: number | null }
 
@@ -170,14 +174,17 @@ export function runJsonTurn(i: JsonTurnInput): Promise<JsonTurn> {
   const codexHome = prepareCodexHome(i.runtimeHome ?? process.env.HQ_HOME ?? join(homedir(), '.hq'), `coordinator:${i.cwd}`)
   const schemaPath = join(codexHome, `schema-${randomUUID()}.json`)
   writeFileSync(schemaPath, JSON.stringify(strictSchema(i.schema)), { mode: 0o600 })
-  const args = execArgs({ model: i.model ?? DEFAULTS.models.sonnet, sessionId: i.sessionId, resume: i.resume, schemaPath })
+  const args = execArgs({ model: i.model ?? DEFAULTS.models.sonnet, sessionId: i.sessionId, resume: i.resume, schemaPath, webSearch: i.webSearch, images: i.images })
   const env: NodeJS.ProcessEnv = { ...chatgptEnv(), CODEX_HOME: codexHome }
   const decoder = new CodexEvents()
   return new Promise((done) => {
-    const child = spawn(i.codexBin, args, { cwd: i.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    const child = spawn(i.codexBin, args, { cwd: i.cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] })
     let result: Record<string, unknown> | null = null
     let err = '', rejected = false, sid = i.sessionId
-    const timer = setTimeout(() => child.kill('SIGINT'), i.timeoutMs ?? 15 * 60_000)
+    let timedOut = false
+    let killTimer: NodeJS.Timeout | undefined
+    const kill = (signal: NodeJS.Signals) => { try { if (child.pid) process.kill(-child.pid, signal) } catch {} }
+    const timer = setTimeout(() => { timedOut = true; kill('SIGTERM'); killTimer = setTimeout(() => kill('SIGKILL'), 3000) }, i.timeoutMs ?? 15 * 60_000)
     createInterface({ input: child.stdout! }).on('line', (raw) => {
       let line: Record<string, unknown>
       try { line = JSON.parse(raw) } catch { return }
@@ -195,13 +202,13 @@ export function runJsonTurn(i: JsonTurnInput): Promise<JsonTurn> {
     child.stdin!.on('error', () => {})
     child.stdin!.end(i.prompt)
     child.on('close', (code) => {
-      clearTimeout(timer)
+      clearTimeout(timer); clearTimeout(killTimer); kill('SIGKILL')
       rmSync(schemaPath, { force: true })
       const r = result as Record<string, unknown> | null
       const limited = isLimited(r, err, rejected)
       const cost = typeof r?.total_cost_usd === 'number' ? r.total_cost_usd : null
       const so = r?.structured_output
-      if (code !== 0 || !r || r.is_error || so === undefined || so === null) return done({ ok: false, output: null, sessionId: sid, error: r ? String(r.result ?? r.subtype ?? '오류') : (err.trim() || '출력 없음').slice(0, 500), limited, costUsd: cost })
+      if (timedOut || code !== 0 || !r || r.is_error || so === undefined || so === null) return done({ ok: false, output: null, sessionId: sid, error: r ? String(r.result ?? r.subtype ?? '오류') : (err.trim() || '출력 없음').slice(0, 500), limited, costUsd: cost })
       done({ ok: true, output: so, sessionId: sid, error: null, limited: false, costUsd: cost })
     })
   })
@@ -213,7 +220,7 @@ export interface TurnInput {
 }
 
 export async function runCeoTurn(input: TurnInput): Promise<CeoTurn> {
-  const rules = readFileSync(resolve(input.hqRoot, 'skills/ceo.md'), 'utf8')
+  const rules = readFileSync(resolve(input.hqRoot, input.project.workflow === 'game' ? 'skills/game-lead.md' : 'skills/ceo.md'), 'utf8')
   const sessionId = input.resumeSessionId ?? randomUUID()
   const prompt = [
     rules,

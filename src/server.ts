@@ -19,6 +19,7 @@ import { readText } from './exec/fsx.ts'
 import { lastActivityOf } from './exec/stream.ts'
 import { DONE_MAX, readOut, REPORT_MAX } from './exec/contract.ts'
 import { createWebUi } from './web/index.ts'
+import { gameEnabled } from './game.ts'
 
 const BODY_MAX = 64 * 1024
 const FILE_MAX = 1024 * 1024
@@ -78,6 +79,15 @@ export function snapshot(d: ServerDeps): Snapshot {
   const active = d.store.requestsByStatus(['queued', 'thinking', 'asking', 'planned', 'executing', 'blocked', 'awaiting_acceptance', 'accepted', 'merging'])
   const ids = [...new Set([...active.map((r) => r.id), ...recent.map((r) => r.id)])]
   const teams = d.scheduler.views()
+  for (const p of d.projects.filter(p => p.workflow === 'game')) {
+    const enabled = gameEnabled(d.store, p.id)
+    const jobs = active.filter(r => r.project === p.id)
+    const latest = recent.find(r => r.project === p.id)
+    const failed = latest?.status === 'failed' ? latest : null
+    teams.push({ id: `game:${p.id}`, name: p.name, pack: 'pokemon', kind: 'game', project: p.id, enabled,
+      state: !enabled ? 'idle' : jobs.length ? 'working' : failed ? 'error' : 'idle',
+      bubble: !enabled ? '꺼짐 · 현재 작업 뒤 다음 배정은 쉽니다' : jobs.length ? `게임팀 ${jobs.length}건 진행 · 팀장이 제작하고 피카츄가 검수해요` : failed ? `완성 미달: ${failed.note ?? '작업 실패'}` : '새 요청을 기다려요 · 기획부터 출시 후보까지', lastRun: null, nextRunAt: null })
+  }
   const v = d.runner.views(teams.map((t) => ({ name: t.name, state: t.state, bubble: t.bubble })))
   return { updatedAt: new Date().toISOString(), lastEventId: d.store.lastEventId(), teams, approvals: d.store.openApprovals(),
     requests: ids.map((id) => requestView(d.store, d.runner, id)!).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
@@ -221,6 +231,19 @@ export function createApi(d: ServerDeps): ApiRouter {
       }
       if (is('POST', 'api', 'teams', null, 'run')) {
         return scheduler.runNow(parts[2]) ? ok({ started: true }, 202) : json(res, 409, { error: '없는 팀이거나 이미 실행 중이거나 한도 보류 중입니다' })
+      }
+      if (is('POST', 'api', 'teams', null, 'enabled')) {
+        const b = await body(req)
+        if (typeof b.enabled !== 'boolean') throw new HttpError(400, 'enabled는 true 또는 false여야 합니다')
+        const project = projects.find(p => p.workflow === 'game' && `game:${p.id}` === parts[2])
+        if (project) {
+          store.set(`game.enabled:${project.id}`, String(b.enabled))
+          bus.emit({ kind: 'team', teamId: parts[2], text: b.enabled ? '게임팀 켜짐' : '게임팀 꺼짐 · 현재 작업 종료 후 다음 배정을 쉽니다' })
+          if (b.enabled) { runner.kick(); void engine.tick() }
+          return ok({ enabled: b.enabled })
+        }
+        if (!scheduler.setEnabled(parts[2], b.enabled)) throw new HttpError(404, '없는 팀입니다')
+        return ok({ enabled: b.enabled })
       }
       json(res, 404, { error: '없는 경로입니다' })
     } catch (e) {

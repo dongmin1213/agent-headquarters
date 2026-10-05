@@ -1,4 +1,5 @@
 // Worker and reviewer prompts (execution.md §6 §8 §10 §11).
+import { GAME_WORKER_RULES } from '../game.ts'
 import type { PlanTask } from '../ceo.ts'
 import type { Verdict } from '../types.ts'
 import { setupCreatedLine, type ChecksFile } from './checks.ts'
@@ -7,6 +8,7 @@ import { setupCreatedLine, type ChecksFile } from './checks.ts'
 export interface Upstream { key: string; title: string; project: string; headSha: string | null; reportSha: string | null; report: string | null }
 
 export interface WorkPromptInput {
+  game?: boolean
   task: PlanTask
   requestText: string
   projectName: string
@@ -90,6 +92,7 @@ export function workPrompt(o: WorkPromptInput): string {
     '',
     '## 지시서',
     t.brief,
+    ...(o.game ? [GAME_WORKER_RULES, `직군: ${t.department}`] : []),
     '',
     '## 수정 가능 범위 (owns)',
     bullet(t.owns),

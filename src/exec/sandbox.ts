@@ -33,6 +33,8 @@ export interface SandboxOpts {
   /** Dedicated Codex auth/session store; never the personal ~/.codex. */
   codexHome?: string
   readOnlyWorktree?: boolean
+  /** Explicit game-project capability: render a local game, without enabling LaunchServices/app launch. */
+  graphics?: boolean
 }
 
 /** Seatbelt matches resolved paths (/var → /private/var); resolve the deepest existing ancestor. */
@@ -76,6 +78,9 @@ export const MACH_SERVICES: [string, string][] = [
 export const TEAM_MACH_ALLOWED: [string, string][] = [
   ['com.apple.trustd.agent', 'certificate validation for Security.framework TLS clients (e.g. Go binaries such as the Higgsfield CLI)'],
 ]
+
+/** Measured Godot OpenGL viewport capture on macOS. Only opted-in game projects receive these. */
+export const GAME_MACH_SERVICES = ['com.apple.hiservices-xpcservice', 'com.apple.windowserver.active', 'com.apple.windowserver', 'com.apple.CARenderServer', 'com.apple.MTLCompilerService']
 
 /**
  * ~ entries the sandbox may read; everything else under $HOME (~/.codex, ~/.config/*, ~/Library/Application Support,
@@ -196,6 +201,7 @@ export function sandboxProfile(o: SandboxOpts): string {
     '(allow default)',
     ...signalRules(),
     ...machRules(),
+    ...(o.graphics ? GAME_MACH_SERVICES.map(name => `(allow mach-lookup (global-name ${q(name)})) ; HQ game graphics`) : []),
     // S2: $HOME, $HQ_HOME and project checkouts are unreadable except the measured list, the mirror and own paths.
     `(deny file-read-data ${[sub(home), sub(hq), ...projects.map(sub)].join(' ')})`,
     `(allow file-read-data ${[...homeReadFilters(home), ...extra.map(sub), ...(o.mirror ? [sub(real(o.mirror))] : []), ...(o.readable ?? []).map((p) => sub(real(p))), claude.own].join(' ')})`,

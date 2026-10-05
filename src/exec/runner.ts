@@ -8,7 +8,8 @@ import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import type { Bus } from '../bus.ts'
-import { reviewModelOf, validateTasks, type Acceptance, type CeoPlan, type PlanTask, type Project } from '../ceo.ts'
+import { gameEnabled, gamePlanProblem, GAME_WORKER_RULES, readGameManifest } from '../game.ts'
+import { runJsonTurn, reviewModelOf, validateTasks, type Acceptance, type CeoPlan, type PlanTask, type Project } from '../ceo.ts'
 import type { HqConfig } from '../config.ts'
 import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../store.ts'
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
@@ -136,6 +137,7 @@ export class Runner {
   readonly launching = new Set<string>()
   readonly checking = new Set<string>()
   readonly integrating = new Set<string>()
+  private gameReleasing = new Set<string>()
   private revising = new Set<string>()
   private diagnosing = new Set<string>()
   private ticking = false
@@ -231,7 +233,7 @@ export class Runner {
 
   /** `projectId` names the mirror the worktree borrows objects from — the only part of $HQ_HOME it may read. */
   sandboxFor(worktree: string, out: string | null, projectId: string): SandboxOpts {
-    return { worktree, out, hqHome: this.home, tokenDir: this.tokenDir, hqPort: this.hqPort, extraWritable: this.cfg.sandbox.extraWritable,
+    return { worktree, out, graphics: this.project(projectId)?.workflow === 'game', hqHome: this.home, tokenDir: this.tokenDir, hqPort: this.hqPort, extraWritable: this.cfg.sandbox.extraWritable,
       projects: this.projects.map((p) => p.path), mirror: this.mirror(projectId), readable: codexBinReadable(this.cfg.codexBin) }
   }
 
@@ -269,9 +271,9 @@ export class Runner {
 
   /** Something the CEO should do before any worker in save/unobserved mode (§13 "CEO 턴이 우선"). */
   ceoWaiting(): boolean {
-    if (this.store.nextQueued()) return true
-    if (this.store.tasksByStatus(['revising']).some((t) => this.store.approval(`revise:${t.id}`)?.state !== 'open')) return true
-    return this.store.tasksByStatus(['blocked']).some((t) => t.diagnosis === null)
+    if (this.store.requestsByStatus(['queued']).some(r => this.project(r.project)?.workflow !== 'game' || gameEnabled(this.store, r.project))) return true
+    if (this.store.tasksByStatus(['revising']).some((t) => (this.project(t.project)?.workflow !== 'game' || gameEnabled(this.store, t.project)) && this.store.approval(`revise:${t.id}`)?.state !== 'open')) return true
+    return this.store.tasksByStatus(['blocked']).some((t) => (this.project(t.project)?.workflow !== 'game' || gameEnabled(this.store, t.project)) && t.diagnosis === null)
   }
 
   observe(line: Record<string, unknown>): void {
@@ -825,6 +827,7 @@ export class Runner {
   readyTasks(): TaskRow[] {
     const out: TaskRow[] = []
     for (const r of this.store.requestsByStatus(['executing'])) {
+      if (this.project(r.project)?.workflow === 'game' && !gameEnabled(this.store, r.project)) continue
       const all = this.store.tasks(r.id)
       // A task whose earlier worker may still run waits for it (not for a slot): it is not ready.
       for (const t of all) if (['pending', 'rework', 'held'].includes(t.status) && !t.lingering && this.depsPassed(t, all)) out.push(t)
@@ -843,6 +846,7 @@ export class Runner {
       if (free <= 0) return
       const r = this.store.request(t.request_id)
       if (!r || !['executing', 'blocked'].includes(r.status)) continue
+      if (this.project(r.project)?.workflow === 'game' && !gameEnabled(this.store, r.project)) continue
       if (this.store.liveAttempts().some((a) => a.task_id === t.id) || t.lingering) continue
       if (this.claimReview(t)) free--
     }
@@ -919,7 +923,7 @@ export class Runner {
     atomicWrite(prof, sandboxProfile(this.sandboxFor(wt, null, project.id)))
     const p = this.procTracker(name)
     try {
-      const s = await runSandboxed(project.setup, wt, this.cfg.checkTimeoutMinutes * 60_000, prof, 'setup', p.onSpawn)
+      const s = await runSandboxed(project.setup, wt, this.cfg.checkTimeoutMinutes * 60_000, prof, 'setup', p.onSpawn, project.workflow === 'game')
       atomicJson(join(hq, `${name}.json`), s)
       if (!s.pass) throw new Setup(`setup 명령 실패 (종료 코드 ${s.exitCode ?? '시간 초과'}): ${s.outputTail.split('\n').slice(-5).join(' ').slice(0, 300)}`)
     } finally { p.done() }
@@ -936,6 +940,7 @@ export class Runner {
     if (!a || !t || !r || r.status === 'cancelled' || a.outcome === 'cancelled' || t.status === 'cancelled') return new StartAborted('cancelled', '요청 중단')
     if (TERMINAL_REQUEST.has(r.status) || r.status === 'merging' || t.generation !== a.generation || t.status !== taskStatus
       || a.status !== 'starting' || a.outcome) return new StartAborted('superseded', '세대가 바뀌어 시작하지 않음')
+    if (this.project(r.project)?.workflow === 'game' && !gameEnabled(this.store, r.project)) return new StartWaiting('게임팀 꺼짐')
     // An earlier worker of this task may still run (its identity could not be confirmed): never two in one task.
     const ling = lingeringOf(t)
     if (ling) return new StartWaiting(lingeringWait(ling.pid))
@@ -1012,7 +1017,7 @@ export class Runner {
       const request = this.store.request(t.request_id)!
       t = this.store.task(t.id)!
       // A legacy thread starts fresh in Codex; every resume also needs the current checkout and full brief.
-      let prompt = workPrompt({ task: specOf(t), requestText: request.text, projectName: project.name, cwd, branch: role === 'implement' ? 'hq-work' : null, base: t.base_sha!,
+      let prompt = workPrompt({ game: project.workflow === 'game', task: specOf(t), requestText: request.text, projectName: project.name, cwd, branch: role === 'implement' ? 'hq-work' : null, base: t.base_sha!,
         out, token: att.attempt_token, rework: t.note && prev ? this.reworkText(t, prev) : null, dirtyNotice: null, upstream: this.upstream(t) })
       if (resume) {
         const answers = this.store.taskQuestions(t.id).filter(q => q.answer !== null).map(q => ({ question: q.question, answer: q.answer! }))
@@ -1021,7 +1026,9 @@ export class Runner {
       // Collect creates a new read-only checkout per attempt, but the Codex thread stays in the original private home.
       const codexHomeKey = resume && prev ? readProcessInfo(hqDirOf(prev))?.codexHomeKey
         ?? readJson<{ cwd?: string }>(join(hqDirOf(prev), 'spec.json'))?.cwd : undefined
-      const argv = codexArgs(this.cfg, { role, model: att.model, sessionId: att.session_id, resume, out })
+      const game = project.workflow === 'game'
+      if (game && !specOf(t).department) throw new Setup('게임 작업에 직군이 없습니다')
+      const argv = codexArgs(this.cfg, { role, model: att.model, sessionId: att.session_id, resume, out, imageGeneration: game && specOf(t).department === 'art', webSearch: game && specOf(t).department === 'research' })
       gate()
       const { info, child, exit } = await launch({ codexBin: this.cfg.codexBin, argv, cwd, hqDir: hq, outDir: out, prompt, sessionId: att.session_id, codexHomeKey,
         sandbox: { ...this.sandboxFor(cwd, out, t.project), readOnlyWorktree: role === 'collect' }, proceed: () => !this.startBlocker(attemptId, 'running'),
@@ -1491,6 +1498,11 @@ export class Runner {
   private putAcceptCard(requestId: string): void {
     const r = this.store.request(requestId)!
     const body: string[] = []
+    if (this.project(r.project)?.workflow === 'game') {
+      const dir = this.integrationDir(requestId, r.project)
+      const checked = readGameManifest(dir)
+      if (checked.manifest) body.push(`사용자 플레이 평가용 출시 후보: ${checked.manifest.title}`, `결과 폴더: ${dir}`, `실행: ${checked.manifest.launch}`, `독립 검수 기록: ${this.store.get(`game.report:${requestId}`)}`, `알려진 문제: ${checked.manifest.knownIssues.join(' / ') || '보고된 문제 없음 (무결함 보장은 아님)'}`)
+    }
     for (const t of this.store.tasks(requestId)) {
       if (t.status === 'cancelled') { body.push(`${t.key} ${t.title} — 취소됨`); continue }
       const work = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.status === 'succeeded').at(-1)
@@ -1533,6 +1545,101 @@ export class Runner {
     this.store.putMerge(requestId, projectId, { state: 'offered' })
   }
 
+  private gameSignature(id: string): string {
+    return sha256(JSON.stringify({ tasks: this.store.tasks(id).map(t => [t.id, t.generation, t.status, t.head_sha, t.report_sha]), merges: this.store.mergeRows(id).map(m => [m.project, m.integration_sha]) }))
+  }
+
+  /** No user-facing accept card exists until this separate supervisor gate succeeds. */
+  private startGameRelease(r: RequestRow, signature: string): void {
+    if (!gameEnabled(this.store, r.project) || this.gameReleasing.has(r.id) || !this.canStartCeo() || !this.ceoLock.tryAcquire()) return
+    this.gameReleasing.add(r.id)
+    this.emitRequest(r.id, '피카츄가 게임 출시 후보를 독립 검수하고 있어요')
+    this.bg(this.checkGameRelease(r, signature).finally(() => { this.gameReleasing.delete(r.id); this.ceoLock.release(); this.kick() }), `game-release:${r.id}`)
+  }
+
+  private async checkGameRelease(r: RequestRow, signature: string): Promise<void> {
+    const cwd = this.integrationDir(r.id, r.project)
+    const current = () => this.store.request(r.id)?.status === 'executing' && this.gameSignature(r.id) === signature && gameEnabled(this.store, r.project)
+    const reject = (why: string) => {
+      if (!current()) return
+      this.store.tx(() => {
+        const n = Number(this.store.get(`game.rejections:${r.id}`) ?? 0) + 1
+        this.store.set(`game.rejections:${r.id}`, String(n))
+        this.store.set(`game.release:${r.id}`, null)
+        const delivery = this.store.tasks(r.id).find(t => specOf(t).department === 'delivery')
+        if (!delivery || n >= 3) { this.failRequest(r.id, `출시 후보 미달 (${n}회): ${why}`); return }
+        this.rework(delivery, `피카츄 독립 검수 반려: ${why}`)
+        this.store.raw().prepare('delete from merges where request_id = ?').run(r.id)
+        this.store.updateRequest(r.id, { note: `피카츄 반려 · 팀장이 수정 중: ${why}` })
+      })
+      this.emitRequest(r.id, `게임 검수 반려: ${why.slice(0, 180)}`)
+    }
+    try {
+      const sha = this.store.mergeRow(r.id, r.project)?.integration_sha
+      if (!sha) { reject('검수할 통합 커밋이 없습니다'); return }
+      // Integration removes its temporary checkout. Recreate the exact candidate and retain it for playtesting.
+      const wt = await verifyWorktree(this.mirror(r.project), cwd, sha)
+      if (!current()) return
+      const checked = readGameManifest(cwd)
+      if (!checked.manifest) { reject(checked.problem!); return }
+      const manifest = checked.manifest
+      const dir = join(this.home, 'runs', r.id, '_game-supervisor', signature)
+      mkdirSync(dir, { recursive: true })
+      const profile = join(dir, 'checks.sb')
+      atomicWrite(profile, sandboxProfile(this.sandboxFor(cwd, null, r.project)))
+      const records = []
+      const quote = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'"
+      for (const f of manifest.files.filter(f => f.kind === 'video')) {
+        if (!current()) return
+        const tracking = this.procTracker('game-video')
+        let video
+        try { video = await runSandboxed(`ffprobe -v error -select_streams v:0 -show_entries stream=codec_type,width,height:format=duration -of json ${quote(f.path)}`, cwd, 30_000, profile, 'video', tracking.onSpawn, true) }
+        finally { tracking.done() }
+        records.push(video)
+        atomicJson(join(dir, 'checks.json'), records)
+        let info: any = null
+        try { info = JSON.parse(video.outputTail) } catch {}
+        if (!video.pass || !info?.streams?.some((s: any) => s.codec_type === 'video' && s.width > 0 && s.height > 0) || Number(info?.format?.duration ?? 0) < 3) {
+          reject(`실제 플레이 영상으로 읽을 수 없거나 3초 미만입니다: ${f.path}`); return
+        }
+      }
+      for (const c of manifest.checks) {
+        if (!current()) return
+        const tracking = this.procTracker('game-check')
+        try { records.push(await runSandboxed(c.command, cwd, Math.min(this.cfg.checkTimeoutMinutes * 60_000, 180_000), profile, c.id, tracking.onSpawn, true)) }
+        finally { tracking.done() }
+        atomicJson(join(dir, 'checks.json'), records)
+        if (!records.at(-1)!.pass) { reject(`필수 검사 실패: ${c.id} — ${records.at(-1)!.outputTail.slice(-1500)}`); return }
+      }
+      if (!current()) return
+      const tools = new Set<string>()
+      const prompt = `너는 게임팀과 독립된 감독자 피카츄다. 팀의 완료 주장이나 검사 exit 0만 믿지 말고 실제 소스·검사 구현·빌드·이미지를 읽어 판정한다.\n사용자 요청: ${r.text}\n출시 명세: ${JSON.stringify(manifest)}\nHQ가 직접 실행한 검사: ${JSON.stringify(records)}\n${GAME_WORKER_RULES}\n이번 역할은 읽기 전용 검수다. 변경하지 않는다. shell로 게임과 테스트 코드를 직접 읽고 파일 존재/상수 반환 검사로 속이지 않았는지 확인한다. 첨부된 실제 플레이 스크린샷을 반드시 확인하고 영상은 ffprobe 메타데이터와 캡처 프레임을 대조한다. 필요시 임시 폴더에서 추가 검사를 한다. docs/game-design.md의 콘텐츠 약속과 최종 게임을 비교한다. 이동/전투/능력 해금/연결된 맵/보스/엔딩/사망/저장/불러오기가 실제로 이어져야 한다. 타이틀 화면이나 기술 데모만 있으면 반려한다. 임시물/누락된 에셋/빌드 실행 불가/진행 불가/권리 출처 미확인은 반려한다. 조사 URL의 실제 근거, 창작 자료를 변형한 독자성, 레퍼런스 도트 느낌과 동작 프레임의 일관성도 확인한다. 확인할 수 없는 항목은 통과로 쓰지 않는다. evidence에는 직접 관측한 파일·명령·이미지 경로를 기록하고 reason에 수정할 구체적 문제를 적는다. 만족하면 '사용자 플레이 평가용 출시 후보'로 통과시키며 상용 품질이나 재미를 보증하지 않는다.`
+      atomicWrite(join(dir, 'prompt.md'), prompt)
+      const result = await runJsonTurn({ codexBin: this.cfg.codexBin, runtimeHome: this.home, model: this.cfg.models.opus, cwd, prompt,
+        sessionId: randomUUID(), resume: false, addDirs: [], timeoutMs: 10 * 60_000, images: manifest.files.filter(f => f.kind === 'screenshot').slice(0, 3).map(f => join(cwd, f.path)),
+        schema: { type: 'object', additionalProperties: false, required: ['pass', 'reason', 'evidence'], properties: { pass: { type: 'boolean' }, reason: { type: 'string' }, evidence: { type: 'array', items: { type: 'string' }, minItems: 1 } } },
+        onLine: line => {
+          if (line.type === 'rate_limit_event') this.observe(line)
+          for (const c of (line.message as any)?.content ?? []) if (c.type === 'tool_use') tools.add(c.name)
+        } })
+      atomicJson(join(dir, 'verdict.json'), result)
+      if (!current()) return
+      if (result.limited) { this.limitBackoff(); return }
+      if (!result.ok && /Not logged in|authentication|unauthorized|401|refresh.token/i.test(result.error ?? '')) { this.requireLogin(result.error ?? 'Not logged in'); return }
+      if (!result.ok) { reject(`감독자 검사 실패: ${result.error}`); return }
+      const verdict = result.output as { pass: boolean; reason: string; evidence: string[] }
+      if (verdict.pass !== true || !tools.has('Bash')) { reject(verdict.reason || '독립적인 코드·이미지 관측 근거 부족'); return }
+      const after = readGameManifest(cwd)
+      if (after.problem || JSON.stringify(after.manifest) !== JSON.stringify(manifest)) { reject(after.problem ?? '검사 중 제출 명세가 바뀌었습니다'); return }
+      if ((await trackedChanges(wt, sha)).length) { reject('검사 중 통합 작업 폴더가 바뀌었거나 Git 확인에 실패했습니다'); return }
+      if (current()) {
+        this.store.set(`game.release:${r.id}`, signature)
+        this.store.set(`game.report:${r.id}`, dir)
+        this.emitRequest(r.id, '피카츄 검수 통과 · 사용자 플레이 평가용 출시 후보 준비')
+      }
+    } catch (e) { reject(`검수 오류: ${String(e).slice(0, 1500)}`) }
+  }
+
   private async completeRequests(): Promise<void> {
     for (const a of this.store.expiredApprovals(this.now())) {
       if (a.kind !== 'plan') continue
@@ -1548,6 +1655,10 @@ export class Runner {
         if (!live.every((t) => t.status === 'passed')) return
         for (const p of this.projectsToIntegrate(r.id)) if (!this.store.mergeRow(r.id, p)) this.store.putMerge(r.id, p, { state: 'pending' })
         if (this.store.mergeRows(r.id).some((m) => m.state !== 'integrated')) return
+        if (this.project(r.project)?.workflow === 'game') {
+          const signature = this.gameSignature(r.id)
+          if (this.store.get(`game.release:${r.id}`) !== signature) { this.startGameRelease(r, signature); return }
+        }
         this.store.updateRequest(r.id, { status: 'awaiting_acceptance', note: null })
         this.putAcceptCard(r.id)
         this.emitRequest(r.id, '모든 작업 통과 — 결과 수락을 기다려요')
@@ -1752,7 +1863,7 @@ export class Runner {
   private async reviseOne(): Promise<void> {
     if (!this.canStartCeo()) return
     const t = this.store.tasksByStatus(['revising']).find((x) => !this.revising.has(x.id) && this.store.approval(`revise:${x.id}`)?.state !== 'open'
-      && this.store.request(x.request_id)?.status === 'executing' && this.jobReady(`revise:${x.id}`))
+      && this.store.request(x.request_id)?.status === 'executing' && (this.project(x.project)?.workflow !== 'game' || gameEnabled(this.store, x.project)) && this.jobReady(`revise:${x.id}`))
     if (!t || !this.ceoLock.tryAcquire()) return
     this.revising.add(t.id)
     this.bg(this.runRevise(t).finally(() => { this.revising.delete(t.id); this.ceoLock.release() }), `revise:${t.id}`, this.blockOnFailure(t.id, t.generation))
@@ -1795,10 +1906,12 @@ export class Runner {
       return
     }
     const rev = res.output.revised_task
+    if (project.workflow === 'game') rev.department = spec.department
     const plan = this.store.tasks(t.request_id).map((x) => (x.id === t.id ? rev : specOf(x)))
     const problem = reviseProblem(spec, rev) ?? validateTasks(plan, this.projects)
     if (problem) { this.store.tx(() => this.block(cur, `지시서 수정안이 유효하지 않아요: ${problem}`)); return }
-    if (canAutoApply(spec, rev)) { this.store.tx(() => this.applyRevision(t.id, rev)); return }
+    if (canAutoApply(spec, rev) || (project.workflow === 'game' && spec.acceptance.every(a => rev.acceptance.some(b => a.id === b.id && a.text === b.text && a.kind === b.kind)) && !gamePlanProblem({ summary: '', assumptions: [], tasks: plan }, project.id))) { this.store.tx(() => this.applyRevision(t.id, rev)); return }
+    if (project.workflow === 'game') { this.store.tx(() => this.block(cur, '팀장 수정안이 완료 기준을 바꿔 적용하지 않았습니다')); return }
     this.store.tx(() => {
       this.store.set(`revise:${t.id}`, JSON.stringify(rev))
       this.store.putApproval({ id: `revise:${t.id}`, teamId: 'hq', subjectId: t.request_id, title: `지시서 수정안: ${t.title}`, body: reviseDiff(spec, rev),
@@ -1901,7 +2014,7 @@ export class Runner {
   private notifyDecisions(): void {
     const titles: Record<DecisionItem['kind'], string> = { system: 'hq가 멈췄어요 — 확인이 필요해요', plan: '사장이 계획을 올렸어요', ceo_question: '사장이 질문했어요', worker_question: '작업자가 질문했어요',
       revise: '지시서 수정안 승인이 필요해요', blocked: '작업이 막혔어요 — 판단이 필요해요', integration: '통합에 문제가 생겼어요', accept: '결과 수락을 기다려요', merge: '병합 승인을 기다려요', team: '팀 결정이 필요해요' }
-    for (const d of decisionItems(this.store, this.now(), this.teamNames)) {
+    for (const d of this.userDecisions()) {
       const k = `notified:${d.id}:${d.revision}`
       if (this.store.get(k)) continue
       this.store.set(k, this.iso())
@@ -1909,9 +2022,18 @@ export class Runner {
     }
   }
 
+  private userDecisions(): DecisionItem[] {
+    return decisionItems(this.store, this.now(), this.teamNames).filter(d => {
+      const r = d.requestId ? this.store.request(d.requestId) : null
+      if (!r || this.project(r.project)?.workflow !== 'game') return true
+      if (['accept', 'merge', 'system'].includes(d.kind)) return true
+      return d.kind === 'blocked' && !!(d.taskId && this.store.task(d.taskId)?.lingering)
+    })
+  }
+
   // ----- screen data -----
   views(teams?: HeadlineInput['teams']): { workers: WorkerView[]; headline: Headline; quota: QuotaView | null; decisions: DecisionItem[] } {
-    const decisions = decisionItems(this.store, this.now(), this.teamNames)
+    const decisions = this.userDecisions()
     const q = this.quota()
     const workers = workerViews(this.store, (a) => this.live.get(a.id)?.tail.lastActivity ?? lastActivityOf(hqDirOf(a)), q.mode === 'hold' ? q.until : null)
     const failures = this.store.requestsByStatus(['blocked']).map((r) => ({ title: r.text.replace(/\s+/g, ' ').slice(0, 30), reason: r.note ?? '' }))
@@ -1944,4 +2066,3 @@ export class Runner {
   /** Offers the merge card again for a project whose integration is still valid (recovery when HEAD is still the target). */
   reofferIntegrated(requestId: string, projectId: string): void { this.store.tx(() => { this.store.putMerge(requestId, projectId, { state: 'integrated' }) }) }
 }
-

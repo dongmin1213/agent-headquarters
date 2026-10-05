@@ -60,13 +60,13 @@ class LineKeeper {
 }
 
 /** Runs one shell command in the sandbox; a timeout kills the whole process group (children included). */
-export function runSandboxed(command: string, cwd: string, timeoutMs: number, profilePath: string, id = 'cmd', onSpawn?: OnSpawn): Promise<CheckResult & { timedOut: boolean }> {
+export function runSandboxed(command: string, cwd: string, timeoutMs: number, profilePath: string, id = 'cmd', onSpawn?: OnSpawn, isolatedHome = false): Promise<CheckResult & { timedOut: boolean }> {
   const started = Date.now()
   return new Promise((resolve) => {
     const out = new LineKeeper()
     const argv = wrap(['/bin/sh', '-c', command], profilePath)
     const cache = makeCacheDir() // per-command package-manager cache (§6.2), removed when the command ends
-    const child = spawn(argv[0], argv.slice(1), { cwd, env: childEnv(cacheEnv(cache)), detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(argv[0], argv.slice(1), { cwd, env: childEnv({ ...cacheEnv(cache), ...(isolatedHome ? { HOME: cache } : {}) }), detached: true, stdio: ['ignore', 'pipe', 'pipe'] })
     if (child.pid) onSpawn?.(child.pid)
     let timedOut = false
     const killGroup = (sig: NodeJS.Signals) => { try { if (child.pid) process.kill(-child.pid, sig) } catch { /* gone */ } }
@@ -251,7 +251,7 @@ export async function runChecks(o: RunChecksOpts): Promise<ChecksFile> {
   const warnings: string[] = []
   let dirty = false
   for (const c of o.checks) {
-    const { timedOut: _t, ...ran } = await runSandboxed(c.command, o.wt.path, o.timeoutMs, o.profilePath, c.id, o.onSpawn)
+    const { timedOut: _t, ...ran } = await runSandboxed(c.command, o.wt.path, o.timeoutMs, o.profilePath, c.id, o.onSpawn, !!o.sandbox.graphics)
     const r: CheckOutcome = { ...ran, kind: c.kind }
     // Once a check changed tracked files, later checks run on content that is not the commit: they fail too.
     const changed = dirty ? [] : await trackedChanges(o.wt, o.head).catch(() => ['?'])
@@ -281,14 +281,14 @@ export async function baseline(o: { mirror: string; base: string; path: string; 
     atomicWrite(o.profilePath, sandboxProfile(o.sandbox(wt.path)))
     const setupFailed = (tail: string) => { for (const c of o.checks) res[c.id] = { pass: false, exitCode: null, timedOut: false, setupFailed: true, tail }; return res }
     if (o.setup) {
-      const s = await runSandboxed(o.setup, wt.path, o.timeoutMs, o.profilePath, 'setup', o.onSpawn)
+      const s = await runSandboxed(o.setup, wt.path, o.timeoutMs, o.profilePath, 'setup', o.onSpawn, !!o.sandbox(wt.path).graphics)
       if (!s.pass) return setupFailed(s.outputTail.slice(-1500))
     }
     const changed = await trackedChanges(wt, o.base)
     if (changed.length) return setupFailed(setupChangedReason(changed))
     let dirty = false
     for (const c of o.checks) {
-      const r = await runSandboxed(c.command, wt.path, o.timeoutMs, o.profilePath, c.id, o.onSpawn)
+      const r = await runSandboxed(c.command, wt.path, o.timeoutMs, o.profilePath, c.id, o.onSpawn, !!o.sandbox(wt.path).graphics)
       res[c.id] = { pass: r.pass && !dirty, exitCode: r.exitCode, timedOut: r.timedOut, tail: r.outputTail.slice(-1500) }
       if (!dirty && (await trackedChanges(wt, o.base)).length) {
         dirty = true

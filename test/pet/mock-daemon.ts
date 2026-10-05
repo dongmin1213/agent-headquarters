@@ -24,10 +24,10 @@ function decision(p: Partial<DecisionItem> & Pick<DecisionItem, 'kind' | 'id' | 
 
 // v2 ids are URL-safe: request req-xxxxxxxx, task <req>.<key>, attempt <task>~a<n> / ~r<n>.
 const decisions: DecisionItem[] = [
-  // System card (no project/task): Claude CLI is not logged in. Kind is whatever the daemon sends; the pet must render it.
-  decision({ kind: 'system' as DecisionItem['kind'], id: 'system:login', requestId: '', title: 'Claude CLI 로그인이 필요해요',
-    situation: '작업자를 띄우려는데 Claude CLI가 로그인되어 있지 않아요. 터미널에서 claude 를 열어 로그인한 뒤 눌러 주세요.',
-    cause: 'claude -p 결과가 "Not logged in"이었어요', causeConfirmed: true, detailPath: null,
+  // System card (no project/task): Codex CLI is not logged in. Kind is whatever the daemon sends; the pet must render it.
+  decision({ kind: 'system' as DecisionItem['kind'], id: 'system:login', requestId: '', title: 'Codex CLI 로그인이 필요해요',
+    situation: '작업자를 띄우려는데 Codex CLI가 로그인되어 있지 않아요. 터미널에서 codex login 을 열어 로그인한 뒤 눌러 주세요.',
+    cause: 'codex exec 결과가 "Not logged in"이었어요', causeConfirmed: true, detailPath: null,
     options: ['다시 확인'], subjectHash: 'h-login', optionHelp: { '다시 확인': '멈춘 시작을 풀고 다음 시작에서 로그인을 다시 확인해요' } }),
   decision({ kind: 'plan', id: 'plan:req-a1b2c3d4', requestId: 'req-a1b2c3d4', title: 'hq · 로그인 화면 다듬기 — 계획 승인',
     detail: '작업 2개', situation: '사장이 작업 2개로 계획을 세웠어요: 폼 검증(sonnet), 오류 문구(haiku). 검사 명령은 npm test -- login 이에요.',
@@ -81,7 +81,7 @@ const snapshot: Snapshot = {
   projects: [{ id: 'hq', name: 'agent-headquarters' }, { id: 'blog', name: 'blog' }],
   limit: { blockedUntil: null },
   decisions,
-  headline: { text: `회장님 결정 ${decisions.length}건: Claude CLI 로그인이 필요해요`, needsYou: decisions.length },
+  headline: { text: `회장님 결정 ${decisions.length}건: Codex CLI 로그인이 필요해요`, needsYou: decisions.length },
   quota: {
     windows: [
       { name: 'five_hour', utilization: 0.42, resetsAt: iso(2 * 3600_000), status: 'allowed' },

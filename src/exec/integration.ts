@@ -33,7 +33,7 @@ export async function integrate(o: {
     const sha = await wtGitOk(wt, ['rev-parse', 'HEAD'])
     if (o.setup) {
       atomicWrite(o.profilePath, sandboxProfile(o.sandbox))
-      const s = await runSandboxed(o.setup, wt.path, o.timeoutMs, o.profilePath, 'setup', o.onSpawn)
+      const s = await runSandboxed(o.setup, wt.path, o.timeoutMs, o.profilePath, 'setup', o.onSpawn, !!o.sandbox.graphics)
       if (!s.pass) return { kind: 'failed', targetSha, checks: null, reason: `setup 실패 (종료 코드 ${s.exitCode ?? '시간 초과'}): ${s.outputTail.split('\n').slice(-5).join(' ').slice(0, 300)}` }
     }
     const checks = await runChecks({ wt, base: targetSha, head: sha, checks: o.checks, timeoutMs: o.timeoutMs, sandbox: o.sandbox, profilePath: o.profilePath, onSpawn: o.onSpawn })

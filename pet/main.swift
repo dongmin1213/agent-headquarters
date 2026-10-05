@@ -6,7 +6,7 @@ import UserNotifications
 
 // MARK: - API models (mirror src/types.ts). Execution-phase fields are optional so an older daemon still works.
 struct RunRecord: Decodable { let exitCode: Int?; let summary: String?; let endedAt: String? }
-struct TeamView: Decodable { let id: String; let name: String; let pack: String; let state: String; let bubble: String; let lastRun: RunRecord?; let nextRunAt: String? }
+struct TeamView: Decodable { let enabled: Bool?; let kind: String?; let project: String?; let id: String; let name: String; let pack: String; let state: String; let bubble: String; let lastRun: RunRecord?; let nextRunAt: String? }
 struct Approval: Decodable { let id: String; let teamId: String; let title: String; let body: String; let options: [String]; let subjectHash: String; let expiresAt: String }
 struct RequestQuestion: Decodable { let id: String; let question: String; let options: [String]; let `default`: String; let reason: String; let answer: String? }
 struct PlanTaskView: Decodable { let id: String; let title: String; let project: String; let role: String; let grade: String; let model: String }
@@ -543,7 +543,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         if let which = env["HQ_OPEN"], !openedForTest {
             openedForTest = true
             let state = which.hasPrefix("worker:") ? String(which.dropFirst(7)) : nil
-            let target = which == "ceo" ? ceo : critters.values.first { $0.kind == .worker && (state == nil || $0.worker?.state == state) }
+            let target = which == "ceo" ? ceo : which.hasPrefix("team:") ? critters["t:" + String(which.dropFirst(5))] : critters.values.first { $0.kind == .worker && (state == nil || $0.worker?.state == state) }
             if let target { DispatchQueue.main.async {
                 if target.kind == .ceo { self.showCeo(for: target, tab: env["HQ_TAB"].flatMap { Int($0) }, focusTask: env["HQ_FOCUS"]) }
                 else { self.showDetail(for: target) }
@@ -556,7 +556,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
                     self.rejectSend(b)
                 } else                 if let kind = env["HQ_PRESS"], let i = self.shownDecisions.firstIndex(where: { $0.kind == kind }) {
                     let b = NSButton(); b.identifier = NSUserInterfaceItemIdentifier("\(i)\u{1F}0"); self.decisionButton(b)
-                } else if target.kind == .ceo {
+                } else {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { self.snapshotPopover() }
                 }
             } }
@@ -676,7 +676,10 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
             for t in snapshot?.teams ?? [] {
                 let item = NSMenuItem(title: "\(t.name): \(label(t.state)) — \(t.bubble)", action: #selector(runFromMenu(_:)), keyEquivalent: "")
                 item.target = self; item.representedObject = t.id; item.toolTip = "클릭하면 지금 실행"
+                item.isEnabled = t.kind != "game" && t.enabled != false
                 m.addItem(item)
+                let toggle = NSMenuItem(title: "\(t.name) \(t.enabled == false ? "켜기" : "끄기")", action: #selector(toggleTeamMenu(_:)), keyEquivalent: "")
+                toggle.target = self; toggle.representedObject = t.id; m.addItem(toggle)
             }
             let web = NSMenuItem(title: "사무실 열기 (웹 화면)", action: #selector(openWeb), keyEquivalent: "")
             web.target = self; m.addItem(web)
@@ -896,7 +899,11 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
             if !a.body.isEmpty { body.addArrangedSubview(text(a.body, size: 12.5, color: Palette.muted)) }
             body.addArrangedSubview(buttonRows(a.options.map { button($0, #selector(decide(_:)), "\(a.id)\u{1F}\($0)\u{1F}\(a.subjectHash)") }, maxWidth: Pet.innerWidth))
         }
-        if !offline { body.addArrangedSubview(button("지금 실행", #selector(runTeam(_:)), t.id)) }
+        if !offline {
+            if t.kind != "game" && t.enabled != false { body.addArrangedSubview(button("지금 실행", #selector(runTeam(_:)), t.id)) }
+            if t.kind == "game" { body.addArrangedSubview(text("피카츄 → 새 요청에서 게임 프로젝트를 선택해 지시하세요.", size: 12)) }
+            body.addArrangedSubview(button(t.enabled == false ? "팀 켜기" : "팀 끄기", #selector(toggleTeamButton(_:)), t.id))
+        }
         openPanel(at: c, header: header, body: body)
     }
 
@@ -1257,6 +1264,12 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         guard let p = parts(b, 3) else { return }
         post("api/approvals/\(seg(p[0]))", body: ["decision": p[1], "subjectHash": p[2]]); popover?.close()
     }
+    func toggleTeam(_ id: String) {
+        guard let t = snapshot?.teams.first(where: { $0.id == id }) else { return }
+        post("api/teams/\(seg(id))/enabled", body: ["enabled": t.enabled == false]); popover?.close()
+    }
+    @objc func toggleTeamMenu(_ m: NSMenuItem) { if let id = m.representedObject as? String { toggleTeam(id) } }
+    @objc func toggleTeamButton(_ b: NSButton) { if let id = b.identifier?.rawValue { toggleTeam(id) } }
     @objc func runTeam(_ b: NSButton) {
         guard let id = b.identifier?.rawValue else { return }
         post("api/teams/\(seg(id))/run", body: [:]); popover?.close()

@@ -47,6 +47,9 @@ export interface Approval {
 }
 
 export interface TeamView {
+  enabled?: boolean
+  kind?: 'scheduled' | 'game'
+  project?: string
   id: string
   name: string
   pack: string

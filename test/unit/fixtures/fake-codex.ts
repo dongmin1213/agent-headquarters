@@ -99,6 +99,28 @@ if (schema && prompt.includes('## 이번 턴: 진단')) {
   process.exit(0)
 }
 
+if (schema && prompt.startsWith('너는 게임팀과 독립된 감독자 피카츄다.')) {
+  if (mk('supervisorlogin')) { result({ is_error: true, result: 'Not logged in' }); process.exit(1) }
+  const evidence = execFileSync('git', ['ls-files'], { encoding: 'utf8' })
+  bash('git ls-files', 0, evidence)
+  if (mk('supervisormutate')) writeFileSync('README.md', 'changed during review')
+  result({ structured_output: { pass: true, reason: 'fixture supervisor pass (not a real quality assessment)', evidence: ['git ls-files', 'release/screenshot.png'] } })
+  process.exit(0)
+}
+if (schema && prompt.startsWith('너는 게임팀장이다.')) {
+  result({ structured_output: { proceed: true, answer: '팀장 결정: 기존 동작을 유지하고 작은 범위로 구현하세요.' } })
+  process.exit(0)
+}
+if (schema && prompt.includes('# 게임팀장') && mk('gameplan')) {
+  const departments = ['research', 'direction', 'gameplay', 'art', 'level', 'qa', 'delivery']
+  const project = /기본 대상 프로젝트: (\S+)/.exec(prompt)?.[1] ?? 'p'
+  result({ structured_output: { questions: [], plan: { summary: '게임팀 시험 계획', assumptions: [], tasks: departments.map((department, i) => ({
+    id: department, title: department, department, project, role: i === 0 ? 'collect' : 'implement', grade: 'L2', model: 'sonnet',
+    owns: i === 0 ? [] : [`${department}/**`], brief: `[[FAKE:write=${department}/out.txt]]`, depends_on: i ? [departments[i - 1]] : [],
+    acceptance: [{ id: 'A1', text: 'README 유지', check: 'test -f README.md', kind: 'regression' }], review: { brief: '독립 검토', model: 'sonnet' },
+  })) } } })
+  process.exit(0)
+}
 if (schema) { // CEO planning turn
   result({ structured_output: { questions: [{ question: '범위?', options: ['작게', '크게'], default: '작게', reason: '테스트' }], plan: null } })
   process.exit(0)
