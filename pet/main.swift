@@ -59,6 +59,7 @@ struct Snapshot: Decodable {
     var requests: [RequestView]? = nil; var projects: [ProjectRef]? = nil
     var workers: [WorkerView]? = nil; var headline: Headline? = nil; var quota: QuotaView? = nil
     var decisions: [DecisionItem]? = nil
+    var models: [String: String]? = nil
     struct Limit: Decodable { let blockedUntil: String? }
 }
 
@@ -113,7 +114,7 @@ let characters: [String: CharSpec] = [
 func charSpec(model: String) -> CharSpec {
     let m = model.lowercased()
     if m == "hq" { return CharSpec(file: "", initial: "hq", rgb: (0.45, 0.47, 0.55)) }   // hq's own acceptance checks
-    for k in ["haiku", "sonnet", "opus"] where m.contains(k) { return characters[k]! }
+    for (alias, family) in [("haiku", "luna"), ("sonnet", "sol"), ("opus", "astra")] where m.contains(alias) || m.contains(family) { return characters[alias]! }
     return CharSpec(file: "", initial: String(model.prefix(1)).uppercased(), rgb: (0.55, 0.55, 0.6))
 }
 
@@ -461,6 +462,10 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         }
     }
 
+    func modelName(_ model: String) -> String {
+        snapshot?.models?[model] ?? ["haiku": "Codex · 경량", "sonnet": "Codex · 표준", "opus": "Codex · 고성능"][model] ?? model
+    }
+
     func apply(_ s: Snapshot, offline: Bool) {
         snapshot = s; self.offline = offline
         let content = panel.contentView!
@@ -499,9 +504,9 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
             c.worker = w
             var l = Look(bubble: w.bubble, mood: .busy)
             l.plate = switch w.kind {
-                case "review": plateText("검토", w.title, w.model)
+                case "review": plateText("검토", w.title, modelName(w.model))
                 case "verify": plateText("기계 검증", w.title, "hq")
-                default: plateText(w.project, w.title, w.model)
+                default: plateText(w.project, w.title, modelName(w.model))
             }
             if w.state == "held" { l.mood = .sleeping; l.badge = "zz" }
             if w.state == "blocked" { l.mood = .blocked; l.bubble = "막힘 · 사장에게 보고" }
@@ -567,42 +572,44 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     func wire(_ c: Critter) {
         c.view.onClick = { [weak self, weak c] in if let c { self?.showDetail(for: c) } }
         c.view.onDrag = { [weak self, weak c] dx, dy in
-            guard let self, let c else { return }
-            self.popover?.close(); c.dragging = true
-            c.move(dx: dx, dy: dy, bounds: self.panel.contentView!.bounds); self.layoutAll()
+            guard let self, c != nil else { return }
+            guard let anchor = self.critters["ceo"] else { return }
+            self.popover?.close(); anchor.dragging = true
+            anchor.move(dx: dx, dy: dy, bounds: self.panel.contentView!.bounds); self.layoutAll()
         }
-        c.view.onDrop = { [weak c] in c?.dragging = false; c?.savePosition() }
+        c.view.onDrop = { [weak self] in
+            guard let anchor = self?.critters["ceo"] else { return }
+            anchor.dragging = false; anchor.savePosition()
+        }
         c.bubble.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(clicked(_:))))
     }
 
-    /// CEO leftmost, then workers in the daemon's order, then teams.
+    /// CEO leftmost, then teams and their workers. Every character belongs to one anchored row.
     func rowOrder() -> [Critter] {
-        ([critters["ceo"]] + workerOrder.map { critters[$0] } + teamOrder.map { critters[$0] }).compactMap { $0 }
+        ([critters["ceo"]] + teamOrder.map { critters[$0] } + workerOrder.map { critters[$0] }).compactMap { $0 }
     }
 
-    /// One row just above the Dock (the panel is the screen's visible frame, so y≈0 is the Dock's top edge).
-    /// Each slot is as wide as its name plate (min 120pt), with an even gap between slots; if the row is wider
-    /// than the screen every slot shrinks and plates truncate. A dragged character keeps its remembered spot.
+    /// One row anchored to Pikachu. Old per-worker saved coordinates never split the group.
+    /// Dragging any character moves the whole row; clamp the row together at screen edges.
     func layoutAll() {
         let bounds = panel.contentView!.bounds
         let row = rowOrder()
+        guard let anchor = row.first else { return }
         let margin: CGFloat = 16, gap: CGFloat = 10, rowY: CGFloat = 22
         var widths = row.map { max($0.naturalPlateWidth(), 120) }
-        let total = widths.reduce(0, +) + gap * CGFloat(max(row.count - 1, 0))
+        let gaps = gap * CGFloat(max(row.count - 1, 0))
+        let total = widths.reduce(0, +) + gaps
         let avail = bounds.width - 2 * margin
-        if total > avail { let k = (avail - gap * CGFloat(max(row.count - 1, 0))) / (total - gap * CGFloat(max(row.count - 1, 0))); widths = widths.map { $0 * k } }
-        var left = margin
+        if total > avail { let scale = max(1, avail - gaps) / (total - gaps); widths = widths.map { $0 * scale } }
+        anchor.setPosKey("row.ceo")
+        let wantedX = anchor.dragging ? anchor.x : (anchor.saved?.x ?? (margin + widths[0] / 2 - anchor.size / 2))
+        let wantedY = anchor.dragging ? anchor.y : (anchor.saved?.y ?? rowY)
+        let groupWidth = widths.reduce(0, +) + gaps
+        var left = min(max(margin, wantedX - widths[0] / 2 + anchor.size / 2), max(margin, bounds.width - margin - groupWidth))
+        let y = min(max(18, wantedY), bounds.height - anchor.size - bubbleFont - 12)
         for (i, c) in row.enumerated() {
             c.slotWidth = widths[i]
-            let key: String = switch c.kind { case .ceo: "row.ceo"; case .worker: "row.\(i)"; case .team: "row." + c.id }
-            c.setPosKey(key)
-            if !c.dragging {
-                if let p = c.saved {
-                    c.x = min(max(0, p.x), bounds.width - c.size); c.y = min(max(18, p.y), bounds.height - c.size - 24)
-                } else {
-                    c.x = left + widths[i] / 2 - c.size / 2; c.y = rowY
-                }
-            }
+            c.x = left + widths[i] / 2 - c.size / 2; c.y = y
             left += widths[i] + gap
         }
         // Bubbles that would overlap an earlier one (only possible after dragging) are lifted a row.
@@ -915,7 +922,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         guard let w = c.worker else { return }
         let task = (snapshot?.requests ?? []).flatMap { $0.tasks ?? [] }.first { $0.id == w.taskId }
         let blocked = w.state == "blocked"
-        let sub = text("\(w.model) · \(workerStateLabel(w.state))", size: 12.5, weight: blocked ? .semibold : .regular, color: blocked ? Palette.alert : Palette.muted)
+        let sub = text("\(modelName(w.model)) · \(workerStateLabel(w.state))", size: 12.5, weight: blocked ? .semibold : .regular, color: blocked ? Palette.alert : Palette.muted)
         let header = [text("\(w.project) · \(w.title)", size: 15, weight: .bold), sub]
         let body = vstack(spacing: 10)
         if blocked {
@@ -1104,7 +1111,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         scroll.widthAnchor.constraint(equalToConstant: Pet.innerWidth).isActive = true
         scroll.heightAnchor.constraint(equalToConstant: 90).isActive = true
         let tv = scroll.documentView as! NSTextView
-        tv.font = .systemFont(ofSize: 13); tv.isRichText = false; tv.textContainerInset = NSSize(width: 4, height: 6)
+        tv.font = .systemFont(ofSize: 13); tv.isRichText = false; tv.allowsUndo = true; tv.textContainerInset = NSSize(width: 4, height: 6)
         requestInput = tv
         let picker = NSPopUpButton(frame: .zero, pullsDown: false)
         for p in snapshot?.projects ?? [] { picker.addItem(withTitle: p.name); picker.lastItem?.representedObject = p.id }
@@ -1344,6 +1351,26 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     }
 }
 
+// Standard AppKit key equivalents route to the focused text view or text field's field editor.
+// The status item's menu alone does not provide the application's editing commands.
+@MainActor func installEditingMenu(_ app: NSApplication) {
+    let main = NSMenu()
+    let appItem = NSMenuItem(); main.addItem(appItem)
+    let appMenu = NSMenu(title: "HQ"); appItem.submenu = appMenu
+    appMenu.addItem(withTitle: "HQ 펫 종료", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    let editItem = NSMenuItem(); main.addItem(editItem)
+    let edit = NSMenu(title: "편집"); editItem.submenu = edit
+    edit.addItem(withTitle: "실행 취소", action: Selector(("undo:")), keyEquivalent: "z")
+    let redo = edit.addItem(withTitle: "다시 실행", action: Selector(("redo:")), keyEquivalent: "z")
+    redo.keyEquivalentModifierMask = [.command, .shift]
+    edit.addItem(.separator())
+    edit.addItem(withTitle: "잘라내기", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+    edit.addItem(withTitle: "복사", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+    edit.addItem(withTitle: "붙여넣기", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+    edit.addItem(withTitle: "전체 선택", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+    app.mainMenu = main
+}
+
 // MARK: - Start
 if env["HQ_PET_PRINT_CONFIG"] == "1" {
     print("bubbleFontSize=\(Double(bubbleFont))")
@@ -1359,5 +1386,6 @@ if env["HQ_ALLOW_SECOND_INSTANCE"] != "1", let bid = Bundle.main.bundleIdentifie
 }
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
+installEditingMenu(app)
 let pet = MainActor.assumeIsolated { Pet() }
 app.run()

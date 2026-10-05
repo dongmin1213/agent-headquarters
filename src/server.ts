@@ -89,10 +89,13 @@ export function snapshot(d: ServerDeps): Snapshot {
       bubble: !enabled ? '꺼짐 · 현재 작업 뒤 다음 배정은 쉽니다' : jobs.length ? `게임팀 ${jobs.length}건 진행 · 팀장이 제작하고 피카츄가 검수해요` : failed ? `완성 미달: ${failed.note ?? '작업 실패'}` : '새 요청을 기다려요 · 기획부터 출시 후보까지', lastRun: null, nextRunAt: null })
   }
   const v = d.runner.views(teams.map((t) => ({ name: t.name, state: t.state, bubble: t.bubble })))
-  return { updatedAt: new Date().toISOString(), lastEventId: d.store.lastEventId(), teams, approvals: d.store.openApprovals(),
+  const models: Record<string, string> = d.runner.cfg.models
+  const workers = v.workers.map(w => ({ ...w, model: models[w.model] ?? w.model }))
+  const headline = { ...v.headline, text: v.headline.text.replace(/ · (haiku|sonnet|opus)(?= ·|$)/g, (_, alias: string) => ` · ${models[alias]}`) }
+  return { models, updatedAt: new Date().toISOString(), lastEventId: d.store.lastEventId(), teams, approvals: d.store.openApprovals(),
     requests: ids.map((id) => requestView(d.store, d.runner, id)!).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
     projects: d.projects.map((p) => ({ id: p.id, name: p.name })), limit: { blockedUntil: d.runner.holdUntil() },
-    workers: v.workers, headline: v.headline, quota: v.quota, decisions: recommendMerges(v.decisions, d.store, (project, branch) => branchSha(d.projects, project, branch)) }
+    workers, headline, quota: v.quota, decisions: recommendMerges(v.decisions, d.store, (project, branch) => branchSha(d.projects, project, branch)) }
 }
 
 /** The branch tip in the user's checkout right now (read-only rev-parse), or null when it cannot be read. */

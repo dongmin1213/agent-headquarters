@@ -202,6 +202,8 @@ export interface QuotaView {
 }
 
 export interface Snapshot {
+  /** Runtime Codex model names; task aliases remain internal planning keys. */
+  models?: Record<string, string>
   updatedAt: string
   /** Last event id; the pet re-fetches the snapshot when it reconnects instead of replaying missed events. */
   lastEventId: number
