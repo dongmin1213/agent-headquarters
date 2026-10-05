@@ -217,20 +217,26 @@ export function taskView(store: Store, t: TaskRow, activity: (a: AttemptRow) => 
 
 export const hhmm = (iso: string) => { const d = new Date(iso); return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}` }
 
+function workerProfession(t: TaskRow): { department: string | null; grade: string } {
+  let department: string | null = null
+  try { const d = JSON.parse(t.spec).department; if (typeof d === 'string') department = d } catch {}
+  return { department, grade: t.grade }
+}
+
 export function workerViews(store: Store, activity: (a: AttemptRow) => string | null = (a) => lastActivityOf(hqDirOf(a)), holdUntil: string | null = null): WorkerView[] {
   const out: WorkerView[] = []
   for (const a of store.liveAttempts()) {
     const t = store.task(a.task_id)
     if (!t) continue
     const review = a.kind === 'review'
-    out.push({ attemptId: a.id, taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, model: a.model,
+    out.push({ ...workerProfession(t), attemptId: a.id, taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, model: a.model,
       kind: review ? 'review' : 'work', state: review ? 'reviewing' : 'running', bubble: activity(a) ?? (review ? '검토 준비 중' : '준비 중'), startedAt: a.started_at ?? t.updated_at })
   }
   for (const t of store.tasksByStatus(['verifying', 'held', 'blocked', 'pending', 'rework'])) {
     const waiting = waitingFor(t)
     if ((t.status === 'pending' || t.status === 'rework') && !waiting) continue
     const last = store.attempts(t.id).at(-1)
-    const base = { attemptId: last?.id ?? '', taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, startedAt: t.updated_at }
+    const base = { ...workerProfession(t), attemptId: last?.id ?? '', taskId: t.id, requestId: t.request_id, title: t.title, project: t.project, role: t.role, startedAt: t.updated_at }
     if (waiting) out.push({ ...base, model: t.model, kind: 'work', state: 'held', bubble: waiting })
     else if (t.status === 'verifying') out.push({ ...base, attemptId: store.attempts(t.id).filter((x) => x.kind === 'work').at(-1)?.id ?? '', model: 'hq', kind: 'verify', state: 'verifying', bubble: '수용 기준 검사 중' })
     else if (t.status === 'held') out.push({ ...base, model: t.model, kind: 'work', state: 'held', bubble: holdUntil ? `한도 보류 · ${hhmm(holdUntil)}까지` : '한도 보류' })

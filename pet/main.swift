@@ -24,6 +24,8 @@ struct RequestView: Decodable {
 }
 struct ProjectRef: Decodable { let id: String; let name: String }
 struct WorkerView: Decodable, Equatable {
+    var department: String? = nil
+    var grade: String? = nil
     let attemptId: String; let taskId: String; let requestId: String; let title: String; let project: String
     let role: String; let model: String; let kind: String; let state: String; let bubble: String; let startedAt: String
 }
@@ -111,11 +113,26 @@ let characters: [String: CharSpec] = [
     "sonnet": CharSpec(file: "bulbasaur", initial: "S", rgb: (0.25, 0.70, 0.45)),
     "opus": CharSpec(file: "charmander", initial: "O", rgb: (0.95, 0.45, 0.20)),
 ]
-func charSpec(model: String) -> CharSpec {
-    let m = model.lowercased()
-    if m == "hq" { return CharSpec(file: "", initial: "hq", rgb: (0.45, 0.47, 0.55)) }   // hq's own acceptance checks
-    for (alias, family) in [("haiku", "luna"), ("sonnet", "sol"), ("opus", "astra")] where m.contains(alias) || m.contains(family) { return characters[alias]! }
-    return CharSpec(file: "", initial: String(model.prefix(1)).uppercased(), rgb: (0.55, 0.55, 0.6))
+let workerSpritePool = ["psyduck", "mewtwo", "bulbasaur", "jigglypuff", "lapras", "gengar", "snorlax", "meowth", "squirtle", "charmander"]
+func preferredSprite(_ w: WorkerView) -> String {
+    if w.kind == "verify" { return "squirtle" }
+    if w.kind == "review" { return "meowth" }
+    return ["research": "psyduck", "direction": "mewtwo", "gameplay": "bulbasaur", "art": "jigglypuff", "level": "lapras", "qa": "gengar", "delivery": "snorlax"][w.department ?? ""] ?? (w.role == "collect" ? "psyduck" : "bulbasaur")
+}
+func professionName(_ w: WorkerView) -> String {
+    if w.kind == "verify" { return "자동검증" }
+    let role = ["research": "리서치", "direction": "게임기획", "gameplay": "게임개발", "art": "아트·사운드", "level": "레벨디자인", "qa": "QA", "delivery": "최종통합"][w.department ?? ""] ?? (w.role == "collect" ? "리서치" : "개발")
+    return w.kind == "review" ? "\(role) 검토" : role
+}
+func workerBubble(_ w: WorkerView) -> String {
+    let title = firstLine(w.title, max: 32)
+    switch w.state {
+    case "held": return "\(professionName(w)) · 재개 대기"
+    case "blocked": return "\(professionName(w)) · 문제 해결 대기"
+    case "reviewing": return "\(title) · 검토 중"
+    case "verifying": return "\(title) · 검사 중"
+    default: return "\(title) 중"
+    }
 }
 
 @MainActor enum Sprites {
@@ -146,6 +163,7 @@ func charSpec(model: String) -> CharSpec {
     static func character(_ spec: CharSpec) -> NSImage { load(pack: "pokemon", file: spec.file) ?? placeholder(spec.initial, spec.rgb) }
     /// Teams keep a stable pick from their pack.
     static func team(_ t: TeamView) -> NSImage {
+        if t.kind == "game" { return character(CharSpec(file: "eevee", initial: "팀", rgb: (0.65, 0.45, 0.25))) }
         let dir = packsDir.appendingPathComponent(t.pack).appendingPathComponent("pool")
         let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasSuffix(".gif") || $0.hasSuffix(".png") }.sorted()
         var h: UInt32 = 2166136261; for b in t.id.utf8 { h = (h ^ UInt32(b)) &* 16777619 }
@@ -210,6 +228,7 @@ func plateText(_ prefix: String, _ title: String, _ suffix: String, limit: Int =
     var look = Look()
     var hovered = false { didSet { if hovered != oldValue { updateAnimates() } } }
     var worker: WorkerView?
+    var spriteName = ""
     var team: TeamView?
     let size: CGFloat = 40
 
@@ -495,21 +514,22 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         workerOrder = workers.map { "w:" + $0.attemptId }
         let live = Set(workerOrder)
         for (id, c) in critters where c.kind == .worker && !live.contains(id) { c.remove(); critters[id] = nil }
+        var usedSprites = Set(critters.values.filter { $0.kind == .worker }.map(\.spriteName))
         for w in workers {
             let key = "w:" + w.attemptId
             let c = critters[key] ?? {
-                let c = Critter(id: key, kind: .worker, image: Sprites.character(charSpec(model: w.model)), in: content)
+                let preferred = preferredSprite(w)
+                let name = ([preferred] + workerSpritePool).first { !usedSprites.contains($0) } ?? preferred
+                usedSprites.insert(name)
+                let c = Critter(id: key, kind: .worker, image: Sprites.character(CharSpec(file: name, initial: String(professionName(w).prefix(1)), rgb: (0.25, 0.65, 0.55))), in: content)
+                c.spriteName = name
                 wire(c); critters[key] = c; return c
             }()
             c.worker = w
-            var l = Look(bubble: w.bubble, mood: .busy)
-            l.plate = switch w.kind {
-                case "review": plateText("검토", w.title, modelName(w.model))
-                case "verify": plateText("기계 검증", w.title, "hq")
-                default: plateText(w.project, w.title, modelName(w.model))
-            }
+            var l = Look(bubble: workerBubble(w), mood: .busy)
+            l.plate = "\(modelName(w.model)) · \(professionName(w))"
             if w.state == "held" { l.mood = .sleeping; l.badge = "zz" }
-            if w.state == "blocked" { l.mood = .blocked; l.bubble = "막힘 · 사장에게 보고" }
+            if w.state == "blocked" { l.mood = .blocked }
             c.set(l)
         }
 
@@ -922,7 +942,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         guard let w = c.worker else { return }
         let task = (snapshot?.requests ?? []).flatMap { $0.tasks ?? [] }.first { $0.id == w.taskId }
         let blocked = w.state == "blocked"
-        let sub = text("\(modelName(w.model)) · \(workerStateLabel(w.state))", size: 12.5, weight: blocked ? .semibold : .regular, color: blocked ? Palette.alert : Palette.muted)
+        let sub = text("\(modelName(w.model)) · \(professionName(w)) · \(workerStateLabel(w.state))", size: 12.5, weight: blocked ? .semibold : .regular, color: blocked ? Palette.alert : Palette.muted)
         let header = [text("\(w.project) · \(w.title)", size: 15, weight: .bold), sub]
         let body = vstack(spacing: 10)
         if blocked {

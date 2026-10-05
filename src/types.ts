@@ -137,13 +137,15 @@ export interface RequestDetail {
 
 /** One character on the pet per live attempt. */
 export interface WorkerView {
+  department?: string | null
+  grade?: string
   attemptId: string
   taskId: string
   requestId: string
   title: string
   project: string
   role: string
-  /** Model alias used for the character (haiku | sonnet | opus). */
+  /** Internal model alias, resolved to the actual Codex model in API snapshots. */
   model: string
   /** verify = hq's own acceptance checks (model "hq"). */
   kind: 'work' | 'review' | 'verify'
