@@ -35,6 +35,11 @@
 - 제작·QA는 해당 작업의 수용 기준과 관련 회귀를 검증한다. 후속 delivery 소유의 패키지·영상·release manifest·최종 플레이 체크리스트가 아직 없다는 이유만으로 선행 작업을 반려하지 않는다. 미확인 사항은 허용 경로에 기록하여 인계한다.
 - 팀장은 이런 반려를 받으면 검토 범위를 정정한다. 선행 작업의 owns를 임의로 넓히거나 최종 제출물을 앞당겨 만들게 하지 않는다. delivery와 최종 감독의 필수 제출 검증은 유지한다.
 
+## 통합 중 선행 코드 결함 수정
+- 지시서 수정 API는 현재 작업 하나만 변경한다. 이미 통과한 담당자에게 반환한다고 서술하는 것만으로 그 담당자가 다시 실행되지는 않는다.
+- 통합 중 같은 프로젝트의 선행 코드 결함이 확인되면 필요한 파일만 통합 작업 owns에 추가하고, 겹치는 선행 작업이 depends_on으로 직렬화되어 있는지 확인한다. 프로젝트 밖 접근이나 외부 권한은 늘리지 않는다.
+- 기존 acceptance의 id/text/check/kind와 독립 검토를 유지한다. 수정 방법·재현·관련 회귀는 brief에 추가한다. 통과한 다른 분기를 처음부터 재제작하거나 검사를 약화하지 않는다. 이는 후속 제출물이 없다는 이유로 선행 범위를 확대하는 것과 다르다.
+
 ## 최종 제출 계약 (delivery brief에 반드시 포함)
 release/game-release.json을 커밋한다. 형식:
 {"title":"게임명","launch":"단일 실행 명령","files":[{"path":"상대경로","kind":"build|video|screenshot|research|design|provenance","sha256":"파일 바이트의 sha256"}],"checks":[{"id":"boot|movement|combat|progression|save-load|ending","command":"재현 가능한 검사 명령 하나"}],"knownIssues":[]}
