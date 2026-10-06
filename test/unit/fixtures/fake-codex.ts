@@ -100,12 +100,19 @@ if (schema && prompt.includes('## 이번 턴: 진단')) {
   process.exit(0)
 }
 
-if (schema && prompt.startsWith('너는 게임팀과 독립된 감독자 피카츄다.')) {
-  if (mk('supervisorlogin')) { result({ is_error: true, result: 'Not logged in' }); process.exit(1) }
+if (schema && (prompt.startsWith('너는 게임팀과 독립된 감독자 피카츄다.') || prompt.startsWith('너는 게임팀장 품질 책임자다.'))) {
+  const leader = prompt.startsWith('너는 게임팀장')
+  if (!leader && mk('supervisorlogin')) { result({ is_error: true, result: 'Not logged in' }); process.exit(1) }
   const evidence = execFileSync('git', ['ls-files'], { encoding: 'utf8' })
   bash('git ls-files', 0, evidence)
-  if (mk('supervisormutate')) writeFileSync('README.md', 'changed during review')
-  result({ structured_output: { pass: true, reason: 'fixture supervisor pass (not a real quality assessment)', evidence: ['git ls-files', 'release/screenshot.png'] } })
+  if (!leader && mk('supervisormutate')) writeFileSync('README.md', 'changed during review')
+  const frames = JSON.parse(/^HQ 영상 프레임: (.+)$/m.exec(prompt)![1])
+  const criteria = ['brief', 'controls-combat', 'world', 'art', 'presentation', 'delivery'].map(id => ({ id, result: 'pass', observation: 'fixture only, no real quality assessed', evidence: ['README.md', frames[0].path] }))
+  if ((leader && mk('supervisorleadfail')) || (!leader && mk('supervisorqualityfail'))) criteria[2].result = 'fail'
+  if (!leader && mk('supervisorunverified')) criteria[3].result = 'unverified'
+  if (!leader && mk('supervisormissing')) criteria.pop()
+  // Intentionally claims overall pass even when a dimension fails: HQ must refuse this.
+  result({ structured_output: { pass: true, reason: 'fixture only, not a real quality assessment', criteria, repairs: [] } })
   process.exit(0)
 }
 if (schema && (prompt.startsWith('너는 게임팀장이다.') || prompt.startsWith('너는 피카츄 독립 감독자이다.'))) {

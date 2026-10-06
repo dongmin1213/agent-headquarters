@@ -9,6 +9,7 @@ import { basename, join } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import type { Bus } from '../bus.ts'
 import { gameEnabled, gameNeedsUser, gamePlanProblem, gameWaiting, gameWaitSignature, GAME_PLAYTEST_RULES, GAME_WORKER_RULES, readGameManifest } from '../game.ts'
+import { GAME_QUALITY_VERSION, GAME_QUALITY_RULES, GAME_QUALITY_SCHEMA, gameQualityProblem } from '../game-quality.ts'
 import { runJsonTurn, reviewModelOf, validateTasks, type Acceptance, type CeoPlan, type PlanTask, type Project } from '../ceo.ts'
 import type { HqConfig } from '../config.ts'
 import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../store.ts'
@@ -1572,7 +1573,7 @@ export class Runner {
   }
 
   private gameSignature(id: string): string {
-    return sha256(JSON.stringify({ tasks: this.store.tasks(id).map(t => [t.id, t.generation, t.status, t.head_sha, t.report_sha]), merges: this.store.mergeRows(id).map(m => [m.project, m.integration_sha]) }))
+    return sha256(JSON.stringify({ qualityVersion: GAME_QUALITY_VERSION, request: this.store.request(id)?.text, tasks: this.store.tasks(id).map(t => [t.id, t.generation, t.status, t.head_sha, t.report_sha]), merges: this.store.mergeRows(id).map(m => [m.project, m.integration_sha]) }))
   }
 
   /** Explicit project delegation covers local delivery only, never user playtest approval or publication. */
@@ -1589,7 +1590,7 @@ export class Runner {
   private startGameRelease(r: RequestRow, signature: string): void {
     if (!gameEnabled(this.store, r.project) || this.gameReleasing.has(r.id) || !this.canStartCeo() || !this.ceoLock.tryAcquire()) return
     this.gameReleasing.add(r.id)
-    this.emitRequest(r.id, '피카츄가 게임 출시 후보를 독립 검수하고 있어요')
+    this.emitRequest(r.id, '게임팀장 1차 검수 후 피카츄가 독립 검수합니다')
     this.bg(this.checkGameRelease(r, signature).finally(() => { this.gameReleasing.delete(r.id); this.ceoLock.release(); this.kick() }), `game-release:${r.id}`)
   }
 
@@ -1620,10 +1621,13 @@ export class Runner {
       if (!checked.manifest) { reject(checked.problem!); return }
       const manifest = checked.manifest
       const dir = join(this.home, 'runs', r.id, '_game-supervisor', signature)
-      mkdirSync(dir, { recursive: true })
+      const evidenceDir = join(dir, 'frames')
+      mkdirSync(evidenceDir, { recursive: true })
       const profile = join(dir, 'checks.sb')
-      atomicWrite(profile, sandboxProfile(this.sandboxFor(cwd, null, r.project)))
+      atomicWrite(profile, sandboxProfile(this.sandboxFor(cwd, evidenceDir, r.project)))
       const records = []
+      const videoFrames: string[] = []
+      const frameIndex: { path: string; video: string; sampleSeconds: number[] }[] = []
       const quote = (s: string) => "'" + s.replaceAll("'", "'\\''") + "'"
       for (const f of manifest.files.filter(f => f.kind === 'video')) {
         if (!current()) return
@@ -1638,6 +1642,19 @@ export class Runner {
         if (!video.pass || !info?.streams?.some((s: any) => s.codec_type === 'video' && s.width > 0 && s.height > 0) || Number(info?.format?.duration ?? 0) < 3) {
           reject(`실제 플레이 영상으로 읽을 수 없거나 3초 미만입니다: ${f.path}`); return
         }
+        // Bound image/context cost. These are decoded by HQ, not hand-picked screenshots supplied by the team.
+        if (videoFrames.length < 3) {
+          const duration = Number(info.format.duration), frame = join(evidenceDir, `video-${videoFrames.length + 1}.png`)
+          const decode = this.procTracker('game-frames')
+          let sampled
+          try { sampled = await runSandboxed(`ffmpeg -nostdin -y -v error -i ${quote(f.path)} -vf ${quote(`fps=8/${duration},scale=384:216:force_original_aspect_ratio=decrease,pad=384:216:(ow-iw)/2:(oh-ih)/2,tile=4x2`)} -frames:v 1 ${quote(frame)}`, cwd, 60_000, profile, 'video-frames', decode.onSpawn, true) }
+          finally { decode.done() }
+          records.push(sampled)
+          if (!sampled.pass || !existsSync(frame)) { reject(`영상 프레임 추출 실패: ${f.path}`); return }
+          videoFrames.push(frame)
+          frameIndex.push({ path: frame, video: f.path, sampleSeconds: Array.from({ length: 8 }, (_, i) => Math.round((i + 0.5) * duration / 8 * 100) / 100) })
+          atomicJson(join(dir, 'frames.json'), frameIndex)
+        }
       }
       for (const c of manifest.checks) {
         if (!current()) return
@@ -1648,26 +1665,61 @@ export class Runner {
         if (!records.at(-1)!.pass) { reject(`필수 검사 실패: ${c.id} — ${records.at(-1)!.outputTail.slice(-1500)}`); return }
       }
       if (!current()) return
-      const tools = new Set<string>()
-      const prompt = `너는 게임팀과 독립된 감독자 피카츄다. 팀의 완료 주장이나 검사 exit 0만 믿지 말고 실제 소스·검사 구현·빌드·이미지를 읽어 판정한다.\n사용자 요청: ${r.text}\n출시 명세: ${JSON.stringify(manifest)}\nHQ가 직접 실행한 검사: ${JSON.stringify(records)}\n${GAME_WORKER_RULES}\n${GAME_PLAYTEST_RULES}\n이번 역할은 읽기 전용 검수다. 변경하지 않는다. shell로 게임과 테스트 코드를 직접 읽고 파일 존재/상수 반환 검사로 속이지 않았는지 확인한다. 첨부된 실제 플레이 스크린샷을 반드시 확인하고 영상은 ffprobe 메타데이터와 캡처 프레임을 대조한다. 필요시 임시 폴더에서 추가 검사를 한다. docs/game-design.md의 콘텐츠 약속과 최종 게임을 비교한다. 이동/전투/능력 해금/연결된 맵/보스/엔딩/사망/저장/불러오기가 실제로 이어져야 한다. 타이틀 화면이나 기술 데모만 있으면 반려한다. 임시물/누락된 에셋/빌드 실행 불가/진행 불가/권리 출처 미확인은 반려한다. 조사 URL의 실제 근거, 창작 자료를 변형한 독자성, 레퍼런스 도트 느낌과 동작 프레임의 일관성도 확인한다. 확인할 수 없는 항목은 통과로 쓰지 않는다. evidence에는 직접 관측한 파일·명령·이미지 경로를 기록하고 reason에 수정할 구체적 문제를 적는다. 만족하면 '사용자 플레이 평가용 출시 후보'로 통과시키며 상용 품질이나 재미를 보증하지 않는다.`
-      atomicWrite(join(dir, 'prompt.md'), prompt)
-      const result = await runJsonTurn({ codexBin: this.cfg.codexBin, runtimeHome: this.home, model: this.cfg.models.opus, cwd, prompt,
-        sessionId: randomUUID(), resume: false, addDirs: [], timeoutMs: 10 * 60_000, images: manifest.files.filter(f => f.kind === 'screenshot').slice(0, 3).map(f => join(cwd, f.path)),
-        schema: { type: 'object', additionalProperties: false, required: ['pass', 'reason', 'evidence'], properties: { pass: { type: 'boolean' }, reason: { type: 'string' }, evidence: { type: 'array', items: { type: 'string' }, minItems: 1 } } },
-        onLine: line => {
-          if (line.type === 'rate_limit_event') this.observe(line)
-          for (const c of (line.message as any)?.content ?? []) if (c.type === 'tool_use') tools.add(c.name)
-        } })
-      atomicJson(join(dir, 'verdict.json'), result)
-      if (!current()) return
-      if (result.limited) { this.limitBackoff(); return }
-      if (!result.ok && /Not logged in|authentication|unauthorized|401|refresh.token/i.test(result.error ?? '')) { this.requireLogin(result.error ?? 'Not logged in'); return }
-      if (!result.ok) { reject(`감독자 검사 실패: ${result.error}`); return }
-      const verdict = result.output as { pass: boolean; reason: string; evidence: string[] }
-      if (verdict.pass !== true || !tools.has('Bash')) { reject(verdict.reason || '독립적인 코드·이미지 관측 근거 부족'); return }
-      const after = readGameManifest(cwd)
-      if (after.problem || JSON.stringify(after.manifest) !== JSON.stringify(manifest)) { reject(after.problem ?? '검사 중 제출 명세가 바뀌었습니다'); return }
-      if ((await trackedChanges(wt, sha)).length) { reject('검사 중 통합 작업 폴더가 바뀌었거나 Git 확인에 실패했습니다'); return }
+      const unchanged = async () => {
+        const after = readGameManifest(cwd)
+        if (after.problem || JSON.stringify(after.manifest) !== JSON.stringify(manifest)) return after.problem ?? '검사 중 제출 명세가 바뀌었습니다'
+        if ((await trackedChanges(wt, sha)).length) return '검사 중 통합 작업 폴더가 바뀌었거나 Git 확인에 실패했습니다'
+        return null
+      }
+      const initialChange = await unchanged()
+      if (initialChange) { reject(initialChange); return }
+      // A passed first stage is reusable only for this exact request, candidate and policy version.
+      // The supervisor receives the artifacts, never the leader's conclusion (avoid rubber-stamping).
+      for (const stage of ['lead', 'supervisor'] as const) {
+        if (!current()) return
+        const cached = readJson<{ signature: string; verdict: unknown; observedSource: boolean }>(join(dir, `${stage}-approval.json`))
+        if (cached?.signature === signature && cached.observedSource && !gameQualityProblem(cached.verdict, cwd, videoFrames)) continue
+        const tools = new Set<string>()
+        const name = stage === 'lead' ? '게임팀장 1차 품질 검수' : '피카츄 독립 2차 품질 검수'
+        this.emitRequest(r.id, `${name} 중`)
+        const prompt = `${stage === 'lead' ? '너는 게임팀장 품질 책임자다.' : '너는 게임팀과 독립된 감독자 피카츄다.'}
+팀의 완료 주장이나 검사 exit 0만 믿지 말고 실제 소스·검사 구현·빌드·이미지를 읽어 판정한다.
+사용자 요청: ${r.text}
+출시 명세: ${JSON.stringify(manifest)}
+HQ 실행 검사 요약: ${JSON.stringify(records.map(c => ({ id: c.id, command: c.command, pass: c.pass, output: c.outputTail.slice(-1200) })))}
+HQ 영상 프레임: ${JSON.stringify(frameIndex)}
+${GAME_WORKER_RULES}
+${GAME_PLAYTEST_RULES}
+${GAME_QUALITY_RULES}
+이번 역할은 읽기 전용 검수다. source와 검사 구현을 shell로 직접 읽고 파일 존재/상수 반환만 검사한 것은 반려한다. 첨부된 영상 프레임은 각 영상의 시간순 8장(왼쪽→오른쪽, 위→아래)이며 전체 영상을 보았다는 증거가 아니다. 조작·애니메이션·진행을 판단할 증거가 부족하면 실제 영상의 해당 구간을 추가 관측하고 확인하지 못한 것은 unverified로 기록한다.
+존재하면 docs/quality-benchmark.md, docs/game-design.md, docs/rework-design.md와 연구·레퍼런스 파일을 읽고 원래 사용자 목표와 비교한다. Ori·할로우 나이트·실크송이 요청된 경우 그 이름을 열거하는 데 그치지 말고 실제 이동·전투·공간·화면의 차이를 기록한다. 기준을 낮춰 합격시키지 않는다.
+criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로(줄번호 제외) 또는 위 HQ 프레임의 절대 경로를 적는다. controls-combat/world/art에는 실제 영상과 대조한 HQ 프레임 경로도 포함한다. 각 observation은 해당 장면·행동·결과·레퍼런스와의 차이를 구체적으로 적는다. 개선이 필요하면 fail과 담당 department별 repairs를 반환한다. 모든 항목 pass이고 수정할 결함이 없을 때만 전체 pass=true, repairs=[]다. 사람의 최종 취향 평가나 수상작 수준 달성을 보증한다고 쓰지 않는다.`
+        atomicWrite(join(dir, `${stage}-prompt.md`), prompt)
+        const result = await runJsonTurn({ codexBin: this.cfg.codexBin, runtimeHome: this.home,
+          model: stage === 'lead' ? this.cfg.models.sonnet : this.cfg.models.opus, cwd, prompt,
+          sessionId: randomUUID(), resume: false, addDirs: [], timeoutMs: 10 * 60_000,
+          images: [...videoFrames, ...manifest.files.filter(f => f.kind === 'screenshot').slice(0, 2).map(f => join(cwd, f.path))],
+          schema: GAME_QUALITY_SCHEMA,
+          onLine: line => {
+            if (line.type === 'rate_limit_event') this.observe(line)
+            for (const c of (line.message as any)?.content ?? []) if (c.type === 'tool_use') tools.add(c.name)
+          } })
+        atomicJson(join(dir, `${stage}-verdict.json`), result)
+        if (!current()) return
+        if (result.limited) { this.limitBackoff(); return }
+        if (!result.ok && /Not logged in|authentication|unauthorized|401|refresh.token/i.test(result.error ?? '')) { this.requireLogin(result.error ?? 'Not logged in'); return }
+        if (!result.ok) { reject(`${name} 실패: ${result.error}`); return }
+        const problem = gameQualityProblem(result.output, cwd, videoFrames)
+        if (problem || !tools.has('Bash')) {
+          const repairs = (result.output as any)?.repairs
+          const directions = Array.isArray(repairs) ? repairs.map((x: any) => `${x.department}: ${x.instruction}`).join('\n').slice(0, 3000) : ''
+          reject(`${name} 반려: ${problem ?? '독립적인 소스 관측 없음'}\n${directions}`); return
+        }
+        const changed = await unchanged()
+        if (changed) { reject(changed); return }
+        if (!current()) return
+        atomicJson(join(dir, `${stage}-approval.json`), { signature, verdict: result.output, observedSource: true })
+      }
       if (current()) {
         this.store.set(`game.release:${r.id}`, signature)
         this.store.set(`game.report:${r.id}`, dir)

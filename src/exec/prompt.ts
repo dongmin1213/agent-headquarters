@@ -1,5 +1,6 @@
 // Worker and reviewer prompts (execution.md §6 §8 §10 §11).
 import { GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, GAME_WORKER_RULES } from '../game.ts'
+import { GAME_QUALITY_RULES } from '../game-quality.ts'
 import type { PlanTask } from '../ceo.ts'
 import type { Verdict } from '../types.ts'
 import { setupCreatedLine, type ChecksFile } from './checks.ts'
@@ -92,7 +93,7 @@ export function workPrompt(o: WorkPromptInput): string {
     '',
     '## 지시서',
     t.brief,
-    ...(o.game ? [GAME_WORKER_RULES, GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, `직군: ${t.department}`] : []),
+    ...(o.game ? [GAME_WORKER_RULES, GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, GAME_QUALITY_RULES, `직군: ${t.department}`] : []),
     '',
     '## 수정 가능 범위 (owns)',
     bullet(t.owns),
@@ -169,7 +170,7 @@ export function reviewPrompt(o: ReviewPromptInput): string {
     '',
     '너는 hq의 검토자다. 다른 작업자가 만든 변경을 이 detached worktree(현재 폴더, 커밋 = 검토 대상 head)에서 독립적으로 판정한다.',
     '코드를 고치지 않는다. 판정만 JSON으로 낸다.',
-    ...(t.department ? [GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES] : []),
+    ...(t.department ? [GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, GAME_QUALITY_RULES] : []),
     '',
     '## 회장의 요청', o.requestText.replace(/\s+/g, ' '),
     '', '## 원 지시서', t.brief,

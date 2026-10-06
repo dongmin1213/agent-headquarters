@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import { execFileSync, spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdirSync, writeFileSync, symlinkSync, rmSync, cpSync, readFileSync, existsSync } from 'node:fs'
+import { mkdirSync, writeFileSync, symlinkSync, rmSync, cpSync, readFileSync, existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { GAME_CHECKS, GAME_DEPARTMENTS, gameEnabled, gameNeedsUser, gamePlanProblem, gameWaiting, gameWaitSignature, readGameManifest, type GameManifest } from '../../src/game.ts'
 import { execArgs } from '../../src/codex.ts'
@@ -282,7 +282,7 @@ test('team switches require master auth, persist over scheduler restart and appe
 test('release gate restores the integrated candidate, retains playable files and fails closed on changes or login loss', {
   skip: spawnSync('ffmpeg', ['-version']).status !== 0 && 'ffmpeg required for a valid video fixture',
 }, async t => {
-  for (const mode of ['pass', 'auto', 'mutate', 'login']) await t.test(mode, async () => {
+  for (const mode of ['pass', 'auto', 'mutate', 'login', 'leadfail', 'qualityfail', 'unverified', 'missing']) await t.test(mode, async () => {
     const h = harness(), f = fixture()
     try {
       h.projects[0].workflow = 'game'
@@ -300,6 +300,20 @@ test('release gate restores the integrated candidate, retains playable files and
         await h.waitFor(() => h.store.request(id)?.status === 'awaiting_acceptance', 'release accepted')
         assert.equal(h.store.approval(`accept:${id}`)?.state, 'open')
         assert.ok(h.store.get(`game.release:${id}`))
+        const report = h.store.get(`game.report:${id}`)!
+        assert.ok(existsSync(join(report, 'lead-approval.json')), 'team leader approved first')
+        assert.ok(existsSync(join(report, 'supervisor-approval.json')), 'independent supervisor also approved')
+        assert.ok(existsSync(join(report, 'frames/video-1.png')), 'HQ decoded actual video frames')
+        const supervisorPrompt = readFileSync(join(report, 'supervisor-prompt.md'), 'utf8')
+        assert.ok(!supervisorPrompt.includes('fixture only, no real quality assessed'), 'leader conclusion is not fed to the supervisor')
+        if (mode === 'pass') {
+          const before = ['lead', 'supervisor'].map(s => statSync(join(report, `${s}-verdict.json`)).mtimeMs)
+          // Simulate restart after both approvals were saved but before the final release seal.
+          h.store.set(`game.release:${id}`, null)
+          h.store.updateRequest(id, { status: 'executing' })
+          await h.waitFor(() => h.store.request(id)?.status === 'awaiting_acceptance', 'cached quality approvals reused')
+          assert.deepEqual(['lead', 'supervisor'].map(s => statSync(join(report, `${s}-verdict.json`)).mtimeMs), before, 'same candidate must not spend two more model turns')
+        }
         assert.ok(existsSync(join(h.runner.integrationDir(id, 'p'), 'release/video.mp4')))
         assert.equal(readGameManifest(h.runner.integrationDir(id, 'p')).problem, null)
         if (mode === 'auto') {
@@ -324,11 +338,21 @@ test('release gate restores the integrated candidate, retains playable files and
         await h.waitFor(() => Number(h.store.get(`game.rejections:${id}`)) > 0, 'mutation rejected')
         assert.equal(h.store.approval(`accept:${id}`), null)
         assert.match(h.store.task(`${id}.A`)?.note ?? '', /통합 작업 폴더/)
-      } else {
+      } else if (mode === 'login') {
         await h.waitFor(() => !!h.store.get('login.required'), 'login hold')
         assert.equal(h.store.request(id)?.status, 'executing')
         assert.equal(h.store.get(`game.rejections:${id}`), null)
         assert.equal(h.store.approval(`accept:${id}`), null)
+      } else {
+        await h.waitFor(() => Number(h.store.get(`game.rejections:${id}`)) > 0, 'quality rejected')
+        assert.equal(h.store.approval(`accept:${id}`), null)
+        assert.equal(h.store.get(`game.release:${id}`), null)
+        assert.match(h.store.task(`${id}.A`)?.note ?? '', mode === 'leadfail' ? /팀장 1차/ : /피카츄 독립 2차/)
+        if (mode === 'leadfail') {
+          const { readdirSync } = await import('node:fs')
+          const root = join(h.cfg.home, 'runs', id, '_game-supervisor')
+          for (const signature of readdirSync(root)) assert.equal(existsSync(join(root, signature, 'supervisor-prompt.md')), false, 'no expensive supervisor turn after leader rejection')
+        }
       }
     } finally { await h.close(); rmSync(f.root, { recursive: true, force: true }) }
   })
