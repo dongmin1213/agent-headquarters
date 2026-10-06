@@ -14,6 +14,7 @@ import type { HqConfig } from '../config.ts'
 import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../store.ts'
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
 import { baseline, checksProfile, envFailure, runChecks, runSandboxed, setupChangedReason, trackedChanges, type BaseResult, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
+import { requestScratchChildren, requestScratchPaths, removeRequestScratch, removeRequestCodexHomes } from './cleanup.ts'
 import { DONE_MAX, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
 import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, lingeringOf, lingeringPsKey, lingeringWait, outDirOf, RELEASE, workerViews, type HeadlineInput, type Lingering, type LingeringPs } from './decisions.ts'
 import { runDiagnoseTurn } from './diagnose.ts'
@@ -28,7 +29,7 @@ import { canAutoApply, reviseDiff, reviseProblem, runReviseTurn } from './revise
 import { checkVerdict, ladderUp, VERDICT_SCHEMA } from './review.ts'
 import { codexBinReadable, real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
 import { extractBashRuns, lastActivityOf, StreamTail } from './stream.ts'
-import { codexArgs, defaultProbe, findOrphan, identify, killGroup, launch, LaunchAborted, looksLikeWorker, pidAlive, psInfo, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
+import { codexArgs, defaultProbe, findOrphan, groupIdentity, identify, killGroup, launch, LaunchAborted, looksLikeWorker, pidAlive, psInfo, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
 import { reconcile as reconcileInvariants, recover as recoverState, type Violation } from './reconcile.ts'
 
 export type Notify = (title: string, body: string) => void
@@ -498,6 +499,9 @@ export class Runner {
 
   async reconcile(): Promise<Violation[]> {
     this.lastViolations = reconcileInvariants(this)
+    for (const r of this.store.requestsByStatus(['merged', 'cancelled'])) {
+      await this.step(`cleanup ${r.id}`, () => this.cleanupFinishedScratch(r.id))
+    }
     this.cleanupOldLogs()
     return this.lastViolations
   }
@@ -1754,7 +1758,7 @@ export class Runner {
   }
 
   private async cleanupMerged(requestId: string): Promise<void> {
-    for (const t of this.store.tasks(requestId)) if (t.worktree) rmSync(t.worktree, { recursive: true, force: true })
+    if (!await this.cleanupFinishedScratch(requestId)) return
     for (const m of this.store.mergeRows(requestId)) await withRepo(this.mirror(m.project), () => hqGit(this.mirror(m.project), null, ['update-ref', '-d', integrationRef(requestId, m.project)]))
   }
 
@@ -1809,11 +1813,47 @@ export class Runner {
   }
 
   private async cleanupCancelled(requestId: string): Promise<void> {
-    if (this.store.get(`cleaned:${requestId}`)) return
-    const tasks = this.store.tasks(requestId)
-    if (this.store.liveAttempts().some((a) => tasks.some((t) => t.id === a.task_id))) return
-    for (const t of tasks) if (t.worktree) rmSync(t.worktree, { recursive: true, force: true })
-    this.store.set(`cleaned:${requestId}`, this.iso())
+    if (await this.cleanupFinishedScratch(requestId) && !this.store.get(`cleaned:${requestId}`)) this.store.set(`cleaned:${requestId}`, this.iso())
+  }
+
+  private cleanupBusy(requestId: string): boolean {
+    const tasks = this.store.tasks(requestId), ids = new Set(tasks.map(t => t.id))
+    return tasks.some(t => t.lingering || this.checking.has(t.id) || this.revising.has(t.id) || this.diagnosing.has(t.id))
+      || this.store.liveAttempts().some(a => ids.has(a.task_id))
+      || [...this.integrating].some(key => key.startsWith(requestId + ':')) || this.gameReleasing.has(requestId)
+  }
+
+  /** Versioned sweep also repairs empty parents and legacy worktrees left by older releases. */
+  private async cleanupFinishedScratch(requestId: string): Promise<boolean> {
+    const r = this.store.request(requestId)
+    if (!r || !['merged', 'cancelled'].includes(r.status) || this.cleanupBusy(requestId)) return false
+    if (this.store.get(`scratchPurged:v1:${requestId}`)) return true
+    const tasks = this.store.tasks(requestId), attempts = tasks.flatMap(t => this.store.attempts(t.id))
+    for (const a of attempts) if (a.pid) {
+      const identity = await groupIdentity(a.pid, a.lstart, this.probe)
+      if (identity === 'same' || identity === 'unknown') return false
+    }
+    const roots = requestScratchPaths(this.home, requestId)
+    const owned = (key: string) => roots.some(root => key.startsWith(root + '/') && !key.split('/').includes('..'))
+    const keys = requestScratchChildren(this.home, requestId).flatMap(path => [path, `coordinator:${path}`])
+    for (const a of attempts) {
+      const key = readProcessInfo(hqDirOf(a))?.codexHomeKey
+      if (key && owned(key)) keys.push(key)
+    }
+    for (const t of tasks) if (t.worktree && owned(t.worktree)) keys.push(t.worktree, `coordinator:${t.worktree}`)
+    const prior = JSON.parse(this.store.get(`cleanupCodex:${requestId}`) ?? '[]') as string[]
+    this.store.set(`cleanupCodex:${requestId}`, JSON.stringify([...new Set([...prior, ...keys.map(sha256)])]))
+    const gitDirs: string[] = []
+    for (const projectId of new Set([r.project, ...tasks.map(t => t.project)])) {
+      gitDirs.push(this.mirror(projectId))
+      const project = this.project(projectId)
+      if (project && existsSync(project.path)) {
+        gitDirs.push(await hqGitOk(null, null, ['rev-parse', '--path-format=absolute', '--git-common-dir'], { cwd: project.path }))
+      }
+    }
+    await removeRequestScratch(this.home, requestId, gitDirs)
+    this.store.set(`scratchPurged:v1:${requestId}`, this.iso())
+    return true
   }
 
   /** §D decideTask (v3): retry on the same model, skip (with dependents), or stop. Revision = the task's block count. */
@@ -2073,7 +2113,13 @@ export class Runner {
 
   private cleanupOldLogs(): void {
     for (const r of this.store.requestsByStatus([...TERMINAL_REQUEST])) {
-      if (this.now() - Date.parse(r.updated_at) < LOG_RETENTION_MS || this.store.get(`logsPurged:${r.id}`)) continue
+      if (this.now() - Date.parse(r.updated_at) < LOG_RETENTION_MS || this.cleanupBusy(r.id)) continue
+      if (['merged', 'cancelled'].includes(r.status) && !this.store.get(`scratchPurged:v1:${r.id}`)) continue
+      if (['merged', 'cancelled'].includes(r.status) && this.store.get(`scratchPurged:v1:${r.id}`) && !this.store.get(`codexPurged:v1:${r.id}`)) {
+        removeRequestCodexHomes(this.home, JSON.parse(this.store.get(`cleanupCodex:${r.id}`) ?? '[]'))
+        this.store.set(`codexPurged:v1:${r.id}`, this.iso())
+      }
+      if (this.store.get(`logsPurged:${r.id}`)) continue
       rmSync(join(this.home, 'runs', r.id), { recursive: true, force: true })
       this.store.set(`logsPurged:${r.id}`, this.iso())
     }
