@@ -108,8 +108,15 @@ if (schema && prompt.startsWith('너는 게임팀과 독립된 감독자 피카�
   result({ structured_output: { pass: true, reason: 'fixture supervisor pass (not a real quality assessment)', evidence: ['git ls-files', 'release/screenshot.png'] } })
   process.exit(0)
 }
-if (schema && prompt.startsWith('너는 게임팀장이다.')) {
-  result({ structured_output: { proceed: !mk('leadwait'), answer: mk('leadwait') ? '외부 관측이 필요해 이 작업만 대기합니다.' : '팀장 결정: 기존 동작을 유지하고 작은 범위로 구현하세요.' } })
+if (schema && (prompt.startsWith('너는 게임팀장이다.') || prompt.startsWith('너는 피카츄 독립 감독자이다.'))) {
+  const supervisor = prompt.startsWith('너는 피카츄')
+  const wait = !!mk('leadwait') || (!!mk('leadescalate') && !supervisor)
+  const repair = mk('leadrepair')
+  const original = JSON.parse(/^작업: (.+)$/m.exec(prompt)![1])
+  const revised = repair ? { ...original, brief: '기존 결과 보존 후 공격 표시 수정·재검수', owns: [...original.owns, 'gameplay/actor.gd'] } : null
+  if (revised && repair === 'weaken') revised.acceptance = original.acceptance.map((a: any) => ({ ...a, check: 'test -f README.md' }))
+  result({ structured_output: { proceed: !wait, answer: wait ? '구체적 근거를 확인했으나 이 판단에서는 해결하지 못했습니다.' : '원인을 확인했습니다. 기존 동작을 유지하고 표시 결함을 수정한 뒤 재검수하세요.',
+    revised_task: revised, owner_decision: wait && mk('ownerdecision') ? 'credentials' : 'none' } })
   process.exit(0)
 }
 if (schema && prompt.includes('# 게임팀장') && mk('gameplan')) {

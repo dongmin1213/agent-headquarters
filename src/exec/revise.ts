@@ -64,6 +64,13 @@ export function canAutoApply(orig: PlanTask, rev: PlanTask): boolean {
   return rest(orig) === rest(rev)
 }
 
+/** Delegated game repair may adjust local ownership, never checks, dependencies or independent review. */
+export function canAutoApplyGame(orig: PlanTask, rev: PlanTask): boolean {
+  return Array.isArray(rev.owns) && rev.owns.every(p => typeof p === 'string' && p.length > 0
+    && !p.startsWith('/') && !p.includes('\\') && !p.split('/').some(part => ['', '.', '..'].includes(part)))
+    && canAutoApply(orig, { ...rev, owns: orig.owns })
+}
+
 /** Human-readable before/after for the revise card. */
 export function reviseDiff(orig: PlanTask, rev: PlanTask): string {
   // Project and role cannot change (reviseProblem), but the card still states them.

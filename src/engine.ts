@@ -2,7 +2,7 @@
 // queued → thinking → asking (questions) → queued (all answered) → thinking → planned → (plan card) → executing (runner)
 import { createHash, randomUUID } from 'node:crypto'
 import type { Bus } from './bus.ts'
-import { reviewModelOf, runCeoTurn, runJsonTurn, validate, type CeoPlan, type Project } from './ceo.ts'
+import { reviewModelOf, runCeoTurn, runJsonTurn, TASK_SCHEMA, validate, type CeoPlan, type PlanTask, type Project } from './ceo.ts'
 import type { Runner } from './exec/runner.ts'
 import { GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, gameEnabled, gamePlanProblem, gameWaiting, gameWaitSignature } from './game.ts'
 import type { TaskRow } from './store.ts'
@@ -11,6 +11,16 @@ import type { Store } from './store.ts'
 const MAX_TURNS = 6
 const MAX_CORRECTIONS = 1
 const PLAN_TTL_MS = 7 * 24 * 60 * 60_000
+const OWNER_DECISIONS = ['none', 'payment', 'publication', 'credentials', 'destructive', 'scope_change', 'missing_user_input'] as const
+interface GameDecision {
+  proceed: boolean; answer: string; revised_task: PlanTask | null
+  owner_decision: typeof OWNER_DECISIONS[number]
+}
+const GAME_DECISION_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['proceed', 'answer', 'revised_task', 'owner_decision'],
+  properties: { proceed: { type: 'boolean' }, answer: { type: 'string' },
+    revised_task: { anyOf: [{ type: 'null' }, TASK_SCHEMA] }, owner_decision: { enum: OWNER_DECISIONS } },
+}
 
 export class RequestEngine {
   private store: Store
@@ -87,28 +97,64 @@ export class RequestEngine {
       if (!t || !this.runner.ceoLock.tryAcquire()) continue
       try {
         const rounds = Number(this.store.get(`game.decisions:${t.id}`) ?? 0)
-        if (rounds >= 3) { this.waitGameTask(t, `게임팀 자체 해결 상한: ${t.title} — ${t.note ?? ''}`); return true }
+        if (rounds >= 3) { this.waitGameTask(t, `피카츄 내부 복구 상한 도달 · 미해결 상태를 보존합니다: ${t.title} — ${t.note ?? ''}`, false); return true }
         const questions = this.store.taskQuestions(t.id).filter(q => q.answer === null)
         const decisionModel = rounds === 0 ? 'sonnet' : 'opus'
+        const supervisor = rounds > 0
+        const signature = gameWaitSignature(this.store, t)
+        const previous = this.store.get(`game.decision:${t.id}:${rounds}`) ?? '(없음)'
         const result = await runJsonTurn({ codexBin: this.runner.cfg.codexBin, runtimeHome: this.runner.home, model: this.runner.cfg.models[decisionModel],
           cwd: t.worktree ?? p.path, sessionId: randomUUID(), resume: false, addDirs: [], timeoutMs: 5 * 60_000,
-          prompt: `너는 게임팀장이다.\n${GAME_ECONOMY_RULES}\n${GAME_PLAYTEST_RULES}\n사용자에게 세부 기획을 떠넘기지 않고 결정한다. 외부 결제/게시/권한 변경은 하지 않는다. 요청: ${r.text}\n작업: ${t.spec}\n상태: ${t.status}\n문제: ${t.note}\n진단: ${t.diagnosis}\n질문: ${JSON.stringify(questions)}\n현재 작업 파일과 선행 기획을 읽고 구체적인 답변 또는 수정 방향을 결정한다. 실행 불가능하거나 외부 권한이 필요하면 proceed=false와 정확한 이유를 보고한다. 단순 재시도는 다른 해결 방법이 있을 때만 선택한다. answer는 작업자가 따라 실행할 수 있는 구체적인 결정이다. 너는 읽기 전용 판단 세션이며 실제 수정은 별도 작업자가 수행하므로 이 세션의 쓰기 금지를 제작 불가능으로 오인하지 않는다.\n${this.runner.gameTaskEvidence(t.id)}`,
-          schema: { type: 'object', additionalProperties: false, required: ['proceed', 'answer'], properties: { proceed: { type: 'boolean' }, answer: { type: 'string' } } },
+          prompt: `너는 ${supervisor ? '피카츄 독립 감독자' : '게임팀장'}이다.\n${GAME_ECONOMY_RULES}\n${GAME_PLAYTEST_RULES}\n사용자에게 세부 기획·구현 판단을 떠넘기지 않고 해결한다. ${supervisor ? '팀장의 판단을 그대로 전달하지 말고 실제 코드·실패 증거·기존 위임 범위를 대조하여 재검토한다.' : '현재 작업 파일과 선행 기획을 확인해 실행 가능한 결정을 내린다.'}\n요청: ${r.text}\n작업: ${t.spec}\n상태: ${t.status}\n문제: ${t.note}\n진단: ${t.diagnosis}\n질문: ${JSON.stringify(questions)}\n전체 작업 계약: ${JSON.stringify(tasks.map(x => ({ key: x.key, status: x.status, project: x.project, role: x.role, owns: JSON.parse(x.spec).owns, depends_on: JSON.parse(x.spec).depends_on })))}\n이전 내부 판단: ${previous}\n
+출력 계약:
+- answer에 확인한 원인·근거, 선택한 수정, 재검 방법을 구체적으로 기록한다. 실패한 방법을 바꾸지 않은 단순 재시도는 금지한다.
+- 현재 범위에서 해결 가능하면 proceed=true, revised_task=null로 구체적인 작업 지시를 낸다.
+- 소유 범위 때문에 막혔으면 proceed=true와 현재 작업의 revised_task 전체를 제출한다. API가 실제 재배정과 재실행을 처리한다. 다른 담당자에게 반환한다고 적는 것만으로는 아무 작업도 재배정되지 않는다.
+- revised_task는 title/brief/owns만 변경할 수 있다. 완료 기준의 id/text/check/kind, 독립 검토, 작업 id/project/role/department/grade/model, depends_on은 그대로 보존한다. 통과한 선행 분기의 필요한 파일만 추가하고 전체 작업 계약에서 병렬 소유 충돌이 없는지 확인한다. 수정 후 관련 회귀와 독립 검수는 필수다. 기존 결과를 보존한다.
+- 등록된 프로젝트 내부의 파일 소유 조정·구현·기획·검수·재작업은 이미 위임된 일이다. 외부 권한 변경으로 분류하지 않는다. 현재 판단 세션은 읽기 전용이며 쓰기는 별도 작업자가 수행한다.
+- 결제(payment), 외부 공개(publication), 사용자 로그인(credentials), 위임 밖 파괴적 작업(destructive), 원래 목표의 실질 변경(scope_change), 조사로도 확보할 수 없는 필수 사용자 정보(missing_user_input)만 owner_decision으로 올릴 수 있다. 그 외는 none이다. 이미 승인된 행동에 재승인을 요구하지 않는다.
+- owner_decision이 none 이외이면 proceed=false, revised_task=null이어야 한다. answer에는 이미 시도한 방법과 근거, 내부 해결이 안 되는 이유, 사용자가 결정할 정확한 사항과 추천안을 포함한다.
+- 기술 문제를 이번 판단에서도 해결 못하면 proceed=false, owner_decision=none으로 미해결을 보고한다. 이를 사용자에게 '재시도/건너뛰기' 선택을 떠넘길 근거로 쓰지 않는다. 완료 기준을 낮추거나 검사를 면제하지 않는다.\n${this.runner.gameTaskEvidence(t.id)}`,
+          schema: GAME_DECISION_SCHEMA,
           onLine: line => { if (line.type === 'rate_limit_event') this.runner.observe(line) } })
         if (result.limited) { this.runner.limitBackoff(); return true }
         if (!result.ok && /Not logged in|authentication|unauthorized|401|refresh.token/i.test(result.error ?? '')) { this.runner.requireLogin(result.error ?? 'Not logged in'); return true }
-        if (!gameEnabled(this.store, p.id) || this.store.task(t.id)?.generation !== t.generation || this.store.task(t.id)?.status !== t.status || !['executing', 'blocked'].includes(this.store.request(r.id)?.status ?? '')) return true
+        const current = this.store.task(t.id)
+        if (!gameEnabled(this.store, p.id) || !current || gameWaitSignature(this.store, current) !== signature || !['executing', 'blocked'].includes(this.store.request(r.id)?.status ?? '')) return true
         this.store.set(`game.decisions:${t.id}`, String(rounds + 1))
-        const o = result.output as { proceed: boolean; answer: string } | null
-        if (!result.ok || !o?.proceed || !o.answer?.trim()) { this.waitGameTask(t, `게임팀장 판단 대기: ${o?.answer ?? result.error}`); return true }
-        this.store.set(`game.decision:${t.id}:${rounds + 1}`, JSON.stringify({ ...o, model: decisionModel }))
-        if (t.status === 'question') for (const q of questions) this.runner.answerTask(t.id, q.id, `[게임팀장 결정] ${o.answer}`, t.revision)
-        else {
-          this.runner.decideTask(t.id, 'retry', t.block_count)
-          const cur = this.store.task(t.id)!
-          this.store.updateTask(t.id, { note: `${cur.note ?? ''}\n팀장 수정 방향: ${o.answer}`.slice(-4000) })
+        const o = result.output as GameDecision | null
+        const valid = result.ok && o && typeof o.proceed === 'boolean' && typeof o.answer === 'string' && o.answer.trim()
+          && OWNER_DECISIONS.includes(o.owner_decision) && (o.revised_task === null || typeof o.revised_task === 'object')
+          && (o.owner_decision === 'none' || (!o.proceed && o.revised_task === null)) && (o.proceed || o.revised_task === null)
+        this.store.set(`game.decision:${t.id}:${rounds + 1}`, JSON.stringify({ ...o, model: decisionModel, supervisor, error: result.error }))
+        if (!valid || !o!.proceed) {
+          const reason = valid ? o!.answer : `판단 출력 실패: ${result.error ?? '잘못된 출력 계약'}`
+          // Even a lead's escalation must be independently examined before reaching the user.
+          if (!supervisor) this.bus.emit({ kind: 'task', text: `피카츄가 팀장 판단을 재검토합니다: ${t.title}`, data: { id: t.id } })
+          else this.waitGameTask(t, `피카츄 검토: ${reason}`, !!valid && o!.owner_decision !== 'none')
+          return true
         }
-        this.bus.emit({ kind: 'request', text: `게임팀장이 결정했어요: ${t.title}`, data: { id: r.id } })
+        const decision = o!
+        let problem: string | null = null
+        if (decision.revised_task) problem = this.runner.repairGameTask(t.id, decision.revised_task, signature)
+        else if (t.status === 'question') {
+          for (const q of questions) {
+            problem = this.runner.answerTask(t.id, q.id, `[${supervisor ? '피카츄' : '게임팀장'} 결정] ${decision.answer}`, t.revision)
+            if (problem) break
+          }
+        } else {
+          problem = this.runner.decideTask(t.id, 'retry', t.block_count)
+          if (!problem) {
+            const cur = this.store.task(t.id)!
+            this.store.updateTask(t.id, { note: `${cur.note ?? ''}\n내부 수정 방향: ${decision.answer}`.slice(-4000) })
+          }
+        }
+        if (problem) {
+          this.store.set(`game.decision:${t.id}:${rounds + 1}`, JSON.stringify({ ...decision, model: decisionModel, supervisor, error: problem }))
+          if (rounds >= 2) this.waitGameTask(t, `피카츄 수정안 적용 실패: ${problem}`, false)
+          return true
+        }
+        this.bus.emit({ kind: 'request', text: `${supervisor ? '피카츄' : '게임팀장'}가 해결 지시를 적용했어요: ${t.title}`, data: { id: r.id } })
         return true
       } finally { this.runner.ceoLock.release() }
     }
@@ -184,13 +230,13 @@ export class RequestEngine {
   }
 
   /** Preserve the failed criterion and stop repeated decisions, without stopping independent work. */
-  private waitGameTask(t: TaskRow, reason: string): void {
+  private waitGameTask(t: TaskRow, reason: string, needsUser: boolean): void {
     this.store.tx(() => {
-      this.store.set(`game.waiting:${t.id}`, JSON.stringify({ signature: gameWaitSignature(this.store, t), reason, at: new Date().toISOString() }))
+      this.store.set(`game.waiting:${t.id}`, JSON.stringify({ signature: gameWaitSignature(this.store, t), reason, needsUser, at: new Date().toISOString() }))
       this.store.updateTask(t.id, { note: reason.slice(0, 4000) })
       if (this.store.request(t.request_id)?.status === 'blocked') this.store.updateRequest(t.request_id, { status: 'executing' })
     })
-    this.bus.emit({ kind: 'task', text: `${t.title}: 판단 대기 · 독립 작업은 계속`, data: { id: t.id } })
+    this.bus.emit({ kind: 'task', text: `${t.title}: ${needsUser ? '사용자 결정 필요' : '내부 복구 보류 · 미해결 원인 보고'} · 독립 작업은 계속`, data: { id: t.id } })
   }
 }
 

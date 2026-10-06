@@ -8,7 +8,7 @@ import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import type { Bus } from '../bus.ts'
-import { gameEnabled, gamePlanProblem, gameWaiting, GAME_PLAYTEST_RULES, GAME_WORKER_RULES, readGameManifest } from '../game.ts'
+import { gameEnabled, gameNeedsUser, gamePlanProblem, gameWaiting, gameWaitSignature, GAME_PLAYTEST_RULES, GAME_WORKER_RULES, readGameManifest } from '../game.ts'
 import { runJsonTurn, reviewModelOf, validateTasks, type Acceptance, type CeoPlan, type PlanTask, type Project } from '../ceo.ts'
 import type { HqConfig } from '../config.ts'
 import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../store.ts'
@@ -25,7 +25,7 @@ import { applyMerge } from './merge.ts'
 import { resumePrompt, reviewPrompt, reworkEvidence, workPrompt, type Upstream } from './prompt.ts'
 import { isAllowedEvent, quotaState, quotaView, recordRateLimit, rejectedWithoutReset, type QuotaState } from './quota.ts'
 import { ensureMirror, fetchWork, hqGit, hqGitOk, mirrorChanged, mirrorPath, mirrorRev, newWorkClone, removeMirrorWorktree, verifyWorktree, wtGit, wtMerge, wtStatus } from './repos.ts'
-import { canAutoApply, reviseDiff, reviseProblem, runReviseTurn } from './revise.ts'
+import { canAutoApply, canAutoApplyGame, reviseDiff, reviseProblem, runReviseTurn } from './revise.ts'
 import { checkVerdict, ladderUp, VERDICT_SCHEMA } from './review.ts'
 import { codexBinReadable, real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
 import { extractBashRuns, lastActivityOf, StreamTail } from './stream.ts'
@@ -2001,7 +2001,7 @@ export class Runner {
     const plan = this.store.tasks(t.request_id).map((x) => (x.id === t.id ? rev : specOf(x)))
     const problem = reviseProblem(spec, rev) ?? validateTasks(plan, this.projects)
     if (problem) { this.store.tx(() => this.block(cur, `지시서 수정안이 유효하지 않아요: ${problem}`)); return }
-    if (canAutoApply(spec, rev) || (project.workflow === 'game' && spec.acceptance.every(a => rev.acceptance.some(b => a.id === b.id && a.text === b.text && a.kind === b.kind)) && !gamePlanProblem({ summary: '', assumptions: [], tasks: plan }, project.id))) { this.store.tx(() => this.applyRevision(t.id, rev)); return }
+    if (canAutoApply(spec, rev) || (project.workflow === 'game' && canAutoApplyGame(spec, rev) && !gamePlanProblem({ summary: '', assumptions: [], tasks: plan }, project.id))) { this.store.tx(() => this.applyRevision(t.id, rev)); return }
     if (project.workflow === 'game') { this.store.tx(() => this.block(cur, '팀장 수정안이 완료 기준을 바꿔 적용하지 않았습니다')); return }
     this.store.tx(() => {
       this.store.set(`revise:${t.id}`, JSON.stringify(rev))
@@ -2026,6 +2026,28 @@ export class Runner {
     this.emitTask(t, `지시서 수정 적용: ${rev.title} (revision ${t.revision + 1})`)
     this.kick()
     return null
+  }
+
+  /** Apply an internal repair decision only to the exact blocked/question occurrence it examined. */
+  repairGameTask(taskId: string, rev: PlanTask, signature: string): string | null {
+    const t = this.store.task(taskId)
+    if (!t || this.project(t.project)?.workflow !== 'game' || !gameEnabled(this.store, t.project)) return '활성 게임 작업이 아닙니다'
+    if (!['question', 'blocked'].includes(t.status) || gameWaitSignature(this.store, t) !== signature
+      || !['executing', 'blocked'].includes(this.store.request(t.request_id)?.status ?? '')) return '판단 대상 상태가 바뀌었습니다'
+    if (t.lingering || this.store.liveAttempts().some(a => a.task_id === t.id)) return '기존 작업자 종료 확인이 필요합니다'
+    if (!canAutoApplyGame(specOf(t), rev)) return '내부 재배정은 제목·지시서·프로젝트 내부 소유 경로만 변경할 수 있습니다. 완료 기준·검사·의존·검토는 유지해야 합니다'
+    const plan = this.store.tasks(t.request_id).map(x => x.id === t.id ? rev : specOf(x))
+    const problem = reviseProblem(specOf(t), rev) ?? validateTasks(plan, this.projects) ?? gamePlanProblem({ summary: '', assumptions: [], tasks: plan }, t.project)
+    if (problem) return problem
+    return this.store.tx(() => {
+      this.store.updateTask(t.id, { status: 'revising' })
+      const error = this.applyRevision(t.id, rev)
+      if (error) return error
+      this.store.updateTask(t.id, { diagnosis: null, note: '피카츄 내부 재배정 적용 · 기존 결과를 보존하고 수정·재검수' })
+      this.store.set(`game.waiting:${t.id}`, null)
+      this.unblockRequest(t.request_id)
+      return null
+    })
   }
 
   // ----- CEO diagnosis of blocked / integration items (§17) -----
@@ -2120,9 +2142,15 @@ export class Runner {
       if (['accept', 'merge', 'system'].includes(d.kind)) return true
       if (d.taskId && ['worker_question', 'blocked'].includes(d.kind)) {
         const task = this.store.task(d.taskId)
-        if (task && gameWaiting(this.store, task)) return true
+        if (task && gameNeedsUser(this.store, task)) return true
       }
       return d.kind === 'blocked' && !!(d.taskId && this.store.task(d.taskId)?.lingering)
+    }).map(d => {
+      const t = d.taskId ? this.store.task(d.taskId) : null
+      if (!t || this.project(t.project)?.workflow !== 'game' || !gameNeedsUser(this.store, t)) return d
+      // Show the supervisor's reason/recommendation, not just the original worker's question.
+      return { ...d, label: '피카츄 검토 후 요청', detail: `${t.note ?? ''}\n\n원래 작업 내용:\n${d.detail ?? ''}`,
+        situation: t.note ?? d.situation, recommendation: null }
     })
   }
 
@@ -2132,10 +2160,22 @@ export class Runner {
     const q = this.quota()
     const workers = workerViews(this.store, (a) => this.live.get(a.id)?.tail.lastActivity ?? lastActivityOf(hqDirOf(a)), q.mode === 'hold' ? q.until : null)
     const failures = this.store.requestsByStatus(['blocked']).map((r) => ({ title: r.text.replace(/\s+/g, ' ').slice(0, 30), reason: r.note ?? '' }))
+    for (const t of this.store.tasksByStatus(['blocked', 'question'])) {
+      if (this.project(t.project)?.workflow !== 'game') continue
+      const held = gameWaiting(this.store, t) && !gameNeedsUser(this.store, t)
+      const worker = workers.find(w => w.taskId === t.id)
+      if (held) failures.push({ title: t.title, reason: t.note ?? '피카츄 내부 복구 보류' })
+      if (worker && !gameNeedsUser(this.store, t)) worker.bubble = held ? '내부 복구 보류 · 원인 보고' : '피카츄가 해결 방법 검토 중'
+    }
     const merged = this.store.requestsByStatus(['merged']).filter((r) => this.now() - Date.parse(r.updated_at) < 10 * 60_000).at(-1)
     const waiting = this.readyTasks().length + this.store.tasksByStatus(['reviewing']).filter((t) => !this.store.liveAttempts().some((a) => a.task_id === t.id)).length
     const headline = buildHeadline({ decisions, failures, workers, ceoThinking: this.store.requestsByStatus(['thinking']).length > 0, waiting, quota: q,
       recentMerged: merged ? merged.text.replace(/\s+/g, ' ').slice(0, 40) : null, reviewFollows: (id) => this.store.task(id)?.review_model !== 'none', teams })
+    if (!decisions.length && !failures.length && !workers.some(w => ['running', 'reviewing', 'verifying'].includes(w.state))) {
+      const internal = this.store.tasksByStatus(['blocked', 'question']).find(t => this.project(t.project)?.workflow === 'game'
+        && gameEnabled(this.store, t.project) && !gameWaiting(this.store, t) && !t.lingering)
+      if (internal && q.mode !== 'hold') headline.text = `피카츄가 해결 방법 검토 중: ${internal.title}`
+    }
     return { workers, headline, quota: this.quotaView(), decisions }
   }
 

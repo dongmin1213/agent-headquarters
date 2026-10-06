@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { mkdirSync, writeFileSync, symlinkSync, rmSync, cpSync, readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { GAME_CHECKS, GAME_DEPARTMENTS, gameEnabled, gamePlanProblem, gameWaiting, readGameManifest, type GameManifest } from '../../src/game.ts'
+import { GAME_CHECKS, GAME_DEPARTMENTS, gameEnabled, gameNeedsUser, gamePlanProblem, gameWaiting, gameWaitSignature, readGameManifest, type GameManifest } from '../../src/game.ts'
 import { execArgs } from '../../src/codex.ts'
 import { Scheduler } from '../../src/scheduler.ts'
 import { startServer } from '../../src/server.ts'
@@ -133,7 +133,7 @@ test('game team leader uses Sol first and escalates repeated decisions to Astra'
       assert.equal(h.runner.views().decisions.some(d => d.kind === 'worker_question'), false)
       if (rounds) h.store.set(`game.decisions:${id}.A`, String(rounds))
       await h.engine.tick()
-      assert.match(h.store.taskQuestions(`${id}.A`)[0].answer ?? '', /게임팀장 결정/)
+      assert.match(h.store.taskQuestions(`${id}.A`)[0].answer ?? '', rounds ? /피카츄 결정/ : /게임팀장 결정/)
       const decision = JSON.parse(h.store.get(`game.decision:${id}.A:${rounds + 1}`)!)
       assert.equal(decision.model, rounds ? 'opus' : 'sonnet')
       assert.equal(decision.proceed, true)
@@ -141,20 +141,29 @@ test('game team leader uses Sol first and escalates repeated decisions to Astra'
   }
 })
 
-test('unresolved game task waits once, exposes its question, and independent work continues', async () => {
-  for (const exhausted of [false, true]) {
+test('supervisor distinguishes owner decisions from technical holds, without repeated paid loops', async () => {
+  for (const mode of ['technical', 'owner', 'exhausted']) {
     const h = harness()
     try {
       h.projects[0].workflow = 'game'
-      const id = h.plan([task('A', { department: 'art', brief: '[[FAKE:outcome=question]] [[FAKE:leadwait]]' })])
+      const id = h.plan([task('A', { department: 'art', brief: `[[FAKE:outcome=question]] [[FAKE:leadwait]] ${mode === 'owner' ? '[[FAKE:ownerdecision]]' : ''}` })])
       await h.approve(id)
       await h.waitFor(() => h.store.task(`${id}.A`)?.status === 'question')
-      if (exhausted) h.store.set(`game.decisions:${id}.A`, '3')
+      if (mode === 'exhausted') h.store.set(`game.decisions:${id}.A`, '3')
       await h.engine.tick()
+      if (mode !== 'exhausted') {
+        assert.equal(gameWaiting(h.store, h.store.task(`${id}.A`)!), false, 'lead failure alone does not reach the owner')
+        assert.equal(h.runner.views().headline.needsYou, 0)
+        await h.engine.tick()
+        assert.equal(JSON.parse(h.store.get(`game.decision:${id}.A:2`)!).supervisor, true)
+      }
       const a = h.store.task(`${id}.A`)!
       assert.equal(gameWaiting(h.store, a), true)
       assert.equal(h.store.request(id)?.status, 'executing')
-      assert.ok(h.runner.views().decisions.some(d => d.kind === 'worker_question' && d.taskId === a.id))
+      assert.equal(gameNeedsUser(h.store, a), mode === 'owner')
+      assert.equal(h.runner.views().decisions.some(d => d.kind === 'worker_question' && d.taskId === a.id), mode === 'owner')
+      if (mode === 'owner') assert.match(h.runner.views().decisions.find(d => d.taskId === a.id)!.detail, /피카츄 검토/)
+      if (mode !== 'owner') assert.match(h.runner.views().headline.text, /막혔어요/)
       const count = h.store.get(`game.decisions:${a.id}`)
       await h.engine.tick(); await h.engine.tick()
       assert.equal(h.store.get(`game.decisions:${a.id}`), count, 'no repeated paid decisions for the same wait')
@@ -168,6 +177,82 @@ test('unresolved game task waits once, exposes its question, and independent wor
       assert.equal(gameWaiting(h.store, h.store.task(a.id)!), false, 'an answer releases only this occurrence')
     } finally { h.engine.stop(); await h.close() }
   }
+})
+
+test('Pikachu resolves a team-lead escalation instead of forwarding it to the owner', async () => {
+  const h = harness()
+  try {
+    h.projects[0].workflow = 'game'
+    const id = h.plan([task('A', { department: 'gameplay', brief: '[[FAKE:outcome=question]] [[FAKE:leadescalate]]' })])
+    await h.approve(id)
+    await h.waitFor(() => h.store.task(`${id}.A`)?.status === 'question')
+    await h.engine.tick()
+    assert.equal(h.store.taskQuestions(`${id}.A`)[0].answer, null)
+    assert.equal(h.runner.views().headline.needsYou, 0)
+    await h.engine.tick()
+    assert.match(h.store.taskQuestions(`${id}.A`)[0].answer!, /피카츄 결정/)
+    assert.equal(h.runner.views().headline.needsYou, 0)
+  } finally { await h.close() }
+})
+
+function repairFixture() {
+  const h = harness()
+  h.runner.stop() // Exercise the decision transaction without dispatching real fake workers.
+  h.projects[0].workflow = 'game'
+  const tasks = plan().tasks
+  const spec = tasks.find(t => t.id === 'level')!
+  spec.brief = '[[FAKE:leadrepair]]'
+  const id = h.plan(tasks)
+  h.store.updateRequest(id, { status: 'executing' })
+  for (const t of tasks) h.store.insertTask({ id: `${id}.${t.id}`, request_id: id, key: t.id, project: 'p', title: t.title,
+    role: t.role, grade: t.grade, model: t.model, review_model: t.review!.model, spec: JSON.stringify(t),
+    status: t.id === 'level' ? 'blocked' : tasks.indexOf(t) < tasks.indexOf(spec) ? 'passed' : 'pending', branch: null, base_sha: null })
+  const tid = `${id}.level`
+  h.store.updateTask(tid, { diagnosis: '{}', worktree: h.repo })
+  return { h, id, tid, spec }
+}
+
+test('internal repair actually updates ownership and schedules preserved work for re-review', async () => {
+  const { h, tid, spec } = repairFixture()
+  try {
+    const before = readFileSync(join(h.repo, 'README.md'), 'utf8')
+    await h.engine.tick()
+    const t = h.store.task(tid)!
+    assert.equal(t.status, 'rework')
+    assert.equal(t.revision, 1)
+    assert.equal(t.worktree, h.repo)
+    assert.equal(readFileSync(join(h.repo, 'README.md'), 'utf8'), before)
+    const updated = JSON.parse(t.spec)
+    assert.ok(updated.owns.includes('gameplay/actor.gd'))
+    assert.deepEqual(updated.acceptance, spec.acceptance)
+    assert.deepEqual(updated.review, spec.review)
+    assert.equal(h.runner.views().headline.needsYou, 0)
+  } finally { await h.close() }
+})
+
+test('repair rejects stale decisions, weaker checks/review, external paths and parallel ownership conflicts', async () => {
+  const { h, id, tid, spec } = repairFixture()
+  try {
+    const signature = gameWaitSignature(h.store, h.store.task(tid)!)
+    const rev = { ...spec, owns: [...spec.owns, 'gameplay/actor.gd'] }
+    assert.ok(h.runner.repairGameTask(tid, rev, 'stale'))
+    for (const bad of [
+      { ...rev, acceptance: spec.acceptance.map(a => ({ ...a, check: 'manual' })) },
+      { ...rev, acceptance: [] },
+      { ...rev, review: { model: 'none' as const, brief: '' } },
+      { ...rev, owns: ['../outside'] },
+      { ...rev, owns: ['/Users/outside'] },
+      { ...rev, depends_on: [] },
+    ]) assert.ok(h.runner.repairGameTask(tid, bad, signature))
+    const parallel = task('parallel', { department: 'gameplay', grade: 'L2', review: { model: 'sonnet', brief: '검토' }, depends_on: ['direction'], owns: ['parallel/**'] })
+    h.store.insertTask({ id: `${id}.parallel`, request_id: id, key: 'parallel', project: 'p', title: parallel.title, role: parallel.role,
+      grade: parallel.grade, model: parallel.model, review_model: 'sonnet', spec: JSON.stringify(parallel), status: 'pending', branch: null, base_sha: null })
+    assert.match(h.runner.repairGameTask(tid, { ...rev, owns: [...rev.owns, 'parallel/actor.gd'] }, signature)!, /병렬/)
+    h.store.set('game.enabled:p', 'false')
+    assert.ok(h.runner.repairGameTask(tid, rev, signature))
+    assert.equal(h.store.task(tid)!.status, 'blocked')
+    assert.equal(h.store.task(tid)!.revision, 0)
+  } finally { await h.close() }
 })
 
 test('team switches require master auth, persist over scheduler restart and appear in snapshots', async () => {
