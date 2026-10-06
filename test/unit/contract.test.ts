@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { DONE_MAX, judgeWork, readOut, type WorkFacts } from '../../src/exec/contract.ts'
+import { DONE_MAX, judgeWork, ownsMatch, readOut, type WorkFacts } from '../../src/exec/contract.ts'
 import { DEFAULTS } from '../../src/config.ts'
 import { tmp } from './helpers.ts'
 
@@ -17,6 +17,19 @@ const facts = (o: Partial<WorkFacts> = {}, g: Partial<NonNullable<WorkFacts['git
   git: { head: HEAD, changed: ['src/a.ts'], status: '', baseIsAncestor: true, hasMerges: false, ...g }, ...o,
 })
 const outcome = (f: WorkFacts) => judgeWork(f).outcome
+
+test('whole-repository owns includes dotfiles without weakening narrow scopes or protected-path review', () => {
+  const changed = ['.gitignore', '.github/workflows/build.yml', 'src/.config/settings.json', 'src/a.ts']
+  for (const file of changed) assert.ok(ownsMatch(file, ['**']), file)
+  for (const file of ['', '/tmp/outside', '../outside', 'src/../../outside', 'src//a']) assert.ok(!ownsMatch(file, ['**']), file)
+  assert.equal(ownsMatch('.gitignore', ['src/**']), false)
+  assert.equal(ownsMatch('.gitignore', ['*']), false)
+  assert.equal(ownsMatch('.gitignore', ['.gitignore']), true)
+  const result = judgeWork(facts({ owns: ['**'], doneRaw: done({ files_modified: changed }) }, { changed }))
+  assert.equal(result.outcome, 'succeeded')
+  assert.ok(result.protectedChanges.includes('.github/workflows/build.yml'))
+  assert.equal(outcome(facts({ owns: ['**'], doneRaw: done({ head_sha: BASE }) })), 'failed', 'whole-repository scope still verifies the commit')
+})
 
 test('2. unverifiable: no done, token mismatch, symlink done, oversized done', () => {
   assert.equal(outcome(facts({ doneRaw: null })), 'unverifiable')

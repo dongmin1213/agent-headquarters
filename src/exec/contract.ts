@@ -104,10 +104,14 @@ export function parseDone(raw: string | null, token: string): { done: DoneJson |
 
 export const normPath = (p: string) => p.replace(/^\.\//, '').replace(/\/+$/, '')
 
-/** owns entries are globs; a plain path also covers everything below it. */
+/** owns entries are globs; a plain path covers descendants. Bare ** means all repo files, including dotfiles. */
 export function ownsMatch(file: string, owns: string[]): boolean {
+  if (!file || file.startsWith('/') || file.split('/').some(part => !part || part === '.' || part === '..')) return false
   return owns.some((o) => {
     const p = normPath(o)
+    // Node's glob default excludes leading dots. A whole-repository grant must also cover .gitignore.
+    // Secret scanning and protected-path review remain separate mandatory checks.
+    if (p === '**') return true
     if (!/[*?[{]/.test(p)) return file === p || file.startsWith(p + '/')
     return matchesGlob(file, p)
   })
