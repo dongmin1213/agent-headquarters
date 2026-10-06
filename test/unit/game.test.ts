@@ -197,7 +197,7 @@ test('team switches require master auth, persist over scheduler restart and appe
 test('release gate restores the integrated candidate, retains playable files and fails closed on changes or login loss', {
   skip: spawnSync('ffmpeg', ['-version']).status !== 0 && 'ffmpeg required for a valid video fixture',
 }, async t => {
-  for (const mode of ['pass', 'mutate', 'login']) await t.test(mode, async () => {
+  for (const mode of ['pass', 'auto', 'mutate', 'login']) await t.test(mode, async () => {
     const h = harness(), f = fixture()
     try {
       h.projects[0].workflow = 'game'
@@ -207,15 +207,34 @@ test('release gate restores the integrated candidate, retains playable files and
       f.save(); cpSync(join(f.root, 'release'), join(h.repo, 'release'), { recursive: true })
       writeFileSync(join(h.repo, 'test.mjs'), `import assert from 'node:assert/strict'; assert.ok(${JSON.stringify(GAME_CHECKS)}.includes(process.argv[2]));`)
       sh(h.repo, 'add', '-A'); sh(h.repo, 'commit', '-qm', 'release fixture')
-      const marker = mode === 'pass' ? '' : `[[FAKE:supervisor${mode}]]`
+      const marker = ['pass', 'auto'].includes(mode) ? '' : `[[FAKE:supervisor${mode}]]`
       const id = h.plan([task('A', { department: 'delivery' })], `release fixture ${marker}`)
+      if (mode === 'mutate' || mode === 'login') h.store.set('game.autoDeliver:p', 'true')
       await h.approve(id)
-      if (mode === 'pass') {
+      if (mode === 'pass' || mode === 'auto') {
         await h.waitFor(() => h.store.request(id)?.status === 'awaiting_acceptance', 'release accepted')
         assert.equal(h.store.approval(`accept:${id}`)?.state, 'open')
         assert.ok(h.store.get(`game.release:${id}`))
         assert.ok(existsSync(join(h.runner.integrationDir(id, 'p'), 'release/video.mp4')))
         assert.equal(readGameManifest(h.runner.integrationDir(id, 'p')).problem, null)
+        if (mode === 'auto') {
+          const signature = h.store.get(`game.release:${id}`)!
+          h.store.set('game.autoDeliver:p', 'true')
+          h.store.set(`game.release:${id}`, 'stale-verdict')
+          await h.runner.tick()
+          assert.equal(h.store.request(id)?.status, 'awaiting_acceptance', 'stale supervisor approval cannot auto-deliver')
+          h.store.set(`game.release:${id}`, signature)
+          h.store.set('game.enabled:p', 'false')
+          await h.runner.tick()
+          assert.equal(h.store.request(id)?.status, 'awaiting_acceptance', 'disabled team cannot auto-deliver')
+          h.store.set('game.enabled:p', 'true')
+          await h.waitFor(() => h.store.request(id)?.status === 'merged', 'delegated local delivery')
+          assert.equal(h.store.approval(`accept:${id}`)?.decision, '수락')
+          assert.equal(h.store.approval(`merge:${id}:p`)?.decision, '병합')
+          assert.ok(existsSync(join(h.repo, 'a/out.txt')), 'candidate was merged into the actual project')
+          assert.equal(JSON.parse(h.store.get(`game.delivery:${id}`)!).userPlaytested, false)
+          assert.equal(sh(h.repo, 'remote'), '', 'local delivery does not create or publish a remote')
+        }
       } else if (mode === 'mutate') {
         await h.waitFor(() => Number(h.store.get(`game.rejections:${id}`)) > 0, 'mutation rejected')
         assert.equal(h.store.approval(`accept:${id}`), null)

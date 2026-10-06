@@ -1575,6 +1575,16 @@ export class Runner {
     return sha256(JSON.stringify({ tasks: this.store.tasks(id).map(t => [t.id, t.generation, t.status, t.head_sha, t.report_sha]), merges: this.store.mergeRows(id).map(m => [m.project, m.integration_sha]) }))
   }
 
+  /** Explicit project delegation covers local delivery only, never user playtest approval or publication. */
+  private canAutoDeliver(r: RequestRow): boolean {
+    if (this.project(r.project)?.workflow !== 'game' || !gameEnabled(this.store, r.project)
+      || this.store.get(`game.autoDeliver:${r.project}`) !== 'true') return false
+    const tasks = this.store.tasks(r.id).filter(t => t.status !== 'cancelled'), merges = this.store.mergeRows(r.id)
+    return tasks.length > 0 && tasks.every(t => t.status === 'passed')
+      && merges.length === 1 && merges[0].project === r.project && ['integrated', 'offered'].includes(merges[0].state)
+      && !merges[0].known_failures && this.store.get(`game.release:${r.id}`) === this.gameSignature(r.id)
+  }
+
   /** No user-facing accept card exists until this separate supervisor gate succeeds. */
   private startGameRelease(r: RequestRow, signature: string): void {
     if (!gameEnabled(this.store, r.project) || this.gameReleasing.has(r.id) || !this.canStartCeo() || !this.ceoLock.tryAcquire()) return
@@ -1690,10 +1700,28 @@ export class Runner {
         this.emitRequest(r.id, '모든 작업 통과 — 결과 수락을 기다려요')
       })
     }
+    for (const r of this.store.requestsByStatus(['awaiting_acceptance'])) {
+      if (!this.canAutoDeliver(r)) continue
+      const card = this.store.approval(`accept:${r.id}`)
+      if (card?.state === 'open') {
+        this.store.set(`game.delivery:${r.id}`, JSON.stringify({ at: this.iso(), kind: 'local-playtest-candidate', signature: this.gameSignature(r.id), userPlaytested: false }))
+        await this.decide(card.id, '수락', card.subjectHash)
+      }
+    }
     for (const r of this.store.requestsByStatus(['accepted'])) {
       for (const m of this.store.mergeRows(r.id)) if (m.state === 'integrated') {
         await this.countTargetAhead(r.id, m.project, m.target_sha)
         this.store.tx(() => { if (this.store.mergeRow(r.id, m.project)?.state === 'integrated') this.offerMerge(r.id, m.project) })
+      }
+      if (this.canAutoDeliver(r)) {
+        const card = this.store.approval(`merge:${r.id}:${r.project}`)
+        if (card?.state === 'open') {
+          const result = await this.decide(card.id, '병합', card.subjectHash)
+          if (result.status === 200 && this.store.request(r.id)?.status === 'merged') {
+            this.emitRequest(r.id, `플레이 후보 전달 완료: ${this.project(r.project)!.path} · 사용자 플레이 평가는 남아 있어요`)
+            this.notify('게임 플레이 후보 준비', `${this.project(r.project)!.path} — README의 실행 방법을 확인하세요. 사용자 플레이 평가는 아직 미확인입니다.`)
+          }
+        }
       }
     }
     for (const r of this.store.requestsByStatus(['cancelled'])) await this.cleanupCancelled(r.id)
