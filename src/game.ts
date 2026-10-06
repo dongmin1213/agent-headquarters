@@ -3,13 +3,25 @@ import { createHash } from 'node:crypto'
 import { lstatSync, readFileSync, realpathSync } from 'node:fs'
 import { isAbsolute, relative, resolve } from 'node:path'
 import { unsafeCommand, type CeoPlan } from './ceo.ts'
-import type { Store } from './store.ts'
+import type { Store, TaskRow } from './store.ts'
 
 export const GAME_DEPARTMENTS = ['research', 'direction', 'gameplay', 'art', 'level', 'qa', 'delivery'] as const
 export type GameDepartment = typeof GAME_DEPARTMENTS[number]
 export const GAME_CHECKS = ['boot', 'movement', 'combat', 'progression', 'save-load', 'ending'] as const
 export const gameEnabled = (store: Store, project: string) => store.get(`game.enabled:${project}`) !== 'false'
 export const GAME_MANIFEST = 'release/game-release.json'
+
+/** A wait belongs to one exact occurrence; answers/retries/new attempts invalidate it. */
+export function gameWaitSignature(store: Store, t: TaskRow): string {
+  return JSON.stringify([t.generation, t.revision, t.status, t.block_count, t.attempts,
+    store.attempts(t.id).at(-1)?.id ?? null, store.taskQuestions(t.id).filter(q => q.answer === null).map(q => q.id).sort()])
+}
+export function gameWaiting(store: Store, t: TaskRow): boolean {
+  if (!['question', 'blocked'].includes(t.status)) return false
+  try { return JSON.parse(store.get(`game.waiting:${t.id}`) ?? 'null')?.signature === gameWaitSignature(store, t) } catch { return false }
+}
+
+export const GAME_PLAYTEST_RULES = `사용자 플레이 평가용 후보와 주관적 평가를 구분한다. 코드·실행·저장·진행·음원 디코딩/파형·실제 출력·출처 검증은 제작 중 필수다. 음원을 듣고 판단할 입력이 없는 세션은 음악 취향·분위기·효과음의 지각적 식별을 통과했다고 주장하지 않는다. 이 주관적 평가는 최종 실행 가능한 게임의 사용자 플레이 체크리스트에 미확인으로 남긴다. delivery는 docs/playtest-checklist.md에 항목·재현 방법·현재 검증 범위를 기록하고 release manifest의 files에 해시와 함께 포함하며 knownIssues에도 사용자 청취 평가 대기를 명시한다. 기술 검사가 모두 통과하고 이 미확인 사항을 공개한 플레이 평가용 후보는 제출할 수 있다. 실제 재생 실패·무음·클리핑·진행 불가 같은 기술 결함은 이 예외로 면제하지 않는다.`
 
 export const GAME_ECONOMY_RULES = `사용량 절약 원칙(완료 기준은 그대로 유지):
 - 먼저 변경 파일 목록과 필요한 인터페이스를 찾고 관련 파일/줄 범위만 읽는다. 같은 문서·전체 저장소·장시간 로그를 반복 출력하지 않는다. 이미지/오디오 바이너리, base64, 대형 관측 JSONL은 본문에 덤프하지 않는다.

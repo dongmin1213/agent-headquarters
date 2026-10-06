@@ -8,7 +8,7 @@ import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import type { Bus } from '../bus.ts'
-import { gameEnabled, gamePlanProblem, GAME_WORKER_RULES, readGameManifest } from '../game.ts'
+import { gameEnabled, gamePlanProblem, gameWaiting, GAME_PLAYTEST_RULES, GAME_WORKER_RULES, readGameManifest } from '../game.ts'
 import { runJsonTurn, reviewModelOf, validateTasks, type Acceptance, type CeoPlan, type PlanTask, type Project } from '../ceo.ts'
 import type { HqConfig } from '../config.ts'
 import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../store.ts'
@@ -1635,7 +1635,7 @@ export class Runner {
       }
       if (!current()) return
       const tools = new Set<string>()
-      const prompt = `너는 게임팀과 독립된 감독자 피카츄다. 팀의 완료 주장이나 검사 exit 0만 믿지 말고 실제 소스·검사 구현·빌드·이미지를 읽어 판정한다.\n사용자 요청: ${r.text}\n출시 명세: ${JSON.stringify(manifest)}\nHQ가 직접 실행한 검사: ${JSON.stringify(records)}\n${GAME_WORKER_RULES}\n이번 역할은 읽기 전용 검수다. 변경하지 않는다. shell로 게임과 테스트 코드를 직접 읽고 파일 존재/상수 반환 검사로 속이지 않았는지 확인한다. 첨부된 실제 플레이 스크린샷을 반드시 확인하고 영상은 ffprobe 메타데이터와 캡처 프레임을 대조한다. 필요시 임시 폴더에서 추가 검사를 한다. docs/game-design.md의 콘텐츠 약속과 최종 게임을 비교한다. 이동/전투/능력 해금/연결된 맵/보스/엔딩/사망/저장/불러오기가 실제로 이어져야 한다. 타이틀 화면이나 기술 데모만 있으면 반려한다. 임시물/누락된 에셋/빌드 실행 불가/진행 불가/권리 출처 미확인은 반려한다. 조사 URL의 실제 근거, 창작 자료를 변형한 독자성, 레퍼런스 도트 느낌과 동작 프레임의 일관성도 확인한다. 확인할 수 없는 항목은 통과로 쓰지 않는다. evidence에는 직접 관측한 파일·명령·이미지 경로를 기록하고 reason에 수정할 구체적 문제를 적는다. 만족하면 '사용자 플레이 평가용 출시 후보'로 통과시키며 상용 품질이나 재미를 보증하지 않는다.`
+      const prompt = `너는 게임팀과 독립된 감독자 피카츄다. 팀의 완료 주장이나 검사 exit 0만 믿지 말고 실제 소스·검사 구현·빌드·이미지를 읽어 판정한다.\n사용자 요청: ${r.text}\n출시 명세: ${JSON.stringify(manifest)}\nHQ가 직접 실행한 검사: ${JSON.stringify(records)}\n${GAME_WORKER_RULES}\n${GAME_PLAYTEST_RULES}\n이번 역할은 읽기 전용 검수다. 변경하지 않는다. shell로 게임과 테스트 코드를 직접 읽고 파일 존재/상수 반환 검사로 속이지 않았는지 확인한다. 첨부된 실제 플레이 스크린샷을 반드시 확인하고 영상은 ffprobe 메타데이터와 캡처 프레임을 대조한다. 필요시 임시 폴더에서 추가 검사를 한다. docs/game-design.md의 콘텐츠 약속과 최종 게임을 비교한다. 이동/전투/능력 해금/연결된 맵/보스/엔딩/사망/저장/불러오기가 실제로 이어져야 한다. 타이틀 화면이나 기술 데모만 있으면 반려한다. 임시물/누락된 에셋/빌드 실행 불가/진행 불가/권리 출처 미확인은 반려한다. 조사 URL의 실제 근거, 창작 자료를 변형한 독자성, 레퍼런스 도트 느낌과 동작 프레임의 일관성도 확인한다. 확인할 수 없는 항목은 통과로 쓰지 않는다. evidence에는 직접 관측한 파일·명령·이미지 경로를 기록하고 reason에 수정할 구체적 문제를 적는다. 만족하면 '사용자 플레이 평가용 출시 후보'로 통과시키며 상용 품질이나 재미를 보증하지 않는다.`
       atomicWrite(join(dir, 'prompt.md'), prompt)
       const result = await runJsonTurn({ codexBin: this.cfg.codexBin, runtimeHome: this.home, model: this.cfg.models.opus, cwd, prompt,
         sessionId: randomUUID(), resume: false, addDirs: [], timeoutMs: 10 * 60_000, images: manifest.files.filter(f => f.kind === 'screenshot').slice(0, 3).map(f => join(cwd, f.path)),
@@ -2050,6 +2050,10 @@ export class Runner {
       const r = d.requestId ? this.store.request(d.requestId) : null
       if (!r || this.project(r.project)?.workflow !== 'game') return true
       if (['accept', 'merge', 'system'].includes(d.kind)) return true
+      if (d.taskId && ['worker_question', 'blocked'].includes(d.kind)) {
+        const task = this.store.task(d.taskId)
+        if (task && gameWaiting(this.store, task)) return true
+      }
       return d.kind === 'blocked' && !!(d.taskId && this.store.task(d.taskId)?.lingering)
     })
   }

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { mkdirSync, writeFileSync, symlinkSync, rmSync, cpSync, readFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { GAME_CHECKS, GAME_DEPARTMENTS, gameEnabled, gamePlanProblem, readGameManifest, type GameManifest } from '../../src/game.ts'
+import { GAME_CHECKS, GAME_DEPARTMENTS, gameEnabled, gamePlanProblem, gameWaiting, readGameManifest, type GameManifest } from '../../src/game.ts'
 import { execArgs } from '../../src/codex.ts'
 import { Scheduler } from '../../src/scheduler.ts'
 import { startServer } from '../../src/server.ts'
@@ -138,6 +138,35 @@ test('game team leader uses Sol first and escalates repeated decisions to Astra'
       assert.equal(decision.model, rounds ? 'opus' : 'sonnet')
       assert.equal(decision.proceed, true)
     } finally { await h.close() }
+  }
+})
+
+test('unresolved game task waits once, exposes its question, and independent work continues', async () => {
+  for (const exhausted of [false, true]) {
+    const h = harness()
+    try {
+      h.projects[0].workflow = 'game'
+      const id = h.plan([task('A', { department: 'art', brief: '[[FAKE:outcome=question]] [[FAKE:leadwait]]' })])
+      await h.approve(id)
+      await h.waitFor(() => h.store.task(`${id}.A`)?.status === 'question')
+      if (exhausted) h.store.set(`game.decisions:${id}.A`, '3')
+      await h.engine.tick()
+      const a = h.store.task(`${id}.A`)!
+      assert.equal(gameWaiting(h.store, a), true)
+      assert.equal(h.store.request(id)?.status, 'executing')
+      assert.ok(h.runner.views().decisions.some(d => d.kind === 'worker_question' && d.taskId === a.id))
+      const count = h.store.get(`game.decisions:${a.id}`)
+      await h.engine.tick(); await h.engine.tick()
+      assert.equal(h.store.get(`game.decisions:${a.id}`), count, 'no repeated paid decisions for the same wait')
+      const b = task('B', { department: 'gameplay' })
+      h.store.insertTask({ id: `${id}.B`, request_id: id, key: 'B', project: 'p', title: b.title, role: b.role, grade: b.grade,
+        model: b.model, review_model: 'sonnet', spec: JSON.stringify(b), status: 'pending', branch: null, base_sha: a.base_sha })
+      await h.waitFor(() => h.store.task(`${id}.B`)?.status === 'passed', 'independent task continues')
+      assert.equal(h.store.task(a.id)?.status, 'question', 'unverified criterion was not auto-passed')
+      const question = h.store.taskQuestions(a.id).find(q => q.answer === null)!
+      assert.equal(h.runner.answerTask(a.id, question.id, '관측 근거 제공', a.revision), null)
+      assert.equal(gameWaiting(h.store, h.store.task(a.id)!), false, 'an answer releases only this occurrence')
+    } finally { h.engine.stop(); await h.close() }
   }
 })
 

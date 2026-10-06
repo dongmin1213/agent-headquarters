@@ -109,7 +109,7 @@ if (schema && prompt.startsWith('너는 게임팀과 독립된 감독자 피카�
   process.exit(0)
 }
 if (schema && prompt.startsWith('너는 게임팀장이다.')) {
-  result({ structured_output: { proceed: true, answer: '팀장 결정: 기존 동작을 유지하고 작은 범위로 구현하세요.' } })
+  result({ structured_output: { proceed: !mk('leadwait'), answer: mk('leadwait') ? '외부 관측이 필요해 이 작업만 대기합니다.' : '팀장 결정: 기존 동작을 유지하고 작은 범위로 구현하세요.' } })
   process.exit(0)
 }
 if (schema && prompt.includes('# 게임팀장') && mk('gameplan')) {
