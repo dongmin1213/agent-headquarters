@@ -38,7 +38,7 @@ export const GAME_ECONOMY_RULES = `사용량 절약 원칙(완료 기준은 그�
 
 export function gamePlanProblem(plan: CeoPlan, project: string): string | null {
   const ts = plan.tasks
-  if (ts.length > 20) return '게임팀 작업은 최대 20개입니다'
+  if (ts.length > 24) return '게임팀 작업은 최대 24개입니다'
   for (const d of GAME_DEPARTMENTS) if (!ts.some(t => t.department === d)) return `게임팀 직군이 빠졌습니다: ${d}`
   for (const t of ts) {
     if (t.project !== project) return '게임팀은 지정된 게임 프로젝트 안에서만 작업합니다'

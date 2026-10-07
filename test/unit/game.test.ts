@@ -32,6 +32,19 @@ test('game plan requires all professions, research before design, independent re
   assert.ok(gamePlanProblem(external, 'p'))
 })
 
+test('bounded game plans can add presentation and lifecycle repair jobs without skipping delivery dependencies', () => {
+  const p = plan(), delivery = p.tasks.at(-1)!
+  const extras = Array.from({ length: 17 }, (_, i) => task(`repair${i}`, {
+    department: 'art', grade: 'L2', depends_on: ['direction'], review: { model: 'sonnet', brief: '독립 검수' },
+  }))
+  p.tasks.push(...extras)
+  delivery.depends_on.push(...extras.map(t => t.id))
+  assert.equal(p.tasks.length, 24)
+  assert.equal(gamePlanProblem(p, 'p'), null)
+  p.tasks.push(task('tooMany'))
+  assert.match(gamePlanProblem(p, 'p')!, /최대 24개/)
+})
+
 function fixture() {
   const root = tmp('hq-game-manifest-'); mkdirSync(join(root, 'release'))
   const kinds = ['build', 'video', 'screenshot', 'research', 'design', 'provenance'] as const
