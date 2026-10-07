@@ -2120,6 +2120,41 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
     return null
   }
 
+  /** Move an untouched repair job ahead of its blocked prerequisite, atomically. No approval or check is waived. */
+  repairGameOrder(taskId: string, repairKey: string, signature: string): string | null {
+    const t = this.store.task(taskId)
+    if (!t || this.project(t.project)?.workflow !== 'game' || !gameEnabled(this.store, t.project)
+      || !['blocked', 'question'].includes(t.status) || gameWaitSignature(this.store, t) !== signature
+      || !['executing', 'blocked'].includes(this.store.request(t.request_id)?.status ?? '')) return '판단 대상 상태가 바뀌었습니다'
+    const rows = this.store.tasks(t.request_id), repair = rows.find(x => x.key === repairKey)
+    if (!repair || repair.project !== t.project || repair.status !== 'pending' || repair.worktree || repair.base_sha || repair.head_sha
+      || this.store.attempts(repair.id).length || repair.lingering || t.lingering
+      || this.store.liveAttempts().some(a => a.task_id === t.id || a.task_id === repair.id)) return '시작하지 않은 같은 프로젝트의 수정 작업만 앞당길 수 있습니다'
+    const old = specOf(t), before = specOf(repair)
+    if (!before.depends_on.includes(t.key)) return '현재 작업을 직접 기다리는 수정 작업이 아닙니다'
+    if (this.dependents(t).some(d => d.status !== 'pending' || d.worktree || d.lingering
+      || this.store.liveAttempts().some(a => a.task_id === d.id))) return '이미 진행된 후속 작업을 보존해야 하므로 순서를 변경하지 않습니다'
+    // Inherit every original prerequisite; keep the blocked task as a mandatory later gate.
+    const moved = { ...before, depends_on: [...new Set([...before.depends_on.filter(k => k !== t.key), ...old.depends_on])] }
+    const revised = { ...old, depends_on: [...new Set([...old.depends_on, repairKey])] }
+    const specs = rows.map(x => x.id === t.id ? revised : x.id === repair.id ? moved : specOf(x))
+    const problem = validateTasks(specs, this.projects) ?? gamePlanProblem({ summary: '', assumptions: [], tasks: specs }, t.project)
+    if (problem) return problem
+    try {
+      return this.store.tx(() => {
+        this.store.set(`game.order-repair:${t.id}:${t.generation}`, JSON.stringify({ at: this.iso(), signature, blocked: t, repair }))
+        this.store.updateTask(repair.id, { spec: JSON.stringify(moved), revision: repair.revision + 1,
+          note: `${t.key} 검수에 필요한 수정 작업을 먼저 수행 · 완료 기준 유지` })
+        const error = this.repairGameTask(t.id, revised, signature)
+        if (error) throw new Error(error)
+        const r = this.store.request(t.request_id)!
+        const plan = JSON.stringify({ ...JSON.parse(r.plan!), tasks: this.store.tasks(t.request_id).map(specOf) })
+        this.store.updateRequest(r.id, { plan, plan_hash: sha256(plan) })
+        return null
+      })
+    } catch (error) { return `작업 순서 변경을 취소했습니다: ${String(error)}` }
+  }
+
   /** Apply an internal repair decision only to the exact blocked/question occurrence it examined. */
   repairGameTask(taskId: string, rev: PlanTask, signature: string): string | null {
     const t = this.store.task(taskId)

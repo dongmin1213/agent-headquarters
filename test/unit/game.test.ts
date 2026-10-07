@@ -264,6 +264,81 @@ function repairFixture() {
   return { h, id, tid, spec }
 }
 
+function orderFixture() {
+  const f = repairFixture(), { h, id, tid, spec } = f
+  h.store.updateTask(tid, { spec: JSON.stringify({ ...spec, brief: '[[FAKE:leadorder=visual-fix]]' }) })
+  const fix = task('visual-fix', { department: 'art', grade: 'L2', review: { model: 'sonnet', brief: '독립 화면 검수' },
+    depends_on: ['level'], owns: ['visual-fix/**'] })
+  h.store.insertTask({ id: `${id}.${fix.id}`, request_id: id, key: fix.id, project: 'p', title: fix.title,
+    role: fix.role, grade: fix.grade, model: fix.model, review_model: fix.review!.model, spec: JSON.stringify(fix),
+    status: 'pending', branch: null, base_sha: null })
+  return { ...f, fix, fid: `${id}.${fix.id}` }
+}
+
+test('leader moves an untouched repair before its blocked gate without passing it or losing work', async () => {
+  const { h, id, tid, spec, fix, fid } = orderFixture()
+  try {
+    const original = readFileSync(join(h.repo, 'README.md'), 'utf8')
+    h.store.set(`game.decisions-total:${tid}`, '4')
+    await h.engine.tick()
+    const blocked = h.store.task(tid)!, moved = h.store.task(fid)!
+    assert.equal(blocked.status, 'rework')
+    assert.equal(moved.status, 'pending')
+    assert.deepEqual(JSON.parse(moved.spec), { ...fix, depends_on: spec.depends_on })
+    assert.deepEqual(JSON.parse(blocked.spec).acceptance, spec.acceptance)
+    assert.deepEqual(JSON.parse(blocked.spec).review, spec.review)
+    assert.equal(blocked.worktree, h.repo)
+    assert.equal(readFileSync(join(h.repo, 'README.md'), 'utf8'), original)
+    assert.equal(h.runner.depsPassed(blocked, h.store.tasks(id)), false)
+    assert.equal(h.runner.depsPassed(moved, h.store.tasks(id)), true)
+    assert.equal(h.store.get(`game.refresh-base:${tid}`), String(blocked.generation))
+    assert.equal(h.store.get(`game.decisions-total:${tid}`), '5', 'lifetime budget is not reset')
+    const plan = JSON.parse(h.store.request(id)!.plan!)
+    assert.deepEqual(plan.tasks.find((x: any) => x.id === 'level').depends_on, [...spec.depends_on, fix.id])
+    assert.equal(gamePlanProblem(plan, 'p'), null)
+    assert.equal(h.store.request(id)!.plan_hash, createHash('sha256').update(h.store.request(id)!.plan!).digest('hex'))
+  } finally { await h.close() }
+})
+
+test('order repair refuses stale, started, cross-project, cyclic and already progressing plans without mutation', async () => {
+  const { h, tid, fix, fid, id } = orderFixture()
+  try {
+    const signature = gameWaitSignature(h.store, h.store.task(tid)!)
+    const before = JSON.stringify(h.store.tasks(id))
+    assert.ok(h.runner.repairGameOrder(tid, fix.id, 'stale'))
+    assert.ok(h.runner.repairGameOrder(tid, 'delivery', signature))
+    assert.equal(JSON.stringify(h.store.tasks(id)), before)
+    for (const change of [{ worktree: h.repo }, { base_sha: 'known' }, { status: 'running' }]) {
+      const original = h.store.task(fid)!
+      h.store.updateTask(fid, change)
+      assert.ok(h.runner.repairGameOrder(tid, fix.id, signature))
+      h.store.updateTask(fid, { worktree: original.worktree, base_sha: original.base_sha, status: original.status })
+    }
+    h.store.raw().prepare('update tasks set project=? where id=?').run('other', fid)
+    assert.ok(h.runner.repairGameOrder(tid, fix.id, signature))
+    h.store.raw().prepare('update tasks set project=? where id=?').run('p', fid)
+    h.store.updateTask(fid, { spec: JSON.stringify({ ...fix, depends_on: ['level', 'qa'] }) })
+    assert.ok(h.runner.repairGameOrder(tid, fix.id, signature), 'remaining indirect cycle rejected')
+    h.store.updateTask(fid, { spec: JSON.stringify(fix) })
+    h.store.updateTask(`${id}.qa`, { status: 'passed' })
+    assert.ok(h.runner.repairGameOrder(tid, fix.id, signature), 'completed descendant is preserved')
+    assert.equal(h.store.task(tid)!.status, 'blocked')
+    assert.equal(h.store.task(fid)!.revision, 0)
+  } finally { await h.close() }
+})
+
+test('order repair rolls back both specs and audit if applying the blocked revision fails', async () => {
+  const { h, id, tid, fix } = orderFixture()
+  try {
+    const before = JSON.stringify(h.store.tasks(id)), request = h.store.request(id)
+    h.runner.repairGameTask = () => 'injected apply failure'
+    assert.match(h.runner.repairGameOrder(tid, fix.id, gameWaitSignature(h.store, h.store.task(tid)!))!, /취소/)
+    assert.equal(JSON.stringify(h.store.tasks(id)), before)
+    assert.deepEqual(h.store.request(id), request)
+    assert.equal(h.store.get(`game.order-repair:${tid}:0`), null)
+  } finally { await h.close() }
+})
+
 test('internal repair actually updates ownership and schedules preserved work for re-review', async () => {
   const { h, tid, spec } = repairFixture()
   try {

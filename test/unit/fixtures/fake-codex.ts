@@ -123,7 +123,7 @@ if (schema && (prompt.startsWith('너는 게임팀장이다.') || prompt.startsW
   const revised = repair ? { ...original, brief: '기존 결과 보존 후 공격 표시 수정·재검수', owns: [...original.owns, 'gameplay/actor.gd'] } : null
   if (revised && repair === 'weaken') revised.acceptance = original.acceptance.map((a: any) => ({ ...a, check: 'test -f README.md' }))
   result({ structured_output: { proceed: !wait, answer: wait ? '구체적 근거를 확인했으나 이 판단에서는 해결하지 못했습니다.' : '원인을 확인했습니다. 기존 동작을 유지하고 표시 결함을 수정한 뒤 재검수하세요.',
-    revised_task: revised, owner_decision: wait && mk('ownerdecision') ? 'credentials' : 'none' } })
+    revised_task: revised, repair_before: mk('leadorder') || null, owner_decision: wait && mk('ownerdecision') ? 'credentials' : 'none' } })
   process.exit(0)
 }
 if (schema && prompt.includes('# 게임팀장') && mk('gameplan')) {

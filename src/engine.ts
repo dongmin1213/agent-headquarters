@@ -14,12 +14,13 @@ const PLAN_TTL_MS = 7 * 24 * 60 * 60_000
 const OWNER_DECISIONS = ['none', 'payment', 'publication', 'credentials', 'destructive', 'scope_change', 'missing_user_input'] as const
 interface GameDecision {
   proceed: boolean; answer: string; revised_task: PlanTask | null
+  repair_before?: string | null
   owner_decision: typeof OWNER_DECISIONS[number]
 }
 const GAME_DECISION_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['proceed', 'answer', 'revised_task', 'owner_decision'],
+  type: 'object', additionalProperties: false, required: ['proceed', 'answer', 'revised_task', 'repair_before', 'owner_decision'],
   properties: { proceed: { type: 'boolean' }, answer: { type: 'string' },
-    revised_task: { anyOf: [{ type: 'null' }, TASK_SCHEMA] }, owner_decision: { enum: OWNER_DECISIONS } },
+    revised_task: { anyOf: [{ type: 'null' }, TASK_SCHEMA] }, repair_before: { type: ['string', 'null'] }, owner_decision: { enum: OWNER_DECISIONS } },
 }
 
 export class RequestEngine {
@@ -107,8 +108,9 @@ export class RequestEngine {
         const previous = this.store.get(`game.decision:${t.id}:${rounds}`) ?? '(없음)'
         const result = await runJsonTurn({ codexBin: this.runner.cfg.codexBin, runtimeHome: this.runner.home, model: this.runner.cfg.models[decisionModel],
           cwd: t.worktree ?? p.path, sessionId: randomUUID(), resume: false, addDirs: [], timeoutMs: 5 * 60_000,
-          prompt: `너는 ${supervisor ? '피카츄 독립 감독자' : '게임팀장'}이다.\n${GAME_ECONOMY_RULES}\n${GAME_PLAYTEST_RULES}\n사용자에게 세부 기획·구현 판단을 떠넘기지 않고 해결한다. ${supervisor ? '팀장의 판단을 그대로 전달하지 말고 실제 코드·실패 증거·기존 위임 범위를 대조하여 재검토한다.' : '현재 작업 파일과 선행 기획을 확인해 실행 가능한 결정을 내린다.'}\n요청: ${r.text}\n작업: ${t.spec}\n상태: ${t.status}\n문제: ${t.note}\n진단: ${t.diagnosis}\n질문: ${JSON.stringify(questions)}\n전체 작업 계약: ${JSON.stringify(tasks.map(x => ({ key: x.key, status: x.status, project: x.project, role: x.role, head_sha: x.head_sha, owns: JSON.parse(x.spec).owns, depends_on: JSON.parse(x.spec).depends_on })))}\n이전 내부 판단: ${previous}\n
+          prompt: `너는 ${supervisor ? '피카츄 독립 감독자' : '게임팀장'}이다.\n${GAME_ECONOMY_RULES}\n${GAME_PLAYTEST_RULES}\n사용자에게 세부 기획·구현 판단을 떠넘기지 않고 해결한다. ${supervisor ? '팀장의 판단을 그대로 전달하지 말고 실제 코드·실패 증거·기존 위임 범위를 대조하여 재검토한다.' : '현재 작업 파일과 선행 기획을 확인해 실행 가능한 결정을 내린다.'}\n요청: ${r.text}\n작업: ${t.spec}\n상태: ${t.status}\n문제: ${t.note}\n진단: ${t.diagnosis}\n질문: ${JSON.stringify(questions)}\n전체 작업 계약: ${JSON.stringify(tasks.map(x => ({ key: x.key, title: x.title, department: JSON.parse(x.spec).department, status: x.status, project: x.project, role: x.role, head_sha: x.head_sha, owns: JSON.parse(x.spec).owns, depends_on: JSON.parse(x.spec).depends_on })))}\n이전 내부 판단: ${previous}\n
 출력 계약:
+- 검수가 후속 수정 작업의 결과를 요구하여 멈췄다면 같은 검수를 반복하지 않는다. repair_before에 현재 작업을 직접 기다리는 미시작 pending 수정 작업 key를 지정하고 revised_task=null, proceed=true로 반환한다. HQ가 그 작업에 현재 선행 조건을 물려주어 먼저 실행하고 현재 검수는 그 결과를 기다리게 한다. 이미 시작한 작업·순환·검사 삭제는 허용하지 않는다. 순서 변경이 필요 없으면 repair_before=null이다.
 - answer에 확인한 원인·근거, 선택한 수정, 재검 방법을 구체적으로 기록한다. 실패한 방법을 바꾸지 않은 단순 재시도는 금지한다.
 - 작업자가 failed/blocked로 명시적으로 반려한 경우 같은 작업을 그대로 재시작하지 않는다. 선행 결과의 아트·지형 품질 문제가 원인이면 해당 파일과 담당/소유 범위를 확인하고, 수정 가능한 owns와 구체적인 brief를 revised_task로 재배정한다. 읽기 전용 진단만 남겨도 복구된 것으로 간주하지 않는다. 독립 검수와 원래 품질 기준은 유지한다. 답변은 한국어로 쓴다.
 - 현재 범위에서 해결 가능하면 proceed=true, revised_task=null로 구체적인 작업 지시를 낸다.
@@ -130,6 +132,8 @@ export class RequestEngine {
         const o = result.output as GameDecision | null
         const valid = result.ok && o && typeof o.proceed === 'boolean' && typeof o.answer === 'string' && o.answer.trim()
           && OWNER_DECISIONS.includes(o.owner_decision) && (o.revised_task === null || typeof o.revised_task === 'object')
+          && (o.repair_before == null || (typeof o.repair_before === 'string' && !!o.repair_before.trim()
+            && o.proceed && o.owner_decision === 'none' && o.revised_task === null))
           && (o.owner_decision === 'none' || (!o.proceed && o.revised_task === null)) && (o.proceed || o.revised_task === null)
         this.store.set(`game.decision:${t.id}:${rounds + 1}`, JSON.stringify({ ...o, model: decisionModel, supervisor, error: result.error }))
         if (!valid || !o!.proceed) {
@@ -141,7 +145,8 @@ export class RequestEngine {
         }
         const decision = o!
         let problem: string | null = null
-        if (decision.revised_task) problem = this.runner.repairGameTask(t.id, decision.revised_task, signature)
+        if (decision.repair_before) problem = this.runner.repairGameOrder(t.id, decision.repair_before, signature)
+        else if (decision.revised_task) problem = this.runner.repairGameTask(t.id, decision.revised_task, signature)
         else if (t.status === 'question') {
           for (const q of questions) {
             problem = this.runner.answerTask(t.id, q.id, `[${supervisor ? '피카츄' : '게임팀장'} 결정] ${decision.answer}`, t.revision)
