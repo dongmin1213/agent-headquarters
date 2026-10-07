@@ -424,3 +424,18 @@ test('dependency repair refreshes verification base and merges completed assets 
     assert.deepEqual(JSON.parse(after.spec).owns, a.owns, 'no asset ownership expansion')
   } finally { await h.close() }
 })
+
+test('a revised game contract gets fresh recovery rounds without erasing the lifetime cap', async () => {
+  const { h, tid, spec } = repairFixture()
+  try {
+    h.store.set(`game.decisions:${tid}`, '3')
+    assert.equal(h.runner.repairGameTask(tid, { ...spec, brief: spec.brief + ' fix fresh-checkout imports and isolated evidence' }, gameWaitSignature(h.store, h.store.task(tid)!)), null)
+    assert.equal(h.store.get(`game.decisions:${tid}`), '0')
+    assert.equal(h.store.get(`game.decisions-total:${tid}`), '3')
+    h.store.updateTask(tid, { status: 'blocked', diagnosis: '{}', note: 'a different check failed' })
+    h.store.set(`game.decisions-total:${tid}`, '9')
+    await h.engine.tick()
+    assert.match(h.store.task(tid)!.note!, /누적 복구 상한 9회/)
+    assert.equal(h.store.get(`game.decisions:${tid}`), '0', 'no paid turn above the lifetime cap')
+  } finally { await h.close() }
+})

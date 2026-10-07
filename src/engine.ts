@@ -97,6 +97,8 @@ export class RequestEngine {
       if (!t || !this.runner.ceoLock.tryAcquire()) continue
       try {
         const rounds = Number(this.store.get(`game.decisions:${t.id}`) ?? 0)
+        const totalRounds = Number(this.store.get(`game.decisions-total:${t.id}`) ?? rounds)
+        if (totalRounds >= 9) { this.waitGameTask(t, `피카츄 누적 복구 상한 9회 도달 · 미해결 근거를 보존합니다: ${t.title} — ${t.note ?? ''}`, false); return true }
         if (rounds >= 3) { this.waitGameTask(t, `피카츄 내부 복구 상한 도달 · 미해결 상태를 보존합니다: ${t.title} — ${t.note ?? ''}`, false); return true }
         const questions = this.store.taskQuestions(t.id).filter(q => q.answer === null)
         const decisionModel = rounds === 0 ? 'sonnet' : 'opus'
@@ -123,6 +125,7 @@ export class RequestEngine {
         const current = this.store.task(t.id)
         if (!gameEnabled(this.store, p.id) || !current || gameWaitSignature(this.store, current) !== signature || !['executing', 'blocked'].includes(this.store.request(r.id)?.status ?? '')) return true
         this.store.set(`game.decisions:${t.id}`, String(rounds + 1))
+        this.store.set(`game.decisions-total:${t.id}`, String(totalRounds + 1))
         const o = result.output as GameDecision | null
         const valid = result.ok && o && typeof o.proceed === 'boolean' && typeof o.answer === 'string' && o.answer.trim()
           && OWNER_DECISIONS.includes(o.owner_decision) && (o.revised_task === null || typeof o.revised_task === 'object')

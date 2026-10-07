@@ -2092,6 +2092,12 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
       revision: t.revision + 1, generation: t.generation + 1, status: 'rework', resume_session: null, note: '지시서 수정 적용' })
     if (this.project(t.project)?.workflow === 'game' && rev.depends_on.some(d => !specOf(t).depends_on.includes(d)))
       this.store.set(`game.refresh-base:${t.id}`, String(t.generation + 1))
+    // A changed, validated contract gets its own recovery rounds; retain an independent lifetime cap.
+    // Otherwise a fixed dependency problem can exhaust the budget for an unrelated later check failure.
+    if (this.project(t.project)?.workflow === 'game' && JSON.stringify(specOf(t)) !== JSON.stringify(rev)) {
+      this.store.set(`game.decisions-total:${t.id}`, this.store.get(`game.decisions-total:${t.id}`) ?? this.store.get(`game.decisions:${t.id}`) ?? '0')
+      this.store.set(`game.decisions:${t.id}`, '0')
+    }
     this.store.set(`revise:${taskId}`, null)
     this.invalidateDependents(this.store.task(taskId)!)
     this.emitTask(t, `지시서 수정 적용: ${rev.title} (revision ${t.revision + 1})`)
