@@ -236,7 +236,12 @@ export class Runner {
   /** `projectId` names the mirror the worktree borrows objects from — the only part of $HQ_HOME it may read. */
   sandboxFor(worktree: string, out: string | null, projectId: string): SandboxOpts {
     return { worktree, out, graphics: this.project(projectId)?.workflow === 'game', hqHome: this.home, tokenDir: this.tokenDir, hqPort: this.hqPort, extraWritable: this.cfg.sandbox.extraWritable,
-      projects: this.projects.map((p) => p.path), mirror: this.mirror(projectId), readable: codexBinReadable(this.cfg.codexBin) }
+      projects: this.projects.map((p) => p.path), mirror: this.mirror(projectId), readable: [...codexBinReadable(this.cfg.codexBin),
+        ...(this.project(projectId)?.workflow === 'game' ? [join(this.hqRoot, 'tools/game-play')] : [])] }
+  }
+
+  gamePlayTools(): string {
+    return `## HQ 실시간 게임 검수 도구\n읽을 사용법: ${join(this.hqRoot, 'tools/game-play/README.md')}\nCLI: python3 ${join(this.hqRoot, 'tools/game-play/play.py')}\nOrca/osascript/screencapture 권한을 열거나 차단 명령을 반복하지 않는다. 이 도구로 일반 main scene을 실행하고 화면을 본 다음 키를 선택한다. --qa, fixture, replay, 좌표·능력 주입은 없다. 사람이 아닌 에이전트의 InputEventKey 입력이며 사람 조작감/초회 이해를 통과했다고 주장하지 않는다. 제작자와 독립 검토자는 각자의 checkout과 별도 session에서 실행한다. 영상·화면에서 실제 관측한 결함은 반려한다. 도구 실행 성공 자체는 제품 품질 통과가 아니다.`
   }
 
   /**
@@ -1060,6 +1065,7 @@ export class Runner {
       const codexHomeKey = resume && prev ? readProcessInfo(hqDirOf(prev))?.codexHomeKey
         ?? readJson<{ cwd?: string }>(join(hqDirOf(prev), 'spec.json'))?.cwd : undefined
       const game = project.workflow === 'game'
+      if (game) prompt += '\n\n' + this.gamePlayTools()
       if (game && !specOf(t).department) throw new Setup('게임 작업에 직군이 없습니다')
       const argv = codexArgs(this.cfg, { role, model: att.model, sessionId: att.session_id, resume, out, imageGeneration: game && specOf(t).department === 'art', webSearch: game && specOf(t).department === 'research' })
       gate()
@@ -1321,9 +1327,10 @@ export class Runner {
       const result = work ? readJson<{ protectedChanges?: string[] }>(join(hqDirOf(work), 'result.json')) : null
       const checks = work ? readJson<ChecksFile>(join(hqDirOf(work), 'checks.json')) : null
       const report = t.role === 'collect' && work ? readText(join(hqDirOf(work), 'report.sealed.md'), 200_000) : null
-      const prompt = reviewPrompt({ task: specOf(t), requestText: this.store.request(t.request_id)!.text, base: t.base_sha!, head: t.head_sha!, diffStat: stat.stdout,
+      let prompt = reviewPrompt({ task: specOf(t), requestText: this.store.request(t.request_id)!.text, base: t.base_sha!, head: t.head_sha!, diffStat: stat.stdout,
         checks, previousIssue: t.note, protectedChanges: result?.protectedChanges ?? [], manualIds: checks?.manual ?? [], report,
         manualTails: Object.fromEntries((checks?.manual ?? []).map((id) => [id, { candidate: checks!.checks.find((c) => c.id === id)?.outputTail ?? '', base: checks!.baseTails?.[id] ?? '' }])) })
+      if (project.workflow === 'game') prompt += '\n\n' + this.gamePlayTools()
       const argv = codexArgs(this.cfg, { role: 'review', model: att.model, sessionId: att.session_id, resume: false, out: null, schema: VERDICT_SCHEMA })
       gate()
       const { info, child, exit } = await launch({ codexBin: this.cfg.codexBin, argv, cwd: wt.path, hqDir: hq, outDir: null, prompt, sessionId: att.session_id, schema: VERDICT_SCHEMA,
@@ -1715,6 +1722,7 @@ HQ 영상 프레임: ${JSON.stringify(frameIndex)}
 ${GAME_WORKER_RULES}
 ${GAME_PLAYTEST_RULES}
 ${GAME_QUALITY_RULES}
+${this.gamePlayTools()}
 이번 역할은 읽기 전용 검수다. source와 검사 구현을 shell로 직접 읽고 파일 존재/상수 반환만 검사한 것은 반려한다. 첨부된 영상 프레임은 각 영상의 시간순 8장(왼쪽→오른쪽, 위→아래)이며 전체 영상을 보았다는 증거가 아니다. 조작·애니메이션·진행을 판단할 증거가 부족하면 실제 영상의 해당 구간을 추가 관측하고 확인하지 못한 것은 unverified로 기록한다.
 존재하면 docs/quality-benchmark.md, docs/game-design.md, docs/rework-design.md와 연구·레퍼런스 파일을 읽고 원래 사용자 목표와 비교한다. Ori·할로우 나이트·실크송이 요청된 경우 그 이름을 열거하는 데 그치지 말고 실제 이동·전투·공간·화면의 차이를 기록한다. 기준을 낮춰 합격시키지 않는다.
 criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로(줄번호 제외) 또는 위 HQ 프레임의 절대 경로를 적는다. controls-combat/world/art에는 실제 영상과 대조한 HQ 프레임 경로도 포함한다. 각 observation은 해당 장면·행동·결과·레퍼런스와의 차이를 구체적으로 적는다. 개선이 필요하면 fail과 담당 department별 repairs를 반환한다. 모든 항목 pass이고 수정할 결함이 없을 때만 전체 pass=true, repairs=[]다. 사람의 최종 취향 평가나 수상작 수준 달성을 보증한다고 쓰지 않는다.`

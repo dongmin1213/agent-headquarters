@@ -118,7 +118,7 @@ export class RequestEngine {
 - 등록된 프로젝트 내부의 파일 소유 조정·구현·기획·검수·재작업은 이미 위임된 일이다. 외부 권한 변경으로 분류하지 않는다. 현재 판단 세션은 읽기 전용이며 쓰기는 별도 작업자가 수행한다.
 - 결제(payment), 외부 공개(publication), 사용자 로그인(credentials), 위임 밖 파괴적 작업(destructive), 원래 목표의 실질 변경(scope_change), 조사로도 확보할 수 없는 필수 사용자 정보(missing_user_input)만 owner_decision으로 올릴 수 있다. 그 외는 none이다. 이미 승인된 행동에 재승인을 요구하지 않는다.
 - owner_decision이 none 이외이면 proceed=false, revised_task=null이어야 한다. answer에는 이미 시도한 방법과 근거, 내부 해결이 안 되는 이유, 사용자가 결정할 정확한 사항과 추천안을 포함한다.
-- 기술 문제를 이번 판단에서도 해결 못하면 proceed=false, owner_decision=none으로 미해결을 보고한다. 이를 사용자에게 '재시도/건너뛰기' 선택을 떠넘길 근거로 쓰지 않는다. 완료 기준을 낮추거나 검사를 면제하지 않는다.\n${this.runner.gameTaskEvidence(t.id)}`,
+- 기술 문제를 이번 판단에서도 해결 못하면 proceed=false, owner_decision=none으로 미해결을 보고한다. 이를 사용자에게 '재시도/건너뛰기' 선택을 떠넘길 근거로 쓰지 않는다. 완료 기준을 낮추거나 검사를 면제하지 않는다.\n${this.runner.gamePlayTools()}\n${this.runner.gameTaskEvidence(t.id)}`,
           schema: GAME_DECISION_SCHEMA,
           onLine: line => { if (line.type === 'rate_limit_event') this.runner.observe(line) } })
         if (result.limited) { this.runner.limitBackoff(); return true }

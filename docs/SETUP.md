@@ -279,3 +279,7 @@ codex login status
 게임 그래픽 프로필은 Godot 화면 캡처를 위해 `com.apple.hiservices-xpcservice`, `com.apple.windowserver.active`, `com.apple.windowserver`, `com.apple.CARenderServer`, `com.apple.MTLCompilerService`만 추가합니다. 일반 프로젝트에는 적용하지 않습니다. LaunchServices, open/osascript/launchctl 금지와 HQ 토큰·개인 인증 읽기 금지는 유지합니다. 게임 작업·검사에는 임시 HOME을 사용해 Godot 사용자 저장 데이터도 분리합니다. `HQ_LIVE_GAME_RENDER=1 node --test test/unit/game-render-live.test.ts`로 실제 움직이는 장면의 PNG 캡처·4초 영상·비밀 파일 읽기 거부를 시험합니다(잠깐 테스트 창이 열립니다).
 
 Codex 사용률 이벤트가 아직 관측되지 않은 경우에도 독립 작업·검토는 최대 `min(2, maxWorkers)`개를 병렬 실행합니다. 사용률을 0%로 간주하지는 않습니다. CEO 판단은 우선 처리하고, 실제 한도 오류·로그인 실패·한도 backoff가 발생하면 신규 실행을 보류합니다.
+
+### 게임 화면·입력 검수
+
+Godot 게임 작업자와 독립 검토자에게 `tools/game-play/README.md` 및 `play.py`를 읽기 전용으로 제공합니다. 작업자와 같은 샌드박스에서 일반 main scene에 실제 키 이벤트를 전달하고 렌더 화면을 관측하는 경로입니다. 상세 사용법은 해당 README를 따릅니다. 에이전트 입력이며 인간 플레이 검증이 아닙니다. 상태 주입·QA 공략 드라이버·다른 앱 제어는 제공하지 않습니다. 세션별 저장 위치·입력 로그·시간순 프레임을 분리하고 끝나면 stop합니다. 일반 프로젝트에는 도구 접근 권한이 추가되지 않습니다. macOS 실제 실행 검사는 `HQ_LIVE_GAME_PLAY=1 node --test test/unit/game-play-live.test.ts`로 수행합니다.

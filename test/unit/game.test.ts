@@ -84,6 +84,22 @@ test('game tool permissions are opt-in and preserve normal worker isolation', ()
   assert.ok(!execArgs({}).includes('web_search="live"'))
 })
 
+test('interactive play helper is readable only by opted-in game workers and reviewers', async () => {
+  const h = harness()
+  try {
+    const ordinary = h.runner.sandboxFor(h.repo, null, 'p')
+    assert.ok(!ordinary.readable?.some(p => p.endsWith('tools/game-play')))
+    h.projects[0].workflow = 'game'
+    for (const out of [null, join(h.dir, 'out')]) {
+      const profile = h.runner.sandboxFor(h.repo, out, 'p')
+      assert.ok(profile.readable?.some(p => p.endsWith('tools/game-play')))
+      assert.equal(profile.graphics, true)
+    }
+    assert.match(h.runner.gamePlayTools(), /controller|play.py/)
+    assert.match(h.runner.gamePlayTools(), /사람 조작감/)
+  } finally { await h.close() }
+})
+
 test('passed game task with no playable release is rejected before any final acceptance card', async () => {
   const h = harness()
   try {
