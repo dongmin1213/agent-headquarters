@@ -115,6 +115,14 @@ if (schema && (prompt.startsWith('너는 게임팀과 독립된 감독자 피카
   result({ structured_output: { pass: true, reason: 'fixture only, not a real quality assessment', criteria, repairs: [] } })
   process.exit(0)
 }
+if (schema && prompt.startsWith('너는 피카츄 작업 흐름 감독자다.')) {
+  const rows = JSON.parse(/^전체 작업 계약: (.+)$/m.exec(prompt)![1])
+  const parent = rows.find((r: any) => r.key === 'art')
+  const child = mk('flowsplit') ? { ...parent.spec, id: 'ui-branch', title: '독립 UI 자산', owns: ['assets/ui/**'],
+    depends_on: ['direction'], acceptance: [1, 2, 3].map(i => ({ id: `U${i}`, text: 'fixture independent check', check: 'manual', kind: 'new' })) } : null
+  result({ structured_output: { reason: 'fixture only: independent UI work or real dependency', parent_key: child ? 'art' : null, child } })
+  process.exit(0)
+}
 if (schema && (prompt.startsWith('너는 게임팀장이다.') || prompt.startsWith('너는 피카츄 독립 감독자이다.'))) {
   if (mk('leadnetwork')) { result({ is_error: true, result: 'workspace routing discovery failed' }); process.exit(1) }
   const supervisor = prompt.startsWith('너는 피카츄')

@@ -33,6 +33,7 @@ import { extractBashRuns, lastActivityOf, StreamTail } from './stream.ts'
 import { codexArgs, defaultProbe, findOrphan, groupIdentity, identify, killGroup, launch, LaunchAborted, looksLikeWorker, pidAlive, psInfo, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
 import { reconcile as reconcileInvariants, recover as recoverState, type Violation } from './reconcile.ts'
 import { AttemptClock } from './attempt-clock.ts'
+import { ancestors, containedOwn, flowSignature } from '../game-flow.ts'
 
 export type Notify = (title: string, body: string) => void
 
@@ -277,6 +278,13 @@ export class Runner {
   canStartCeo(): boolean {
     const m = this.quota().mode
     return m !== 'hold' && (m === 'normal' || this.store.liveAttempts().length === 0)
+  }
+
+  /** Internal game supervision uses one free worker slot even when quota percentages are unavailable. */
+  canStartGameSupervisor(): boolean {
+    const mode = this.quota().mode
+    const capacity = mode === 'hold' ? 0 : mode === 'save' ? 1 : mode === 'unobserved' ? Math.min(2, this.cfg.maxWorkers) : this.cfg.maxWorkers
+    return this.store.liveAttempts().length < capacity
   }
 
   /** Something the CEO should do before any worker in save/unobserved mode (§13 "CEO 턴이 우선"). */
@@ -864,9 +872,10 @@ export class Runner {
     // all observed quota/login/backoff holds. A higher maxWorkers needs telemetry.
     const unobserved = q.mode === 'unobserved'
     const single = q.mode === 'save'
-    if ((single || unobserved) && (this.ceoLock.busy || this.ceoWaiting())) return
+    if (single && (this.ceoLock.busy || this.ceoWaiting())) return
+    if (unobserved && !this.ceoLock.busy && this.ceoWaiting()) return
     const capacity = single ? 1 : unobserved ? Math.min(2, this.cfg.maxWorkers) : this.cfg.maxWorkers
-    let free = capacity - this.store.liveAttempts().length
+    let free = capacity - this.store.liveAttempts().length - (this.ceoLock.busy ? 1 : 0)
     for (const t of this.store.tasksByStatus(['reviewing'])) {
       if (free <= 0) return
       const r = this.store.request(t.request_id)
@@ -2120,6 +2129,42 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
     this.store.set(`revise:${taskId}`, null)
     this.invalidateDependents(this.store.task(taskId)!)
     this.emitTask(t, `지시서 수정 적용: ${rev.title} (revision ${t.revision + 1})`)
+    this.kick()
+    return null
+  }
+
+  /** Split independent production from an untouched pending job; retain all original integration gates. */
+  splitPendingGameTask(requestId: string, parentKey: string, child: PlanTask, signature: string): string | null {
+    const r = this.store.request(requestId), rows = this.store.tasks(requestId), parent = rows.find(t => t.key === parentKey)
+    if (!r || r.status !== 'executing' || this.project(r.project)?.workflow !== 'game' || !gameEnabled(this.store, r.project)
+      || flowSignature(rows) !== signature || !parent || parent.status !== 'pending' || parent.worktree || parent.head_sha
+      || parent.lingering || this.store.attempts(parent.id).length) return '계획이나 분리 대상 상태가 바뀌었습니다'
+    const old = specOf(parent), upstream = ancestors(rows, parent.key)
+    if (old.role !== 'implement' || !['art', 'gameplay', 'level'].includes(old.department ?? '')
+      || child.role !== 'implement' || child.project !== parent.project || child.department !== old.department
+      || child.grade !== old.grade || child.model !== old.model || reviewModelOf(child) !== reviewModelOf(old)
+      || child.acceptance.length < 3 || child.acceptance.length > 7 || !child.brief.trim()) return '같은 제작 직군·등급·모델·독립 검토를 유지해야 합니다'
+    if (child.owns.some(p => !containedOwn(p, old.owns))) return '분리 작업이 기존 소유 범위를 벗어납니다'
+    if (!child.depends_on.length || child.depends_on.some(k => !upstream.some(t => t.key === k && t.status === 'passed')))
+      return '분리 작업은 승인된 기존 선행 결과에서만 시작할 수 있습니다'
+    if (upstream.some(t => ['research', 'direction', 'qa'].includes(specOf(t).department ?? '') && t.status !== 'passed')) return '미통과 조사·기획·품질 관문을 앞질러 제작하지 않습니다'
+    // Keep every already-passed ancestor in the branch's history, including approved assets and design.
+    const branch = { ...child, depends_on: [...new Set([...child.depends_on, ...upstream.filter(t => t.status === 'passed').map(t => t.key)])] }
+    const revised = { ...old, depends_on: [...old.depends_on, branch.id],
+      brief: `${old.brief}\n병렬 분리 ${branch.id}의 승인 결과를 합쳐 기존 완료 기준을 모두 실제 게임에서 검증한다. 분리 결과를 중복 제작하지 않는다. 중간 미리보기는 통합/최종 품질 증거를 대신하지 않는다.` }
+    const specs = [...rows.map(t => t.id === parent.id ? revised : specOf(t)), branch]
+    const problem = validateTasks(specs, this.projects) ?? gamePlanProblem({ summary: '', assumptions: [], tasks: specs }, r.project)
+    if (problem) return problem
+    this.store.tx(() => {
+      this.store.set(`game.flow-split:${requestId}:${branch.id}`, JSON.stringify({ at: this.iso(), signature, parent, branch }))
+      this.store.insertTask({ id: `${r.id}.${branch.id}`, request_id: r.id, key: branch.id, project: branch.project,
+        title: branch.title, role: branch.role, grade: branch.grade, model: branch.model, review_model: reviewModelOf(branch),
+        spec: JSON.stringify(branch), status: 'pending', branch: null, base_sha: null })
+      this.store.updateTask(parent.id, { spec: JSON.stringify(revised), revision: parent.revision + 1 })
+      const plan = JSON.stringify({ ...JSON.parse(r.plan!), tasks: specs })
+      this.store.updateRequest(r.id, { plan, plan_hash: sha256(plan) })
+    })
+    this.emitRequest(r.id, `피카츄가 독립 제작을 분리했어요: ${branch.title} · 기존 통합 검수 유지`)
     this.kick()
     return null
   }

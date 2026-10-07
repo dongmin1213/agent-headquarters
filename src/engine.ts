@@ -7,6 +7,7 @@ import type { Runner } from './exec/runner.ts'
 import { GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, gameEnabled, gamePlanProblem, gameWaiting, gameWaitSignature, gameDecisionReady, transientDecisionFailure } from './game.ts'
 import type { TaskRow } from './store.ts'
 import type { Store } from './store.ts'
+import { flowCandidates, flowDue, flowSignature, FLOW_MAX_TURNS } from './game-flow.ts'
 
 const MAX_TURNS = 6
 const MAX_CORRECTIONS = 1
@@ -62,10 +63,10 @@ export class RequestEngine {
   }
 
   async tick(): Promise<void> {
-    if (!this.runner.canStartCeo()) return
-    if (await this.manageGame()) return
+    if (this.runner.canStartGameSupervisor() && await this.manageGame()) return
     const r = this.store.requestsByStatus(['queued']).find(r => this.projects.find(p => p.id === r.project)?.workflow !== 'game' || gameEnabled(this.store, r.project))
-    if (!r || !this.runner.ceoLock.tryAcquire()) return
+    if (!r) { await this.manageGameFlow(); return }
+    if (!this.runner.canStartCeo() || !this.runner.ceoLock.tryAcquire()) return
     try { await this.turn(r.id) } finally { this.runner.ceoLock.release() }
     void this.tick()
   }
@@ -183,6 +184,46 @@ export class RequestEngine {
       } finally { this.runner.ceoLock.release() }
     }
     return false
+  }
+
+  /** A bounded plan audit can run in a spare slot before any worker reports failure. */
+  private async manageGameFlow(): Promise<void> {
+    for (const r of this.store.requestsByStatus(['executing'])) {
+      const p = this.projects.find(p => p.id === r.project)
+      if (p?.workflow !== 'game') continue
+      const rows = this.store.tasks(r.id), candidates = flowCandidates(this.store, rows)
+      const eligible = gameEnabled(this.store, p.id) && this.runner.canStartGameSupervisor() && this.runner.cfg.maxWorkers > 1
+        && this.runner.quota().mode !== 'save' && rows.length < 24 && candidates.length > 0
+        && !this.runner.ceoLock.busy && !this.runner.ceoWaiting()
+        && !this.runner.readyTasks().length && !this.store.tasksByStatus(['reviewing']).some(t => !this.store.liveAttempts().some(a => a.task_id === t.id))
+      if (!flowDue(this.store, r.id, rows, this.runner.now(), eligible) || !this.runner.ceoLock.tryAcquire()) continue
+      const signature = flowSignature(rows), count = Number(this.store.get(`game.flow-count:${r.id}`) ?? 0)
+      this.store.set(`game.flow-count:${r.id}`, String(count + 1))
+      this.store.set(`game.flow-last:${r.id}`, JSON.stringify({ at: this.runner.now(), signature }))
+      // Persist before invoking: restart cannot repeat a paid audit whose result was lost.
+      this.store.set(`game.flow-seen:${r.id}:${signature}`, 'started')
+      this.bus.emit({ kind: 'request', text: '피카츄가 작업 대기 원인과 독립 제작 분리 가능성을 점검합니다', data: { id: r.id } })
+      try {
+        const result = await runJsonTurn({ codexBin: this.runner.cfg.codexBin, runtimeHome: this.runner.home,
+          model: this.runner.cfg.models.sonnet, cwd: p.path, sessionId: randomUUID(), resume: false, addDirs: [], timeoutMs: 3 * 60_000,
+          prompt: `너는 피카츄 작업 흐름 감독자다.\n${GAME_ECONOMY_RULES}\n${GAME_PLAYTEST_RULES}\n요청: ${r.text}\n현재는 빈 작업 슬롯이 있지만 승인된 선행 조건으로 즉시 실행할 작업이 없는 상태가 3분 이상 관측됐다. 이것만으로 오류라고 단정하지 말고 실제로 필요한 순서인지 판단한다.\n전체 작업 계약: ${JSON.stringify(rows.map(t => ({ key: t.key, status: t.status, head_sha: t.head_sha, worktree: t.worktree, spec: JSON.parse(t.spec) })))}\n분리 후보 key: ${JSON.stringify(candidates.map(t => t.key))}\n현재 호출은 이 상태에서 한 번뿐이며 요청 전체 최대 ${FLOW_MAX_TURNS}회다.\n출력: reason에 구체적인 선행 결과·충돌 파일·판단 근거를 기록한다. 독립 제작이 없으면 parent_key=null, child=null로 순서를 유지한다. 분리 가능하면 parent_key에 후보 하나, child에 새 PlanTask 전체를 반환한다. 새 child는 원래 작업의 일부 제작을 맡는다. 새 기능, 중복 시장조사, 인원 채우기용 보고서/QA를 만들지 않는다. 승인된 기존 선행 작업에서 분기하고 부모가 기존 의존과 모든 acceptance를 유지하며 child도 기다리게 된다. 현재 실행 중 작업·기존 수용 기준·검토·품질 관문은 변경할 수 없다. child는 부모와 같은 project/role/department/grade/model/review.model이어야 하며 owns는 부모 owns의 부분집합이고 나머지 병렬 작업과 겹치면 안 된다. 미통과 QA 관문 뒤의 콘텐츠 확장을 앞당기지 않는다. 새 id는 기존 key와 달라야 한다. child acceptance는 3~7개이며 독립 제작 결과만 검증하고 전체 게임 통합 판정을 대신하지 않는다. 공용 코드 수정은 부모에게 남긴다. 쓰기는 별도 작업자가 수행하며 현재는 읽기 전용 판단이다. 사용자에게 세부 구현 질문을 전달하지 않는다.`,
+          schema: { type: 'object', additionalProperties: false, required: ['reason', 'parent_key', 'child'], properties: {
+            reason: { type: 'string' }, parent_key: { type: ['string', 'null'] }, child: { anyOf: [{ type: 'null' }, TASK_SCHEMA] },
+          } }, onLine: line => { if (line.type === 'rate_limit_event') this.runner.observe(line) } })
+        if (result.limited) this.runner.limitBackoff()
+        if (!result.ok && /Not logged in|authentication|unauthorized|401|refresh.token/i.test(result.error ?? '')) this.runner.requireLogin(result.error ?? 'Not logged in')
+        const o = result.output as { reason?: string; parent_key?: string | null; child?: PlanTask | null } | null
+        let problem: string | null = !result.ok ? result.error ?? '흐름 점검 실패' : null
+        if (!problem && (!o || typeof o.reason !== 'string' || !o.reason.trim() || !((o.parent_key === null && o.child === null)
+          || (typeof o.parent_key === 'string' && !!o.child && candidates.some(t => t.key === o.parent_key))))) problem = '흐름 점검 출력 계약 위반'
+        if (!problem && o?.child && o.parent_key) problem = this.runner.splitPendingGameTask(r.id, o.parent_key, o.child, signature)
+        this.store.set(`game.flow-seen:${r.id}:${signature}`, JSON.stringify({ at: this.runner.now(), reason: o?.reason ?? null, error: problem, parent: o?.parent_key ?? null, child: o?.child?.id ?? null }))
+        this.bus.emit({ kind: 'request', text: problem ? `작업 흐름 점검: ${problem} · 기존 작업 유지` : o?.child ? '독립 제작 분리 적용 · 통합 품질 기준 유지' : `작업 순서 유지: ${o?.reason?.slice(0, 180)}`, data: { id: r.id } })
+      } catch (e) {
+        this.store.set(`game.flow-seen:${r.id}:${signature}`, JSON.stringify({ at: this.runner.now(), error: String(e) }))
+      } finally { this.runner.ceoLock.release() }
+      return
+    }
   }
 
   private async turn(id: string): Promise<void> {
