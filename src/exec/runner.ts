@@ -16,7 +16,7 @@ import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../sto
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
 import { baseline, checksProfile, envFailure, runChecks, runSandboxed, setupChangedReason, trackedChanges, type BaseResult, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
 import { requestScratchChildren, requestScratchPaths, removeRequestScratch, removeRequestCodexHomes } from './cleanup.ts'
-import { DONE_MAX, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
+import { DONE_MAX, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, readOutResult, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
 import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, lingeringOf, lingeringPsKey, lingeringWait, outDirOf, RELEASE, workerViews, type HeadlineInput, type Lingering, type LingeringPs } from './decisions.ts'
 import { runDiagnoseTurn } from './diagnose.ts'
 import { atomicJson, atomicWrite, readJson, readText, sha256 } from './fsx.ts'
@@ -701,10 +701,11 @@ export class Runner {
       await removeMirrorWorktree(mirror, collectWt).catch(() => {})
     }
     const stderr = (readText(join(hq, 'stderr.log'), 200_000) ?? '').slice(-20_000)
+    const doneFile = readOutResult(out, 'done.json', DONE_MAX)
     const j = judgeWork({
       role, token: att.attempt_token, owns: spec.owns, protectedPaths: this.cfg.protectedPaths, base: task.base_sha ?? '',
       runaway: att.outcome === 'runaway', result, stderr, rejectedSeen: l.tail.rejectedSeen,
-      doneRaw: readOut(out, 'done.json', DONE_MAX), report, git,
+      doneRaw: doneFile.text, doneReadProblem: doneFile.problem, report, git,
     })
     // The fetch's own reason (e.g. the object check refused the result) says more than "could not fetch".
     if (fetchError && j.outcome === 'failed' && !git?.head) j.reasons = [fetchError]

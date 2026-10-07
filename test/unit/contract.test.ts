@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { DONE_MAX, judgeWork, ownsMatch, readOut, type WorkFacts } from '../../src/exec/contract.ts'
+import { DONE_MAX, judgeWork, ownsMatch, readOut, readOutResult, type WorkFacts } from '../../src/exec/contract.ts'
 import { DEFAULTS } from '../../src/config.ts'
 import { tmp } from './helpers.ts'
 
@@ -46,6 +46,37 @@ test('2. unverifiable: no done, token mismatch, symlink done, oversized done', (
   assert.equal(readOut(join(dir, 'out2'), 'done.json', DONE_MAX), null, 'oversized ignored')
   writeFileSync(join(dir, 'out2', 'report.md'), 'ok')
   assert.equal(readOut(join(dir, 'out2'), 'report.md', DONE_MAX), 'ok')
+})
+
+test('large complete file lists survive submission without relaxing commit, scope or token checks', () => {
+  const dir = tmp('hq-large-done-')
+  const changed = Array.from({ length: 969 }, (_, i) => `src/world/evidence/independent-playtest-capture/vertical-traversal/camera-proof-${i}.json`)
+  const raw = done({ files_modified: changed })
+  assert.ok(Buffer.byteLength(raw) > 64 * 1024)
+  assert.ok(Buffer.byteLength(raw) < DONE_MAX)
+  writeFileSync(join(dir, 'done.json'), raw)
+  const file = readOutResult(dir, 'done.json', DONE_MAX)
+  assert.equal(file.problem, null)
+  const f = facts({ doneRaw: file.text, doneReadProblem: file.problem }, { changed })
+  assert.equal(outcome(f), 'succeeded')
+  assert.equal(outcome({ ...f, token: 'stale' }), 'unverifiable')
+  assert.equal(outcome({ ...f, owns: ['src/other/**'] }), 'failed')
+  assert.equal(outcome({ ...f, git: { ...f.git!, head: BASE } }), 'failed')
+  assert.equal(outcome({ ...f, git: { ...f.git!, changed: [...changed, 'src/missing.ts'] } }), 'failed')
+})
+
+test('submission read failures distinguish oversized, missing and non-regular files', () => {
+  const dir = tmp('hq-out-reasons-')
+  assert.match(readOutResult(dir, 'missing.json', DONE_MAX).problem!, /파일 없음/)
+  mkdirSync(join(dir, 'directory.json'))
+  assert.match(readOutResult(dir, 'directory.json', DONE_MAX).problem!, /일반 파일이 아님/)
+  writeFileSync(join(dir, 'done.json'), 'x'.repeat(DONE_MAX + 1))
+  const file = readOutResult(dir, 'done.json', DONE_MAX)
+  assert.equal(file.text, null)
+  assert.match(file.problem!, /크기 제한 초과 \(1048577 bytes > 1048576 bytes\)/)
+  assert.deepEqual(judgeWork(facts({ doneRaw: file.text, doneReadProblem: file.problem })).reasons, [file.problem])
+  symlinkSync(join(dir, 'done.json'), join(dir, 'link.json'))
+  assert.match(readOutResult(dir, 'link.json', DONE_MAX).problem!, /심볼릭 링크 금지/)
 })
 
 test('2. judgement table', () => {

@@ -41,6 +41,8 @@ export interface WorkFacts {
   rejectedSeen: boolean
   /** out/done.json read safely (null = missing, symlink, not a file, or oversized). */
   doneRaw: string | null
+  /** Exact file-read failure; kept separate from JSON/schema failures. */
+  doneReadProblem?: string | null
   report: string | null
   /** implement: worktree facts; collect: facts of the read-only cwd (tree must be unchanged). */
   git: GitFacts | null
@@ -48,26 +50,43 @@ export interface WorkFacts {
 
 export interface Judgement { outcome: WorkOutcome; reasons: string[]; done: DoneJson | null; protectedChanges: string[]; login?: boolean }
 
-export const DONE_MAX = 64 * 1024
+// A full base..HEAD file list can exceed 64 KiB for game assets and playtest evidence.
+export const DONE_MAX = 1024 * 1024
 export const REPORT_MAX = 1024 * 1024
 const LIMIT_RE = /usage limit|rate limit|limit reached|5-hour limit|weekly limit/i
 const SHA_RE = /^[0-9a-f]{40}$/
 
 /** Reads a worker-submitted file only if it is a regular file (no symlink) within the size cap. §1 */
 export function readOut(outDir: string, name: string, max: number): string | null {
+  return readOutResult(outDir, name, max).text
+}
+
+export function readOutResult(outDir: string, name: string, max: number): { text: string | null; problem: string | null } {
   const p = join(outDir, name)
+  const fail = (reason: string) => ({ text: null, problem: `out/${name}: ${reason}` })
   try {
     const st = lstatSync(p)
-    if (!st.isFile() || st.isSymbolicLink() || st.size > max) return null
-    const fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW)
+    if (!st.isFile() || st.isSymbolicLink()) return fail('일반 파일이 아님 (심볼릭 링크 금지)')
+    if (st.size > max) return fail(`크기 제한 초과 (${st.size} bytes > ${max} bytes)`)
+    const fd = openSync(p, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
     try {
-      const size = fstatSync(fd).size
-      if (size > max) return null
+      const opened = fstatSync(fd), size = opened.size
+      if (!opened.isFile()) return fail('일반 파일이 아님')
+      if (size > max) return fail(`크기 제한 초과 (${size} bytes > ${max} bytes)`)
       const buf = Buffer.alloc(size)
-      readSync(fd, buf, 0, size, 0)
-      return buf.toString('utf8')
+      let offset = 0
+      while (offset < size) {
+        const count = readSync(fd, buf, offset, size - offset, offset)
+        if (!count) return fail('읽는 도중 파일이 변경됨')
+        offset += count
+      }
+      if (fstatSync(fd).size !== size) return fail('읽는 도중 파일이 변경됨')
+      return { text: buf.toString('utf8'), problem: null }
     } finally { closeSync(fd) }
-  } catch { return null }
+  } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code
+    return fail(code === 'ENOENT' ? '파일 없음' : `읽기 실패 (${code ?? 'unknown'})`)
+  }
 }
 
 /** §8.1: structured signals only; stderr is consulted only when no result line exists. */
@@ -148,7 +167,7 @@ export function judgeWork(f: WorkFacts): Judgement {
   if (isTransient(f.result)) return j('transient', [`일시 오류 (API ${String(f.result!.api_error_status)})`])
   if (f.result?.subtype === 'error_max_turns') return j('failed', ['턴 상한 도달'])
   const { done, problem } = parseDone(f.doneRaw, f.token)
-  if (!done) return j('unverifiable', [problem!])
+  if (!done) return j('unverifiable', [f.doneRaw === null && f.doneReadProblem ? f.doneReadProblem : problem!])
   if (done.outcome === 'question') return done.questions.length ? j('question', [], done) : j('failed', ['outcome question인데 questions 없음'], done)
   if (done.outcome === 'blocked') return j('brief_blocked', [`작업자 보고 blocked: ${done.summary || '(요약 없음)'}`], done)
   if (done.outcome === 'failed') return j('failed', [`작업자 보고 failed: ${done.summary || '(요약 없음)'}`], done)

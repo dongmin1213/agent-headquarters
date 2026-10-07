@@ -23,7 +23,7 @@
 | `<hq repo>/config/hq.json`, `config/projects.json` | 설정 | — |
 
 - **ID 형식 (URL 안전)**: 요청 `req-xxxxxxxx`, 작업 `<requestId>.<key>`(key는 `[A-Za-z0-9_-]{1,32}`), 시도 `<taskId>~a<n>`(작업) / `<taskId>~r<n>`(검토). 클라이언트는 그래도 경로 세그먼트를 percent-encode하고, 서버는 한 번만 decode한다.
-- `out/` 파일은 hq가 `lstat`로 일반 파일인지 확인하고 `O_NOFOLLOW` + 크기 상한(report 1MB, done 64KB)으로만 읽는다. symlink·디렉터리·과대 파일은 없는 것으로 취급한다.
+- `out/` 파일은 hq가 `lstat`로 일반 파일인지 확인하고 `O_NOFOLLOW` + 크기 상한(report·done 각각 1MiB)으로만 읽는다. done은 base 이후 전체 변경 경로를 담으므로 에셋·검증 증거가 많은 제출도 수용한다. symlink·디렉터리·과대 파일은 거부하며, 완료 판정에는 파일 없음·비정상 파일·크기 초과를 구분해 기록한다. 작업자에게도 바이트 상한을 안내한다.
 - **로그는 append-only**(stream.jsonl, stderr.log, activity.jsonl; 마지막 불완전 줄은 다음 읽기에서 복구). **스냅샷 파일은 원자적 교체**(tmp→rename). 판정의 원본은 DB이며 파일은 사본이다.
 
 ## 2. 설정 `config/hq.json` (모든 키 선택)
