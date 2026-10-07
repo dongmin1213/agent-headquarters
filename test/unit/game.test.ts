@@ -380,3 +380,47 @@ test('invalid collect reviews retry the preserved report and expose it to the ga
     assert.equal(h.store.attempts(before.id).filter(a => a.kind === 'review').length, 3)
   } finally { await h.close() }
 })
+
+test('game repair adds a missing prerequisite, waits for it, and refuses cycles or removed prerequisites', async () => {
+  const { h, id, tid, spec } = repairFixture()
+  try {
+    const parallel = task('parallel', { department: 'art', grade: 'L2', review: { model: 'sonnet', brief: '검토' }, depends_on: ['direction'], owns: ['parallel/**'] })
+    h.store.insertTask({ id: `${id}.parallel`, request_id: id, key: 'parallel', project: 'p', title: parallel.title, role: parallel.role,
+      grade: parallel.grade, model: parallel.model, review_model: 'sonnet', spec: JSON.stringify(parallel), status: 'pending', branch: null, base_sha: null })
+    const signature = gameWaitSignature(h.store, h.store.task(tid)!)
+    assert.ok(h.runner.repairGameTask(tid, { ...spec, depends_on: [...spec.depends_on, 'delivery'] }, signature), 'cycle must fail')
+    assert.ok(h.runner.repairGameTask(tid, { ...spec, depends_on: ['parallel'] }, signature), 'old prerequisites cannot be removed')
+    const revised = { ...spec, depends_on: [...spec.depends_on, 'parallel'] }
+    assert.equal(h.runner.repairGameTask(tid, revised, signature), null)
+    const t = h.store.task(tid)!
+    assert.equal(t.worktree, h.repo)
+    assert.equal(h.store.get(`game.refresh-base:${tid}`), String(t.generation))
+    assert.equal(h.runner.depsPassed(t, h.store.tasks(id)), false, 'wait, not another doomed retry')
+    h.store.updateTask(`${id}.parallel`, { status: 'passed' })
+    assert.equal(h.runner.depsPassed(t, h.store.tasks(id)), true)
+  } finally { await h.close() }
+})
+
+test('dependency repair refreshes verification base and merges completed assets without discarding existing or dirty work', async () => {
+  const h = harness()
+  try {
+    const a = task('A', { department: 'level' }), b = task('B', { department: 'art' })
+    const id = h.plan([a, b]); await h.approve(id)
+    await h.waitFor(() => h.store.tasks(id).every(t => t.status === 'passed'))
+    const prior = h.store.task(`${id}.A`)!, upstream = h.store.task(`${id}.B`)!
+    const preserved = join(prior.worktree!, 'a/preserved.txt')
+    writeFileSync(preserved, 'uncommitted work must survive')
+    h.projects[0].workflow = 'game'
+    h.store.updateRequest(id, { status: 'executing' })
+    h.store.updateTask(prior.id, { status: 'revising' })
+    assert.equal(h.store.tx(() => h.runner.applyRevision(prior.id, { ...a, depends_on: ['B'] })), null)
+    await h.waitFor(() => h.store.task(prior.id)?.status === 'passed', 'refreshed task passed')
+    const after = h.store.task(prior.id)!
+    assert.equal(after.worktree, prior.worktree)
+    assert.equal(after.base_sha, upstream.head_sha)
+    assert.equal(readFileSync(preserved, 'utf8'), 'uncommitted work must survive')
+    assert.ok(existsSync(join(after.worktree!, 'b/out.txt')), 'approved assets actually arrive in the old checkout')
+    assert.equal(sh(after.worktree!, 'merge-base', upstream.head_sha!, 'HEAD'), upstream.head_sha)
+    assert.deepEqual(JSON.parse(after.spec).owns, a.owns, 'no asset ownership expansion')
+  } finally { await h.close() }
+})

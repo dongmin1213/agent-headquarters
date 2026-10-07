@@ -33,6 +33,7 @@ export async function runReviseTurn(i: ReviseInput): Promise<ReviseTurn> {
     ...(i.project.workflow === 'game' ? [
       '게임 제작 내부 수정은 팀장에게 위임되어 있다. 원래 acceptance 배열의 id/text/check/kind를 정확히 보존한다. 수용 기준을 다시 쓰거나 완화하지 말고 구체적인 수정·재검 지시는 brief에 추가한다.',
       '현재 수정 API는 이 작업 하나만 변경한다. 다른 담당자에게 반환한다고 적는 것만으로 선행 작업이 재실행되지 않는다. 이미 완료한 선행 분기의 내부 결함을 통합 중 발견했다면, 같은 프로젝트의 필요한 파일만 owns에 명시적으로 추가하고 기존 산출물을 보존하여 수정한다. 파일 소유가 겹치는 작업과 depends_on 순서를 유지하며 병렬 충돌을 만들지 않는다.',
+      '다른 분기에서 제작된 결과가 현재 checkout에 없는 경우 재제작이나 owns 확장보다 해당 작업의 depends_on 추가로 연결한다. 기존 의존 제거나 순환은 금지한다. HQ가 새 선행 기준을 제공하며 작업자는 현재 구현을 보존한 채 재배치 후 재검수한다.',
       '프로젝트 내부 owns 조정은 외부 권한 변경이 아니며 그 자체로 회장 질문을 만들지 않는다. 독립 검토·기존 검사·후속 제품 품질 관문은 유지한다. 후속 제출물 부재만으로 선행 범위를 확대하지 않는다.',
     ] : ['owns를 넓히거나 수용 기준 check 명령을 바꾸면 회장 승인이 필요하다.']),
     '', '## 회장의 요청', i.requestText,
@@ -64,11 +65,12 @@ export function canAutoApply(orig: PlanTask, rev: PlanTask): boolean {
   return rest(orig) === rest(rev)
 }
 
-/** Delegated game repair may adjust local ownership, never checks, dependencies or independent review. */
+/** Game repairs may add prerequisites, never remove them or weaken checks/review. Full DAG validation is separate. */
 export function canAutoApplyGame(orig: PlanTask, rev: PlanTask): boolean {
   return Array.isArray(rev.owns) && rev.owns.every(p => typeof p === 'string' && p.length > 0
     && !p.startsWith('/') && !p.includes('\\') && !p.split('/').some(part => ['', '.', '..'].includes(part)))
-    && canAutoApply(orig, { ...rev, owns: orig.owns })
+    && Array.isArray(rev.depends_on) && orig.depends_on.every(d => rev.depends_on.includes(d))
+    && canAutoApply(orig, { ...rev, owns: orig.owns, depends_on: orig.depends_on })
 }
 
 /** Human-readable before/after for the revise card. */

@@ -1005,6 +1005,20 @@ export class Runner {
         gate()
       } else {
         cwd = this.workDir(t.request_id, t.key)
+        let refresh: { generation: number; base: string; previousBase: string } | null = null
+        try { refresh = JSON.parse(this.store.get(`game.refreshed-base:${t.id}`) ?? 'null') } catch {}
+        const needsRefresh = this.store.get(`game.refresh-base:${t.id}`) === String(t.generation)
+        if (needsRefresh && t.worktree) {
+          // Preserve the worker checkout, including dirty files. HQ only resolves approved upstream
+          // commits in its own mirror; the worker rebases its saved commits before touching its existing work.
+          const base = refresh?.generation === t.generation && refresh.base ? refresh.base : await this.resolveBase(t)
+          const previousBase = refresh?.generation === t.generation ? refresh.previousBase : t.base_sha!
+          gate()
+          this.tset(t, { base_sha: base, checks_state: null, head_sha: null, report_sha: null })
+          atomicJson(join(hq, 'dependency-refresh.json'), { generation: t.generation, base, previousBase })
+          this.store.set(`game.refreshed-base:${t.id}`, JSON.stringify({ generation: t.generation, base, previousBase }))
+          t = this.store.task(t.id)!
+        }
         if (!t.worktree) {
           const base = await this.resolveBase(t)
           gate()
@@ -1027,7 +1041,10 @@ export class Runner {
       t = this.store.task(t.id)!
       // A legacy thread starts fresh in Codex; every resume also needs the current checkout and full brief.
       let prompt = workPrompt({ game: project.workflow === 'game', task: specOf(t), requestText: request.text, projectName: project.name, cwd, branch: role === 'implement' ? 'hq-work' : null, base: t.base_sha!,
-        out, token: att.attempt_token, rework: t.note && prev ? this.reworkText(t, prev) : null, dirtyNotice: null, upstream: this.upstream(t) })
+        out, token: att.attempt_token, rework: t.note && prev ? this.reworkText(t, prev) : null,
+        dirtyNotice: this.store.get(`game.refresh-base:${t.id}`) === String(t.generation)
+          ? `선행 작업 의존성이 추가되어 검증 기준 커밋이 ${t.base_sha}로 갱신됐다. 이전 기준은 ${JSON.parse(this.store.get(`game.refreshed-base:${t.id}`) ?? 'null')?.previousBase ?? t.base_sha}이다. 먼저 현재 HEAD를 백업 브랜치에 보존한다. 새 기준이 이미 HEAD의 조상이면 재배치하지 않는다. 그렇지 않으면 기존 코드·미커밋 파일을 보존해 git rebase --autostash --onto ${t.base_sha} <이전 기준>으로 기존 작업 커밋만 승인된 선행 결과 위에 재배치한다. merge 커밋은 제출 계약상 금지다. reset/checkout으로 기존 구현을 버리지 않는다. 충돌은 현재 owns 안에서 해결하며 그 밖의 충돌은 정확한 파일과 함께 보고한다. 선행 아트를 새로 만들거나 누락으로 다시 판단하기 전에 해당 승인 결과를 확인한다. 재배치 후 기존 수용 기준과 회귀·독립 검토를 모두 수행한다.` : null,
+        upstream: this.upstream(t) })
       if (resume) {
         const answers = this.store.taskQuestions(t.id).filter(q => q.answer !== null).map(q => ({ question: q.question, answer: q.answer! }))
         prompt += '\n\n' + resumePrompt({ answers, out, token: att.attempt_token, role, base: t.base_sha! })
@@ -2073,6 +2090,8 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
     for (const a of this.store.liveAttempts()) if (a.task_id === t.id) this.store.updateAttempt(a.id, { outcome: 'superseded' }) // pollLive signals it
     this.store.updateTask(taskId, { spec: JSON.stringify(rev), title: rev.title, grade: rev.grade, model: rev.model, review_model: reviewModelOf(rev),
       revision: t.revision + 1, generation: t.generation + 1, status: 'rework', resume_session: null, note: '지시서 수정 적용' })
+    if (this.project(t.project)?.workflow === 'game' && rev.depends_on.some(d => !specOf(t).depends_on.includes(d)))
+      this.store.set(`game.refresh-base:${t.id}`, String(t.generation + 1))
     this.store.set(`revise:${taskId}`, null)
     this.invalidateDependents(this.store.task(taskId)!)
     this.emitTask(t, `지시서 수정 적용: ${rev.title} (revision ${t.revision + 1})`)
@@ -2087,7 +2106,9 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
     if (!['question', 'blocked'].includes(t.status) || gameWaitSignature(this.store, t) !== signature
       || !['executing', 'blocked'].includes(this.store.request(t.request_id)?.status ?? '')) return '판단 대상 상태가 바뀌었습니다'
     if (t.lingering || this.store.liveAttempts().some(a => a.task_id === t.id)) return '기존 작업자 종료 확인이 필요합니다'
-    if (!canAutoApplyGame(specOf(t), rev)) return '내부 재배정은 제목·지시서·프로젝트 내부 소유 경로만 변경할 수 있습니다. 완료 기준·검사·의존·검토는 유지해야 합니다'
+    if (!canAutoApplyGame(specOf(t), rev)) return '내부 재배정은 제목·지시서·프로젝트 내부 소유 경로와 선행 의존 추가만 가능합니다. 완료 기준·검사·기존 의존·검토는 유지해야 합니다'
+    const added = rev.depends_on.filter(d => !specOf(t).depends_on.includes(d))
+    if (added.some(k => this.store.tasks(t.request_id).find(x => x.key === k)?.project !== t.project)) return '추가 선행 작업은 같은 프로젝트여야 합니다'
     const plan = this.store.tasks(t.request_id).map(x => x.id === t.id ? rev : specOf(x))
     const problem = reviseProblem(specOf(t), rev) ?? validateTasks(plan, this.projects) ?? gamePlanProblem({ summary: '', assumptions: [], tasks: plan }, t.project)
     if (problem) return problem

@@ -159,6 +159,12 @@ let outcome = mk('outcome') ?? 'succeeded'
 if (outcome === 'question' && resume) outcome = 'succeeded'
 let head = base, files: string[] = []
 if (!collect && outcome === 'succeeded') {
+  const refresh = /선행 작업 의존성이 추가되어 검증 기준 커밋이 ([0-9a-f]{40})로 갱신됐다/.exec(prompt)?.[1]
+  if (refresh) {
+    const previous = /이전 기준은 ([0-9a-f]{40})이다/.exec(prompt)![1]
+    if (git('merge-base', refresh, 'HEAD') !== refresh) git('rebase', '--autostash', '--onto', refresh, previous)
+    bash(`git rebase --autostash --onto ${refresh} ${previous}`, 0)
+  }
   // evilcheck: a committed check script that swaps the verification worktree's .git for a trap repository
   // (fsmonitor + hooks write markers) and tries to hide changes via the index. Only hq's own git could trip it.
   if (mk('evilcheck') && mk('mark')) {
