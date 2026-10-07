@@ -205,12 +205,13 @@ test('11. limits: rejected event → held, no new starts until the latest blocki
 
 test('12. runaway: wall time exceeded → group SIGTERM → runaway → rework; 3 identical errors → runaway', async () => {
   const h = harness()
+  h.cfg.attemptWallMinutes = { ...h.cfg.attemptWallMinutes, L1: 0.01 }
   try {
     const id = h.plan([task('A', { brief: '[[FAKE:sleep=60000]]' })])
     await h.approve(id)
     const tid = `${id}.A`
     await h.waitFor(() => h.store.attempts(tid).some((a) => a.status === 'running' && a.pid), 'running')
-    h.clock.t += 46 * 60_000
+    h.clock.t += 610 // observed time exceeds 600ms; long unobserved sleep gaps are tested separately
     await h.waitFor(() => h.store.attempts(tid)[0].status === 'runaway', 'runaway')
     assert.match(h.store.attempts(tid)[0].reason!, /시간 초과/)
     assert.ok(['rework', 'running'].includes(tsk(h, tid).status))

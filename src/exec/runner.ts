@@ -8,7 +8,7 @@ import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import type { Bus } from '../bus.ts'
-import { gameEnabled, gameNeedsUser, gamePlanProblem, gameWaiting, gameWaitSignature, GAME_PLAYTEST_RULES, GAME_WORKER_RULES, readGameManifest } from '../game.ts'
+import { gameEnabled, gameNeedsUser, gamePlanProblem, gameWaiting, gameWaitSignature, gameDecisionReady, GAME_PLAYTEST_RULES, GAME_WORKER_RULES, readGameManifest } from '../game.ts'
 import { GAME_QUALITY_VERSION, GAME_QUALITY_RULES, GAME_QUALITY_SCHEMA, gameQualityProblem } from '../game-quality.ts'
 import { runJsonTurn, reviewModelOf, validateTasks, type Acceptance, type CeoPlan, type PlanTask, type Project } from '../ceo.ts'
 import type { HqConfig } from '../config.ts'
@@ -32,6 +32,7 @@ import { codexBinReadable, real, sandboxProfile, type SandboxOpts } from './sand
 import { extractBashRuns, lastActivityOf, StreamTail } from './stream.ts'
 import { codexArgs, defaultProbe, findOrphan, groupIdentity, identify, killGroup, launch, LaunchAborted, looksLikeWorker, pidAlive, psInfo, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
 import { reconcile as reconcileInvariants, recover as recoverState, type Violation } from './reconcile.ts'
+import { AttemptClock } from './attempt-clock.ts'
 
 export type Notify = (title: string, body: string) => void
 
@@ -153,9 +154,11 @@ export class Runner {
   readonly probe: Probe
   /** Consecutive failures of keyed background jobs and when they may run again (this.now() clock). */
   private failures = new Map<string, { n: number; until: number }>()
+  private attemptClock: AttemptClock
 
   constructor(d: RunnerDeps) {
     this.store = d.store; this.bus = d.bus; this.cfg = d.cfg; this.projects = d.projects; this.hqRoot = d.hqRoot; this.hqPort = d.hqPort
+    this.attemptClock = new AttemptClock(d.store)
     this.notify = d.notify; this.now = d.now; this.ceoLock = d.ceoLock ?? new TurnLock()
     this.teamNames = d.teamNames ?? {}
     this.probe = { ...defaultProbe, ...d.probe }
@@ -281,7 +284,7 @@ export class Runner {
     if (this.store.requestsByStatus(['queued']).some(r => this.project(r.project)?.workflow !== 'game' || gameEnabled(this.store, r.project))) return true
     if (this.store.tasksByStatus(['revising']).some((t) => (this.project(t.project)?.workflow !== 'game' || gameEnabled(this.store, t.project)) && this.store.approval(`revise:${t.id}`)?.state !== 'open')) return true
     return this.store.tasksByStatus(['blocked']).some((t) => this.project(t.project)?.workflow === 'game'
-      ? gameEnabled(this.store, t.project) && !t.lingering && !gameWaiting(this.store, t)
+      ? gameEnabled(this.store, t.project) && !t.lingering && !gameWaiting(this.store, t) && gameDecisionReady(this.store, t, this.now())
       : t.diagnosis === null)
   }
 
@@ -521,6 +524,7 @@ export class Runner {
       exited: false, killAt: null, killed9: false, confirmed: !!spawned, unknownPolls: 0, unknownSince: null }
     if (spawned) spawned.exit.onExit(() => { l.exited = true; this.kick() })
     this.live.set(att.id, l)
+    this.attemptClock.track(att.id, this.now())
     return l
   }
 
@@ -543,7 +547,7 @@ export class Runner {
   /** Time already spent by earlier work attempts of this generation (resume included), for the 3× cap (§13). */
   private spentMs(t: TaskRow, exclude: string): number {
     return this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.id !== exclude && a.generation === t.generation && a.started_at && a.ended_at)
-      .reduce((s, a) => s + Math.max(0, Date.parse(a.ended_at!) - Date.parse(a.started_at!)), 0)
+      .reduce((s, a) => s + this.attemptClock.spent(a), 0)
   }
 
   private async pollLive(): Promise<void> {
@@ -551,6 +555,7 @@ export class Runner {
       if (this.launching.has(att.id)) continue
       const l = this.live.get(att.id)
       if (!l) continue // not adopted (reconcile reports it)
+      const elapsed = this.attemptClock.sample(att.id, this.now())
       const task = this.store.task(att.task_id)
       l.tail.poll((line, s) => {
         if (s.sessionId && s.sessionId !== att.session_id) { this.store.updateAttempt(att.id, { session_id: s.sessionId }); att.session_id = s.sessionId }
@@ -572,7 +577,6 @@ export class Runner {
       if (id === 'same') {
         const now = this.now()
         const wall = this.wallMs(task)
-        const elapsed = now - Date.parse(att.started_at ?? new Date(now).toISOString())
         const total = att.kind === 'work' && task ? this.spentMs(task, att.id) + elapsed : elapsed
         if (!att.outcome && (elapsed > wall || total > 3 * wall || l.tail.sameErrorCount >= 3 || l.tail.toolCount > this.cfg.maxTurns)) {
           const why = elapsed > wall ? `시간 초과 (${Math.round(elapsed / 60_000)}분 > ${wall / 60_000}분)`

@@ -116,6 +116,7 @@ if (schema && (prompt.startsWith('너는 게임팀과 독립된 감독자 피카
   process.exit(0)
 }
 if (schema && (prompt.startsWith('너는 게임팀장이다.') || prompt.startsWith('너는 피카츄 독립 감독자이다.'))) {
+  if (mk('leadnetwork')) { result({ is_error: true, result: 'workspace routing discovery failed' }); process.exit(1) }
   const supervisor = prompt.startsWith('너는 피카츄')
   const wait = !!mk('leadwait') || (!!mk('leadescalate') && !supervisor)
   const repair = mk('leadrepair')

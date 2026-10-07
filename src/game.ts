@@ -21,6 +21,17 @@ export function gameWaiting(store: Store, t: TaskRow): boolean {
   try { return JSON.parse(store.get(`game.waiting:${t.id}`) ?? 'null')?.signature === gameWaitSignature(store, t) } catch { return false }
 }
 
+/** Transport failures are not product decisions and must not consume the leader's repair budget. */
+export function transientDecisionFailure(error: string | null): boolean {
+  return !!error && /workspace routing discovery failed|ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|network (?:is )?unreachable|fetch failed|stream disconnected|connection (?:reset|closed)|\b(?:502|503|504)\b/i.test(error)
+}
+export function gameDecisionReady(store: Store, t: TaskRow, now: number): boolean {
+  try {
+    const retry = JSON.parse(store.get(`game.decision-retry:${t.id}`) ?? 'null')
+    return !retry || retry.signature !== gameWaitSignature(store, t) || !Number.isFinite(retry.until) || now >= retry.until
+  } catch { return true }
+}
+
 /** A technical hold is a status report, not a request for the owner to solve it. */
 export function gameNeedsUser(store: Store, t: TaskRow): boolean {
   if (!gameWaiting(store, t)) return false

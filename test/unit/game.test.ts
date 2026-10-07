@@ -339,6 +339,33 @@ test('order repair rolls back both specs and audit if applying the blocked revis
   } finally { await h.close() }
 })
 
+test('supervisor transport outage backs off persistently without exhausting decisions or starving independent work', async () => {
+  const { h, tid, spec } = repairFixture()
+  try {
+    h.store.updateTask(tid, { spec: JSON.stringify({ ...spec, brief: spec.brief + ' [[FAKE:leadnetwork]]' }) })
+    h.store.set(`game.decisions:${tid}`, '2')
+    h.store.set(`game.decisions-total:${tid}`, '2')
+    await h.engine.tick()
+    assert.equal(h.store.get(`game.decisions:${tid}`), '2')
+    assert.equal(h.store.get(`game.decisions-total:${tid}`), '2')
+    assert.equal(h.store.get(`game.waiting:${tid}`), null)
+    const first = h.store.get(`game.decision-retry:${tid}`)!
+    assert.equal(JSON.parse(first).until, h.clock.t + 60_000)
+    assert.equal(h.runner.ceoWaiting(), false, 'other work may dispatch during transport backoff')
+    await h.engine.tick()
+    assert.equal(h.store.get(`game.decision-retry:${tid}`), first, 'no repeated turn before deadline')
+    h.clock.t += 60_000
+    await h.engine.tick()
+    assert.equal(JSON.parse(h.store.get(`game.decision-retry:${tid}`)!).until, h.clock.t + 120_000)
+    h.store.updateTask(tid, { spec: JSON.stringify(spec) })
+    h.clock.t += 120_000
+    await h.engine.tick()
+    assert.equal(h.store.task(tid)!.status, 'rework')
+    assert.equal(h.store.get(`game.decision-retry:${tid}`), null)
+    assert.equal(h.store.get(`game.decisions-total:${tid}`), '3', 'only a real decision consumes a round')
+  } finally { await h.close() }
+})
+
 test('internal repair actually updates ownership and schedules preserved work for re-review', async () => {
   const { h, tid, spec } = repairFixture()
   try {

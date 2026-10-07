@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { Bus } from './bus.ts'
 import { reviewModelOf, runCeoTurn, runJsonTurn, TASK_SCHEMA, validate, type CeoPlan, type PlanTask, type Project } from './ceo.ts'
 import type { Runner } from './exec/runner.ts'
-import { GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, gameEnabled, gamePlanProblem, gameWaiting, gameWaitSignature } from './game.ts'
+import { GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, gameEnabled, gamePlanProblem, gameWaiting, gameWaitSignature, gameDecisionReady, transientDecisionFailure } from './game.ts'
 import type { TaskRow } from './store.ts'
 import type { Store } from './store.ts'
 
@@ -94,7 +94,8 @@ export class RequestEngine {
         await this.runner.decide(integration.id, choice, integration.subjectHash)
         return true
       }
-      const t = tasks.find(t => !gameWaiting(this.store, t) && (t.status === 'question' || (t.status === 'blocked' && !t.lingering)))
+      const t = tasks.find(t => !gameWaiting(this.store, t) && gameDecisionReady(this.store, t, this.runner.now())
+        && (t.status === 'question' || (t.status === 'blocked' && !t.lingering)))
       if (!t || !this.runner.ceoLock.tryAcquire()) continue
       try {
         const rounds = Number(this.store.get(`game.decisions:${t.id}`) ?? 0)
@@ -127,6 +128,19 @@ export class RequestEngine {
         if (!result.ok && /Not logged in|authentication|unauthorized|401|refresh.token/i.test(result.error ?? '')) { this.runner.requireLogin(result.error ?? 'Not logged in'); return true }
         const current = this.store.task(t.id)
         if (!gameEnabled(this.store, p.id) || !current || gameWaitSignature(this.store, current) !== signature || !['executing', 'blocked'].includes(this.store.request(r.id)?.status ?? '')) return true
+        if (!result.ok && transientDecisionFailure(result.error)) {
+          const key = `game.decision-retry:${t.id}`
+          let prior: { signature?: string; failures?: number } | null = null
+          try { prior = JSON.parse(this.store.get(key) ?? 'null') } catch {}
+          const failures = prior?.signature === signature ? Math.max(0, Number(prior.failures) || 0) + 1 : 1
+          const delay = Math.min(15 * 60_000, 60_000 * 2 ** Math.min(failures - 1, 4))
+          const until = this.runner.now() + delay
+          this.store.set(key, JSON.stringify({ signature, failures, until, error: result.error }))
+          this.store.updateTask(t.id, { note: `감독자 연결 오류 · ${Math.round(delay / 60_000)}분 후 자동 복구 판단 재시도: ${result.error}` })
+          this.bus.emit({ kind: 'task', text: '감독자 연결 복구 대기 · 판단 예산 유지 · 독립 작업은 계속', data: { id: t.id } })
+          return true
+        }
+        this.store.set(`game.decision-retry:${t.id}`, null)
         this.store.set(`game.decisions:${t.id}`, String(rounds + 1))
         this.store.set(`game.decisions-total:${t.id}`, String(totalRounds + 1))
         const o = result.output as GameDecision | null
