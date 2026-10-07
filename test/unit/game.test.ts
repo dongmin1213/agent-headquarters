@@ -122,6 +122,29 @@ test('one game request creates and starts a reviewed profession plan without ask
   } finally { h.engine.stop(); await h.close() }
 })
 
+test('explicit game failure and scope blocks reach the leader before any duplicate worker or diagnosis turn', async () => {
+  for (const outcome of ['failed', 'blocked']) {
+    const h = harness()
+    try {
+      h.projects[0].workflow = 'game'
+      const id = h.plan([task('A', { department: 'gameplay', brief: `[[FAKE:outcome=${outcome}]]` })])
+      await h.approve(id)
+      await h.waitFor(() => h.store.task(`${id}.A`)?.status === 'blocked')
+      for (let i = 0; i < 4; i++) await h.runner.tick()
+      const t = h.store.task(`${id}.A`)!
+      assert.equal(h.store.attempts(t.id).length, 1, 'no identical worker retry before a repair decision')
+      assert.equal(t.diagnosis, null, 'no duplicate paid diagnosis prerequisite')
+      assert.equal(t.revise_turns, 0, 'no separate revision turn before the game leader')
+      assert.equal(h.runner.ceoLock.busy, false)
+      assert.equal(h.runner.ceoWaiting(), true)
+      assert.equal(h.runner.views().headline.needsYou, 0)
+      await h.engine.tick()
+      assert.ok(h.store.get(`game.decision:${t.id}:1`), 'leader receives failure with no diagnosis row')
+      assert.notEqual(h.store.task(t.id)?.status, 'blocked')
+    } finally { await h.close() }
+  }
+})
+
 test('game team leader uses Sol first and escalates repeated decisions to Astra', async () => {
   for (const rounds of [0, 1]) {
     const h = harness()
@@ -216,6 +239,8 @@ test('internal repair actually updates ownership and schedules preserved work fo
   const { h, tid, spec } = repairFixture()
   try {
     const before = readFileSync(join(h.repo, 'README.md'), 'utf8')
+    h.store.updateTask(tid, { diagnosis: null })
+    h.store.updateRequest(h.store.task(tid)!.request_id, { note: '작업 level 판단 필요' })
     await h.engine.tick()
     const t = h.store.task(tid)!
     assert.equal(t.status, 'rework')
@@ -226,6 +251,7 @@ test('internal repair actually updates ownership and schedules preserved work fo
     assert.ok(updated.owns.includes('gameplay/actor.gd'))
     assert.deepEqual(updated.acceptance, spec.acceptance)
     assert.deepEqual(updated.review, spec.review)
+    assert.equal(h.store.request(t.request_id)?.note, null, 'obsolete blocked message clears after internal repair')
     assert.equal(h.runner.views().headline.needsYou, 0)
   } finally { await h.close() }
 })

@@ -275,7 +275,9 @@ export class Runner {
   ceoWaiting(): boolean {
     if (this.store.requestsByStatus(['queued']).some(r => this.project(r.project)?.workflow !== 'game' || gameEnabled(this.store, r.project))) return true
     if (this.store.tasksByStatus(['revising']).some((t) => (this.project(t.project)?.workflow !== 'game' || gameEnabled(this.store, t.project)) && this.store.approval(`revise:${t.id}`)?.state !== 'open')) return true
-    return this.store.tasksByStatus(['blocked']).some((t) => (this.project(t.project)?.workflow !== 'game' || gameEnabled(this.store, t.project)) && t.diagnosis === null)
+    return this.store.tasksByStatus(['blocked']).some((t) => this.project(t.project)?.workflow === 'game'
+      ? gameEnabled(this.store, t.project) && !t.lingering && !gameWaiting(this.store, t)
+      : t.diagnosis === null)
   }
 
   observe(line: Record<string, unknown>): void {
@@ -734,7 +736,8 @@ export class Runner {
           break
         }
         case 'brief_blocked':
-          if (t.revise_turns >= MAX_REVISE_TURNS) this.block(t, `지시서를 ${t.revise_turns}번 고쳤는데도 작업자가 멈췄어요: ${reason}`)
+          if (this.project(t.project)?.workflow === 'game') this.block(t, `게임팀장 수정 판단 필요: ${reason}`)
+          else if (t.revise_turns >= MAX_REVISE_TURNS) this.block(t, `지시서를 ${t.revise_turns}번 고쳤는데도 작업자가 멈췄어요: ${reason}`)
           else this.tset(t, { status: 'revising', note: reason })
           break
         case 'question': {
@@ -765,7 +768,10 @@ export class Runner {
           break
         }
         default: // failed, runaway
-          this.rework(t, j.outcome === 'runaway' ? `폭주로 중단: ${att.reason ?? ''}` : reason ?? '실패')
+          // A worker's explicit rejection needs a new plan/scope, not another identical paid attempt.
+          if (j.outcome === 'failed' && j.done?.outcome === 'failed' && this.project(t.project)?.workflow === 'game')
+            this.block(t, `게임팀장 수정 판단 필요: ${reason}`)
+          else this.rework(t, j.outcome === 'runaway' ? `폭주로 중단: ${att.reason ?? ''}` : reason ?? '실패')
       }
       this.emitTask(t, `${t.title}: 시도 판정 ${j.outcome}`)
     })
@@ -1988,7 +1994,7 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
   /** A blocked request goes back to executing once nothing in it needs the chairman any more. Call inside a tx. */
   private unblockRequest(requestId: string): void {
     const r = this.store.request(requestId)!
-    if (r.status !== 'blocked') return
+    if (r.status !== 'blocked' && !(r.status === 'executing' && r.note?.startsWith('작업 ') && r.note.endsWith(' 판단 필요'))) return
     if (this.store.tasks(requestId).some((x) => x.status === 'blocked')) return
     if (this.store.mergeRows(requestId).some((m) => ['conflict', 'failed'].includes(m.state))) return
     this.store.updateRequest(requestId, { status: 'executing', note: null })
@@ -2133,7 +2139,10 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
   // ----- CEO diagnosis of blocked / integration items (§17) -----
   private async diagnoseOne(): Promise<void> {
     if (!this.canStartCeo() || this.ceoLock.busy) return
-    const t = this.store.tasksByStatus(['blocked']).find((x) => x.diagnosis === null && !this.diagnosing.has(x.id) && this.jobReady(`diagnose:${x.id}`))
+    // The game leader already reads the same evidence and decides a repair. Do not spend a separate
+    // read-only diagnosis turn (or wait for it) before dispatching that decision.
+    const t = this.store.tasksByStatus(['blocked']).find((x) => this.project(x.project)?.workflow !== 'game'
+      && x.diagnosis === null && !this.diagnosing.has(x.id) && this.jobReady(`diagnose:${x.id}`))
     const m = t ? null : this.store.requestsByStatus(['blocked', 'executing', 'accepted']).flatMap((r) => this.store.mergeRows(r.id))
       .find((x) => ['conflict', 'failed'].includes(x.state) && x.diagnosis === null && !this.diagnosing.has(`${x.request_id}:${x.project}`)
         && this.jobReady(`diagnose:${x.request_id}:${x.project}`))

@@ -93,7 +93,7 @@ export class RequestEngine {
         await this.runner.decide(integration.id, choice, integration.subjectHash)
         return true
       }
-      const t = tasks.find(t => !gameWaiting(this.store, t) && (t.status === 'question' || (t.status === 'blocked' && !t.lingering && t.diagnosis !== null)))
+      const t = tasks.find(t => !gameWaiting(this.store, t) && (t.status === 'question' || (t.status === 'blocked' && !t.lingering)))
       if (!t || !this.runner.ceoLock.tryAcquire()) continue
       try {
         const rounds = Number(this.store.get(`game.decisions:${t.id}`) ?? 0)
@@ -110,6 +110,7 @@ export class RequestEngine {
           prompt: `너는 ${supervisor ? '피카츄 독립 감독자' : '게임팀장'}이다.\n${GAME_ECONOMY_RULES}\n${GAME_PLAYTEST_RULES}\n사용자에게 세부 기획·구현 판단을 떠넘기지 않고 해결한다. ${supervisor ? '팀장의 판단을 그대로 전달하지 말고 실제 코드·실패 증거·기존 위임 범위를 대조하여 재검토한다.' : '현재 작업 파일과 선행 기획을 확인해 실행 가능한 결정을 내린다.'}\n요청: ${r.text}\n작업: ${t.spec}\n상태: ${t.status}\n문제: ${t.note}\n진단: ${t.diagnosis}\n질문: ${JSON.stringify(questions)}\n전체 작업 계약: ${JSON.stringify(tasks.map(x => ({ key: x.key, status: x.status, project: x.project, role: x.role, head_sha: x.head_sha, owns: JSON.parse(x.spec).owns, depends_on: JSON.parse(x.spec).depends_on })))}\n이전 내부 판단: ${previous}\n
 출력 계약:
 - answer에 확인한 원인·근거, 선택한 수정, 재검 방법을 구체적으로 기록한다. 실패한 방법을 바꾸지 않은 단순 재시도는 금지한다.
+- 작업자가 failed/blocked로 명시적으로 반려한 경우 같은 작업을 그대로 재시작하지 않는다. 선행 결과의 아트·지형 품질 문제가 원인이면 해당 파일과 담당/소유 범위를 확인하고, 수정 가능한 owns와 구체적인 brief를 revised_task로 재배정한다. 읽기 전용 진단만 남겨도 복구된 것으로 간주하지 않는다. 독립 검수와 원래 품질 기준은 유지한다. 답변은 한국어로 쓴다.
 - 현재 범위에서 해결 가능하면 proceed=true, revised_task=null로 구체적인 작업 지시를 낸다.
 - 병렬 작업의 자산/코드가 없다고 보고되면 전체 작업 계약의 해당 담당자 상태와 승인된 head_sha를 먼저 확인한다. 이미 완성된 다른 분기의 결과가 현재 checkout에 없는 경우 해당 작업을 depends_on에 추가한다. HQ는 새 기준 커밋을 제공하고 기존 구현을 보존하여 재배치·재검수한다. 이때 자산을 재생성하거나 소유 범위를 빼앗지 않는다. 담당 작업이 아직 실행 중이면 필요 의존을 추가해 완료를 기다리며 같은 검사를 재시도하지 않는다.
 - 소유 범위 때문에 막혔으면 proceed=true와 현재 작업의 revised_task 전체를 제출한다. API가 실제 재배정과 재실행을 처리한다. 다른 담당자에게 반환한다고 적는 것만으로는 아무 작업도 재배정되지 않는다.
