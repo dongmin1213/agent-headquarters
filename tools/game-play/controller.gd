@@ -9,6 +9,11 @@ var capture_index := 0
 var last_request := ""
 var started_usec := Time.get_ticks_usec()
 var frame_log: FileAccess
+var event_log: FileAccess
+var phase := ""
+var settle_frame := 0
+var timeline: Array = []
+var before_pause := ""
 const KEYS = {"A":KEY_A,"D":KEY_D,"W":KEY_W,"S":KEY_S,"J":KEY_J,"K":KEY_K,"L":KEY_L,"Z":KEY_Z,"X":KEY_X,"C":KEY_C,"E":KEY_E,"SPACE":KEY_SPACE,"ENTER":KEY_ENTER,"ESCAPE":KEY_ESCAPE,"TAB":KEY_TAB,"UP":KEY_UP,"DOWN":KEY_DOWN,"LEFT":KEY_LEFT,"RIGHT":KEY_RIGHT}
 func _initialize() -> void:
  var args := OS.get_cmdline_user_args()
@@ -18,6 +23,7 @@ func _initialize() -> void:
   return
  channel = args[1]
  frame_log = FileAccess.open(channel+"/frames.jsonl",FileAccess.WRITE)
+ event_log = FileAccess.open(channel+"/events.jsonl",FileAccess.WRITE)
  call_deferred("boot")
 func boot() -> void:
  var scene: PackedScene = load(ProjectSettings.get_setting("application/run/main_scene"))
@@ -37,6 +43,22 @@ func response(value: Dictionary) -> void:
  f.store_string(JSON.stringify(value))
  f.close()
  DirAccess.rename_absolute(channel+"/response.tmp",channel+"/response.json")
+func record_event(kind: String, data: Dictionary = {}) -> void:
+ var row := {"event":kind,"request":active.get("id",last_request),"usec":Time.get_ticks_usec(),"physics_frame":Engine.get_physics_frames()}
+ row.merge(data)
+ event_log.store_line(JSON.stringify(row))
+ event_log.flush()
+ if not active.is_empty(): timeline.append(row)
+func press_keys(keys: Array) -> void:
+ for key in keys:
+  var code: int = KEYS[key]
+  var event := InputEventKey.new()
+  event.physical_keycode = code
+  event.keycode = code
+  event.pressed = true
+  held.append(code)
+  Input.parse_input_event(event)
+  record_event("key_down",{"key":key})
 func release_keys() -> void:
  for code in held:
   var event := InputEventKey.new()
@@ -44,7 +66,60 @@ func release_keys() -> void:
   event.keycode = code
   event.pressed = false
   Input.parse_input_event(event)
+  record_event("key_up",{"keycode":code})
  held.clear()
+func capture(path: String) -> int:
+ var started := Time.get_ticks_usec()
+ var img := root.get_texture().get_image()
+ var read_usec := Time.get_ticks_usec()-started
+ var error := img.save_png(path)
+ record_event("capture",{"read_usec":read_usec,"total_usec":Time.get_ticks_usec()-started,"path":path,"error":error})
+ return error
+func begin_action() -> void:
+ phase = "action"
+ record_event("action_start",{"seconds":active.seconds})
+ press_keys(active.keys)
+ until_usec = Time.get_ticks_usec()+int(float(active.seconds)*1000000)
+func finish_action() -> void:
+ var shot := channel+"/shot-"+str(active.id)+".png"
+ var error := capture(shot)
+ var timing_file := channel+"/timing-"+str(active.id)+".json"
+ var timing_out := FileAccess.open(timing_file,FileAccess.WRITE)
+ timing_out.store_string(JSON.stringify(timeline))
+ timing_out.close()
+ response({"id":active.id,"screenshot":shot,"before_pause":before_pause,"capture_error":error,"wall_usec":Time.get_ticks_usec(),"frames":capture_index,"input":"agent physical-key events","human_playtest":false,"pause_requested":active.get("pause_after",false),"timing_file":timing_file})
+ active = {}
+ timeline = []
+ before_pause = ""
+func advance_action() -> void:
+ if phase == "resume_settle":
+  if Engine.get_physics_frames() >= settle_frame: begin_action()
+  return
+ if phase == "pause_settle":
+  if Engine.get_physics_frames() >= settle_frame:
+   phase = "pause_key"
+   press_keys(["ESCAPE"])
+   until_usec = Time.get_ticks_usec()+60000
+  return
+ if phase == "finish_settle":
+  if Engine.get_physics_frames() >= settle_frame: finish_action()
+  return
+ if Time.get_ticks_usec() < until_usec: return
+ release_keys()
+ if phase == "resume_key":
+  phase = "resume_settle"
+  settle_frame = Engine.get_physics_frames()+1
+ elif phase == "action":
+  record_event("action_end")
+  if active.get("pause_after",false):
+   before_pause = channel+"/before-pause-"+str(active.id)+".png"
+   capture(before_pause)
+   phase = "pause_settle"
+   settle_frame = Engine.get_physics_frames()+1
+  else: finish_action()
+ elif phase == "pause_key":
+  phase = "finish_settle"
+  settle_frame = Engine.get_physics_frames()+1
 func after_draw() -> void:
  frame_index += 1
  if Time.get_ticks_usec()-started_usec > 900000000:
@@ -53,17 +128,12 @@ func after_draw() -> void:
   return
  if frame_index % 6 == 0:
   var path := channel+"/frames/%06d.png" % capture_index
-  root.get_texture().get_image().save_png(path)
+  capture(path)
   frame_log.store_line(JSON.stringify({"index":capture_index,"wall_usec":Time.get_ticks_usec(),"request":active.get("id", "idle")}))
   frame_log.flush()
   capture_index += 1
  if not active.is_empty():
-  if Time.get_ticks_usec() >= until_usec:
-   release_keys()
-   var shot := channel+"/shot-"+str(active.id)+".png"
-   var error := root.get_texture().get_image().save_png(shot)
-   response({"id":active.id,"screenshot":shot,"capture_error":error,"wall_usec":Time.get_ticks_usec(),"frames":capture_index,"input":"agent physical-key events", "human_playtest":false})
-   active = {}
+  advance_action()
   return
  if not FileAccess.file_exists(channel+"/request.json"): return
  var request = JSON.parse_string(FileAccess.get_file_as_string(channel+"/request.json"))
@@ -89,13 +159,17 @@ func after_draw() -> void:
   if not KEYS.has(key):
    response({"id":last_request,"error":"unsupported key"})
    return
+ if not request.get("pause_after",false) is bool or not request.get("resume_before",false) is bool:
+  response({"id":last_request,"error":"pause flags must be booleans"})
+  return
+ if (request.get("pause_after",false) or request.get("resume_before",false)) and "ESCAPE" in request.keys:
+  response({"id":last_request,"error":"ESCAPE action cannot be combined with pause flags"})
+  return
  active = request
- until_usec = Time.get_ticks_usec()+int(seconds*1000000)
- for key in request.keys:
-  var code: int = KEYS[key]
-  var event := InputEventKey.new()
-  event.physical_keycode = code
-  event.keycode = code
-  event.pressed = true
-  held.append(code)
-  Input.parse_input_event(event)
+ timeline = []
+ record_event("request_received")
+ if request.get("resume_before",false):
+  phase = "resume_key"
+  press_keys(["ESCAPE"])
+  until_usec = Time.get_ticks_usec()+60000
+ else: begin_action()
