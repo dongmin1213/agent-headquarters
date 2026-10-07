@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Interactive Godot pixel/key transport; no fixture, replay, or state-changing API."""
-import argparse, hashlib, json, os, pathlib, shutil, subprocess, time
+import argparse, hashlib, json, os, pathlib, shutil, subprocess, time, re
 HERE=pathlib.Path(__file__).resolve().parent
 
 def restore_save(source, destination, expected_file):
@@ -22,7 +22,10 @@ def restore_save(source, destination, expected_file):
 
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('op',choices=['start','step','stop']);p.add_argument('--session',required=True,type=pathlib.Path);p.add_argument('--project',type=pathlib.Path);p.add_argument('--keys',default='');p.add_argument('--seconds',type=float,default=0.1);p.add_argument('--pause-after',action='store_true');p.add_argument('--resume-before',action='store_true');p.add_argument('--restore-session',type=pathlib.Path);p.add_argument('--expected-save-hashes',type=pathlib.Path);a=p.parse_args()
+ p=argparse.ArgumentParser();p.add_argument('op',choices=['start','step','stop']);p.add_argument('--session',required=True,type=pathlib.Path);p.add_argument('--project',type=pathlib.Path);p.add_argument('--keys',default='');p.add_argument('--seconds',type=float,default=0.1);p.add_argument('--pause-after',action='store_true');p.add_argument('--resume-before',action='store_true');p.add_argument('--restore-session',type=pathlib.Path);p.add_argument('--expected-save-hashes',type=pathlib.Path);p.add_argument('--resolution',default='1440x810');a=p.parse_args()
+ if not re.fullmatch(r'[0-9]{3,4}x[0-9]{3,4}',a.resolution):p.error('resolution must be WIDTHxHEIGHT')
+ width,height=map(int,a.resolution.split('x'))
+ if not (320<=width<=3840 and 180<=height<=2160):p.error('resolution is outside supported capture bounds')
  channel=a.session.resolve()
  if bool(a.restore_session)!=bool(a.expected_save_hashes):p.error('restore requires both original session and expected hashes')
  if a.restore_session and a.op!='start':p.error('restore is only valid for start')
@@ -35,7 +38,7 @@ def main():
    (channel/'restore-receipt.json').write_text(json.dumps(receipt,indent=2))
   env={**os.environ,'XDG_DATA_HOME':str(channel/'userdata')}
   log=open(channel/'engine.log','w')
-  command=[shutil.which('godot') or 'godot','--path',str(a.project.resolve()),'--log-file',str(channel/'godot.log'),'--rendering-method','gl_compatibility','--resolution','960x540','--max-fps','60','--audio-driver','Dummy','--script',str(HERE/'controller.gd'),'--','--hq-play-channel',str(channel)]
+  command=[shutil.which('godot') or 'godot','--path',str(a.project.resolve()),'--log-file',str(channel/'godot.log'),'--rendering-method','gl_compatibility','--resolution',a.resolution,'--max-fps','60','--audio-driver','Dummy','--script',str(HERE/'controller.gd'),'--','--hq-play-channel',str(channel)]
   proc=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT,env=env,start_new_session=True);log.close()
   (channel/'session.json').write_text(json.dumps({'pid':proc.pid,'project':str(a.project.resolve()),'command':command,'started_at':time.time(),'helper_sha256':hashlib.sha256((HERE/'controller.gd').read_bytes()).hexdigest(),'input_method':'agent live physical-key events, no fixture/state injection','audio':'Dummy, not audio evidence'}))
   wanted='ready'
