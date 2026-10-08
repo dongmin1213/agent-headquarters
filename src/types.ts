@@ -162,6 +162,8 @@ export interface DecisionItem {
   kind: 'system' | 'plan' | 'ceo_question' | 'worker_question' | 'revise' | 'blocked' | 'integration' | 'accept' | 'merge' | 'team'
   /** Display label overriding the kind's default (e.g. '사장 질문' for a CEO revise question answered like a worker question). */
   label?: string
+  /** False for an internal incident report; never counted as an owner decision. */
+  requiresDecision?: boolean
   /** Team that posted a 'team' decision. */
   teamId?: string
   /** Stable id: approval id, question id, or task id. Notifications dedupe on id + revision. */

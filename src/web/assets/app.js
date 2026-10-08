@@ -338,8 +338,8 @@ function renderDecisions() {
   const collapsed = ui.decisionsCollapsed
   swap(el,
     h('div', { class: 'section-head' },
-      h('h2', { id: 'decisions-title', class: 'section-title' }, '회장님 결정'),
-      h('span', { class: 'count' }, `${items.length}건`),
+      h('h2', { id: 'decisions-title', class: 'section-title' }, items.some(d => d.requiresDecision === false) ? '결정과 내부 보고' : '회장님 결정'),
+      h('span', { class: 'count' }, `결정 ${items.filter(d => d.requiresDecision !== false).length}건 · 보고 ${items.filter(d => d.requiresDecision === false).length}건`),
       h('button', { class: 'btn btn-small section-toggle', type: 'button', 'data-fkey': 'decisions-toggle', 'aria-expanded': collapsed ? 'false' : 'true', 'aria-controls': 'decision-grid',
         onclick: () => { ui.decisionsCollapsed = !ui.decisionsCollapsed; try { localStorage.setItem('hq.decisionsCollapsed', ui.decisionsCollapsed ? '1' : '0') } catch { /* storage unavailable */ } sigs.delete('decisions'); renderDecisions() } },
       collapsed ? '펼치기' : '접기')),
@@ -366,7 +366,7 @@ function decisionCard(d) {
     tkey ? taskLink(d.requestId, tkey) : reqLink(d.requestId),
   ]
   const opts = Array.isArray(d.options) ? d.options : []
-  const optLabel = (o) => (d.kind === 'blocked' ? BLOCKED_LABEL[o] ?? o : o)
+  const optLabel = (o) => d.requiresDecision === false && o === '보류 유지' ? '보고 확인' : (d.kind === 'blocked' ? BLOCKED_LABEL[o] ?? o : o)
   const rec = d.recommendation && typeof d.recommendation.option === 'string' && opts.includes(d.recommendation.option) ? d.recommendation : null
   const help = d.optionHelp && typeof d.optionHelp === 'object' ? d.optionHelp : {}
   const explain = explainBlock(d, rec, opts, optLabel, help)
@@ -389,7 +389,7 @@ function decisionCard(d) {
   } else if (d.kind === 'blocked') {
     // Options are wire values (retry|release|skip|stop); unknown values are shown but cannot be sent.
     opts.forEach((decision, i) => {
-      const label = BLOCKED_LABEL[decision] ?? decision
+      const label = optLabel(decision)
       const known = decision in BLOCKED_LABEL
       const send = () => post(`/tasks/${enc(d.taskId ?? '')}/decide`, { decision, revision: d.revision }, decision === 'stop' ? '요청을 중단했어요' : `${label} — 보냈어요`)
       if (ui.confirm.has(`${key}:${decision}`)) { actions.push(confirmRow(key, d, decision, label, busy, send)); return }

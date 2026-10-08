@@ -12,6 +12,17 @@ const q = { mode: 'normal' as const, until: null, window: null, pct: null }
 const base: HeadlineInput = { decisions: [], failures: [], workers: [], ceoThinking: false, waiting: 0, quota: q, recentMerged: null }
 const w = (o: Partial<WorkerView>): WorkerView => ({ attemptId: 'a', taskId: 't', requestId: 'r', title: '로그인 고치기', project: 'p', role: 'implement', model: 'sonnet', kind: 'work', state: 'running', bubble: '', startedAt: '', ...o })
 
+test('internal incident stays visible without impersonating an owner decision', () => {
+  const report = { kind: 'blocked', title: '수정 배정 필요', requiresDecision: false } as DecisionItem
+  assert.deepEqual(buildHeadline({ ...base, decisions: [report] }), {
+    text: '내부 복구 보류 · 수정 배정 필요', needsYou: 0,
+  })
+  const decision = { kind: 'worker_question', title: '외부 권한 확인' } as DecisionItem
+  assert.deepEqual(buildHeadline({ ...base, decisions: [report, decision] }), {
+    text: '회장님 결정 1건: 외부 권한 확인', needsYou: 1,
+  })
+})
+
 test('18. headline sentences', () => {
   const d = { kind: 'plan', title: '계획 승인: X' } as DecisionItem
   assert.deepEqual(buildHeadline({ ...base, decisions: [d, d] }), { text: '회장님 결정 2건: 계획 승인: X', needsYou: 2 })

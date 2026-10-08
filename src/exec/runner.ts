@@ -2491,7 +2491,7 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
       const k = `notified:${d.id}:${d.revision}`
       if (this.store.get(k)) continue
       this.store.set(k, this.iso())
-      this.notify(titles[d.kind], d.title)
+      this.notify(d.requiresDecision === false ? '내부 복구 보류 보고' : titles[d.kind], d.title)
     }
   }
 
@@ -2529,15 +2529,15 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
           history.push(`새 통합·검증 별도 진단 (요청당 1회 사용): ${(decision?.error || decision?.answer || reserve.error || (reserve.limited ? '사용 한도로 진단 미완료' : '진단 완료를 확인하지 못했습니다')).slice(0, 1600)}`)
         }
       } catch { /* Older reports have no reserve record. */ }
-      const options = [...(total < 9 && gameEnabled(this.store, t.project) ? [GAME_REASSESS] : []), GAME_KEEP_HOLD, 'stop']
+      const options = [...(total < 9 && gameEnabled(this.store, t.project) ? [GAME_REASSESS] : []), GAME_KEEP_HOLD]
       // A report is visible even though the owner is not being asked to solve the technical defect.
-      items.push({ kind: 'blocked', label: '자동 복구 중단 보고', id: `game-hold:${t.id}`, requestId: t.request_id,
-        taskId: t.id, revision: t.block_count, title: `자동 복구가 멈췄어요: ${t.title}`,
+      items.push({ kind: 'blocked', label: '내부 처리 상황', requiresDecision: false, id: `game-hold:${t.id}`, requestId: t.request_id,
+        taskId: t.id, revision: t.block_count, title: `수정 배정이 필요해요: ${t.title}`,
         detail: `보고된 문제와 중단 이유:\n${t.note ?? '미해결'}\n\n이미 시도한 판단 (${rounds}회, 누적 ${total}/9회):\n${history.join('\n\n') || '추가 판단 기록 없음'}\n\n자동 재시도는 중단된 상태입니다. 기존 결과와 검수 기준은 보존됩니다. ${total < 9 ? '재진단은 피카츄 판단 1회를 요청하며, 같은 작업자를 즉시 재시작하지 않습니다.' : '누적 판단 상한에 도달해 원인 수정 전 추가 재진단은 제공하지 않습니다.'}`,
-        situation: '내부 복구를 마치지 못해 작업이 보류됐어요 · 문제와 시도한 조치를 확인해 주세요', cause: t.note,
+        situation: '게임팀장·피카츄의 내부 복구가 보류됐습니다. 사용자 승인을 기다리는 문제가 아닙니다. 현재 자동 재개는 중단됐고, 구체적인 원인 수정·재배정이 필요합니다.', cause: t.note,
         causeConfirmed: false, recommendation: null, options,
         optionHelp: { [GAME_REASSESS]: '피카츄가 실패 근거와 수정 방법을 한 번 더 판단해요 · 사용량이 들며 누적 9회 상한은 유지해요',
-          [GAME_KEEP_HOLD]: '보고를 확인하고 보류 상태와 결과물을 유지해요 · 새 문제나 복구 시도 후에는 다시 알려요', stop: '요청 전체를 중단해요 · 기존 결과는 보존해요' },
+          [GAME_KEEP_HOLD]: '이 보고만 읽음 처리합니다. 문제 해결·재개·보류 승인으로 처리하지 않습니다. 새 문제가 생기면 다시 표시합니다.' },
         confirm: { stop: '정말 중단할까요? · 되돌릴 수 없어요' }, subjectHash: null,
         detailPath: `/ui/#request=${encodeURIComponent(t.request_id)}&task=${encodeURIComponent(t.id)}`, createdAt: t.updated_at })
     }

@@ -47,6 +47,8 @@ struct QuotaView: Decodable {
 /// Everything the chairman can act on, already ordered by the daemon (execution.md §17).
 struct DecisionItem: Decodable {
     let kind: String; let id: String
+    var requiresDecision: Bool? = nil
+    var label: String? = nil
     var revision: Int? = nil; var requestId: String? = nil; var taskId: String? = nil
     var title: String? = nil; var detail: String? = nil; var options: [String]? = nil; var subjectHash: String? = nil
     var situation: String? = nil; var cause: String? = nil; var causeConfirmed: Bool? = nil
@@ -490,7 +492,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         let content = panel.contentView!
         let reqs = s.requests ?? []
         let items = offline ? [] : (s.decisions ?? [])
-        let needsYou = offline ? 0 : (s.decisions?.count ?? s.headline?.needsYou ?? 0)
+        let needsYou = offline ? 0 : (s.decisions?.filter { $0.requiresDecision != false }.count ?? s.headline?.needsYou ?? 0)
 
         // CEO: bubble = "확인해 주세요 (N)" while decisions wait, else the headline, else none (§19).
         let active = reqs.first { ["thinking", "asking", "planned", "queued", "executing"].contains($0.status) } ?? reqs.first
@@ -739,7 +741,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         guard let known = knownDecisions, notifyOK else { return }
         for d in items where !known.contains(d.key) {
             let c = UNMutableNotificationContent()
-            c.title = "회장님 결정 필요"; c.body = d.title ?? d.kind; c.subtitle = firstLine(d.detail)
+            c.title = d.requiresDecision == false ? "내부 복구 보류 보고" : "회장님 결정 필요"; c.body = d.title ?? d.kind; c.subtitle = firstLine(d.detail)
             UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: d.key, content: c, trigger: nil)) { _ in }
         }
     }
@@ -1009,7 +1011,10 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         var header: [NSView] = [text("사장", size: 15, weight: .bold)]
         if offline { header.append(text("hq 데몬이 꺼져 있어요. 켜진 뒤에 요청할 수 있어요.", size: 12.5, color: Palette.alert)) }
         else if let h = snapshot?.headline, !h.text.isEmpty { header.append(text(h.text, size: 12.5, color: Palette.muted)) }
-        let seg = NSSegmentedControl(labels: ["내 차례 \(items.count)", "새 요청", "사용량"], trackingMode: .selectOne, target: self, action: #selector(tabChanged(_:)))
+        let decisions = items.filter { $0.requiresDecision != false }.count
+        let reports = items.count - decisions
+        let inboxLabel = reports > 0 ? "내 차례 \(decisions) · 보고 \(reports)" : "내 차례 \(decisions)"
+        let seg = NSSegmentedControl(labels: [inboxLabel, "새 요청", "사용량"], trackingMode: .selectOne, target: self, action: #selector(tabChanged(_:)))
         seg.segmentDistribution = .fillEqually; seg.font = .systemFont(ofSize: 13)
         seg.widthAnchor.constraint(equalToConstant: Pet.innerWidth).isActive = true
         seg.selectedSegment = ceoTab
@@ -1048,7 +1053,10 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         return nil
     }
 
-    func optionLabel(_ d: DecisionItem, _ o: String) -> String { d.kind == "blocked" ? (Pet.blockedLabels[o] ?? o) : o }
+    func optionLabel(_ d: DecisionItem, _ o: String) -> String {
+        if d.requiresDecision == false && o == "보류 유지" { return "보고 확인" }
+        return d.kind == "blocked" ? (Pet.blockedLabels[o] ?? o) : o
+    }
 
     /// 내 차례: one card per DecisionItem in the daemon's order.
     func decisionsBody() -> NSStackView {
@@ -1058,7 +1066,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         if items.isEmpty { body.addArrangedSubview(text("지금 하실 결정은 없어요.", color: Palette.muted)); return body }
         for (i, d) in items.enumerated() {
             let card = vstack(spacing: 8)
-            if let chip = Pet.kindLabels[d.kind] { card.addArrangedSubview(text(chip, size: 11.5, weight: .semibold, color: Palette.muted)) }
+            if let chip = d.label ?? Pet.kindLabels[d.kind] { card.addArrangedSubview(text(chip, size: 11.5, weight: .semibold, color: Palette.muted)) }
             card.addArrangedSubview(text(d.title ?? d.kind, size: 14, weight: .bold, width: Pet.cardText))
             let situation = (d.situation?.isEmpty == false ? d.situation : d.detail) ?? ""
             if !situation.isEmpty { card.addArrangedSubview(text(situation, width: Pet.cardText)) }

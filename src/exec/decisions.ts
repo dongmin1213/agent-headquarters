@@ -265,8 +265,11 @@ export interface HeadlineInput {
 }
 
 export function buildHeadline(h: HeadlineInput): Headline {
-  const needsYou = h.decisions.length
-  if (needsYou) return { text: `회장님 결정 ${needsYou}건: ${h.decisions[0].title}`, needsYou }
+  const decisions = h.decisions.filter(d => d.requiresDecision !== false)
+  const needsYou = decisions.length
+  if (needsYou) return { text: `회장님 결정 ${needsYou}건: ${decisions[0].title}`, needsYou }
+  const report = h.decisions.find(d => d.requiresDecision === false)
+  if (report) return { text: `내부 복구 보류 · ${report.title}`, needsYou }
   if (h.failures.length) return { text: `막혔어요 · ${h.failures[0].title}: ${h.failures[0].reason.split('\n')[0].slice(0, 80)}`, needsYou }
   const active = h.workers.filter((w) => w.state !== 'held' && w.state !== 'blocked')
   if (active.length) {

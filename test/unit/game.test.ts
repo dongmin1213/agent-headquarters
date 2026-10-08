@@ -219,8 +219,9 @@ test('supervisor distinguishes owner decisions from technical holds, without rep
         const report = h.runner.views().decisions.find(d => d.id === `game-hold:${a.id}`)!
         assert.equal(report.kind, 'blocked')
         assert.match(report.detail!, /이미 시도한 판단/)
-        assert.deepEqual(report.options, [GAME_REASSESS, GAME_KEEP_HOLD, 'stop'])
-        assert.equal(h.runner.views().headline.needsYou, 1)
+        assert.deepEqual(report.options, [GAME_REASSESS, GAME_KEEP_HOLD])
+        assert.equal(report.requiresDecision, false)
+        assert.equal(h.runner.views().headline.needsYou, 0)
       }
       const count = h.store.get(`game.decisions:${a.id}`)
       await h.engine.tick(); await h.engine.tick()
@@ -285,7 +286,7 @@ test('technical hold report can be acknowledged and a new occurrence becomes vis
     await h.engine.tick()
     const next = h.runner.views().decisions.find(d => d.id === report.id)!
     assert.ok(next.revision > report.revision)
-    assert.equal(h.runner.views().headline.needsYou, 1)
+    assert.equal(h.runner.views().headline.needsYou, 0)
   } finally { await h.close() }
 })
 
@@ -308,7 +309,9 @@ test('owner-requested reassessment grants one supervisor judgment, not a blind w
     assert.equal(h.store.get(`game.decisions-total:${tid}`), '8')
     h.store.set(`game.decisions-total:${tid}`, '9')
     const exhausted = h.runner.views().decisions.find(d => d.id === `game-hold:${tid}`)!
-    assert.deepEqual(exhausted.options, [GAME_KEEP_HOLD, 'stop'])
+    assert.deepEqual(exhausted.options, [GAME_KEEP_HOLD])
+    assert.equal(exhausted.requiresDecision, false)
+    assert.equal(h.runner.views().headline.needsYou, 0)
     assert.match(h.runner.decideTask(tid, GAME_REASSESS, exhausted.revision)!, /상한/)
   } finally { await h.close() }
 })
