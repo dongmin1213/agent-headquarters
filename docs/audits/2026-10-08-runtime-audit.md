@@ -117,3 +117,17 @@ HQ 재시작 후 HTTP 200, 추가 수용 기준의 저장 및 C02 기존 프로�
 회귀 검증: 상한 뒤 새 제출 진단→검증된 재배정, 기존 완료 기준/독립 검토/작업 폴더 보존, 같은 요청 재호출 차단, 기존 진단/다른 단계/오래된 세대/사용자 결정 제외, 단순 재시도·약화된 검사·연결 실패의 미해결 보고를 검사했다. 전체416개 중409개 통과·실패0·기존 조건부7개 제외 (`/tmp/hq-verification-rescue-tests.log`). 타입·diff 검사 통과.
 
 운영 관측: 앞서 재개한 C02 a18의 제출 ea2f69cccd4f4f7e215591354cd110875c844bb6은 HQ 새 checkout death/regression 종료0 후 독립 r1도 통과했다. C02 passed에 따라 후속 I03 통합 작업이 자동으로 시작됐다. 게임 전체/대화면/대표 구간 품질의 최종 승인은 아직 아니다.
+
+## 새 승인 기준의 통합 계약 충돌과 실제 내부 재배정
+
+I03 a13은 C02/AT01 등이 합쳐진 6d6b914 새 기준에서 check_a03의 `palette mote` 실패를 보고했다. C02가 승인한 mote의 9색 파생 가공·recover 재생 매핑·최신 PNG 해시가 구 manifest/검사/provenance에 반영되지 않았고 필요한 검사 파일은 I03 owns 밖이었다. 이전 복구9회 상한에 걸렸다. 앞서 추가한 후보 제출 후 검사 진단은 succeeded/기계 검사 실패에 한정되어 이 brief_blocked 사례를 놓쳤다.
+
+별도 진단 경로에 HQ가 확인한 새 통합 기준의 blocked도 포함했다. 이전/현재 실행 spec의 base가 실제로 달라야 하고, 현재 base 일치·선행 작업 passed·현재 세대의 검증된 brief_blocked 결과와 fetched 커밋·구체 보고가 있어야 한다. 같은 기준의 반복 실패·다른 세대·미승인 의존·사용자 권한 결정은 제외한다. 기존 요청당1회 진단 기록을 공유하므로 별도 횟수를 추가하지 않는다. 실제 지시서 수정과 전체 소유/의존/완료 기준 검증을 통과해야 재개한다.
+
+I03 a13 diff에 이미 존재한 `tests/rework/spatial-integration/evidence/.gdignore`가 다음 정상 제출에서 scope 실패를 만들 것도 확인했다. literal directory/**는 해당 디렉터리의 숨김 파일을 포함하도록 ownsMatch를 수정했다. 부모·형제·경로 이탈과 좁은 `*` 패턴 허용 범위는 그대로다. 기존 .gitignore 문제와 같은 Node 기본 glob의 불일치를 폴더 범위에서도 해결했다. 자산 변경 시 manifest/재생 계약/provenance/검사를 함께 동기화하라는 실제 작업자 지침도 보강했다.
+
+DB 백업 `before-i03-contract-rescue-1791465739.db` 후 읽기 전용으로 확인한 원인과 수정 제안을 diagnosis에 기록했다. 총100회 사용, 남은8개 제작/독립 검토에 최소16회 필요하여 기존112회 상한으로는 완료가 불가능했다. 운영자가 이번 재개 요청 범위에서 120회(필수16+수정 여유4)로 명시적으로 조정했고 모델 자동 증액·기존 이력 초기화·사용량 제한 우회는 없다.
+
+새 코드가 시작한 피카츄의 별도 진단은 실제 check_a03 종료1을 재현하고, approved PNG/고유9색/기존 provenance 해시/recover Atlas를 대조했다. I03에 tools/check_art.py, assets/animations/check_a03.py, assets/animations/u02-contract.json, assets/animations/mote-c02-contract.json 4개만 추가하는 revised_task가 검증을 통과했다. 승인 외형 유지·전역24색 유지·mote의 정확한 자산별 계약·미등록색/해시변조/잘못된 Atlas/빈프레임/반복 사망 거부 회귀를 명시하고 I03 a14(pid39782)가 시작됐다. 수용 기준·QF·레퍼런스·독립 검토를 유지했다. 이 기록은 실제 내부 재배정과 실행 증거이며 통합 제품 승인이나 자산 계약 수정 완료 선언이 아니다.
+
+최종 검사419개 중412개 통과, 실패0, 기존 조건부7개 제외 (`/tmp/hq-integration-reserve-final-tests.log`). 타입·diff 검사 통과. 새 통합 기준의 자동 진단/재배정과 동일 기준·누락 증거·미승인 선행의 거부, .gdignore 정상 제출과 폴더 경계 거부를 포함한다.

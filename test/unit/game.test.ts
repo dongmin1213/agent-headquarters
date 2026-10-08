@@ -686,7 +686,7 @@ test('a new verification failure gets one automatic supervisor repair after exha
   const { h, id, tid, spec } = verificationRescueFixture()
   try {
     const before = h.store.task(tid)!
-    assert.ok(h.runner.gameVerificationRescue(before))
+    assert.ok(h.runner.gameRecoveryReserve(before))
     assert.equal(h.runner.ceoWaiting(), true)
     await h.engine.tick()
     const after = h.store.task(tid)!
@@ -703,7 +703,7 @@ test('a new verification failure gets one automatic supervisor repair after exha
     await h.engine.tick(); await h.engine.tick()
     assert.equal(h.store.get(`game.decisions-total:${tid}`), '9')
     assert.equal(gameWaiting(h.store, h.store.task(tid)!), true)
-    assert.match(h.runner.views().decisions.find(d => d.taskId === tid)!.detail!, /제출 후 검증 별도 진단.*1회 사용/)
+    assert.match(h.runner.views().decisions.find(d => d.taskId === tid)!.detail!, /새 통합·검증 별도 진단.*1회 사용/)
   } finally { await h.close() }
 })
 
@@ -728,21 +728,72 @@ test('verification reserve excludes known submissions, other phases, stale attem
   const { h, id, tid, dir } = verificationRescueFixture()
   try {
     const t = h.store.task(tid)!
-    assert.ok(h.runner.gameVerificationRescue(t))
-    assert.equal(h.runner.gameVerificationRescue({ ...t, checks_state: 'passed' }), null)
-    assert.equal(h.runner.gameVerificationRescue({ ...t, status: 'question' }), null)
-    assert.equal(h.runner.gameVerificationRescue({ ...t, generation: t.generation + 1 }), null)
+    assert.ok(h.runner.gameRecoveryReserve(t))
+    assert.equal(h.runner.gameRecoveryReserve({ ...t, checks_state: 'passed' }), null)
+    assert.equal(h.runner.gameRecoveryReserve({ ...t, status: 'question' }), null)
+    assert.equal(h.runner.gameRecoveryReserve({ ...t, generation: t.generation + 1 }), null)
     h.store.set(`game.decisions:${tid}`, '1')
     h.store.set(`game.decision:${tid}:1`, JSON.stringify({ checkedWork: `${tid}~a1` }))
-    assert.equal(h.runner.gameVerificationRescue(t), null)
+    assert.equal(h.runner.gameRecoveryReserve(t), null)
     h.store.set(`game.decisions:${tid}`, '0')
     h.store.set(`game.waiting:${tid}`, JSON.stringify({ signature: gameWaitSignature(h.store, t), needsUser: true }))
-    assert.equal(h.runner.gameVerificationRescue(t), null)
+    assert.equal(h.runner.gameRecoveryReserve(t), null)
     h.store.set(`game.waiting:${tid}`, null)
     h.store.set(`game.verification-rescue:${id}`, JSON.stringify({ taskId: 'another-task', status: 'started' }))
-    assert.equal(h.runner.gameVerificationRescue(t), null)
+    assert.equal(h.runner.gameRecoveryReserve(t), null)
     h.store.set(`game.verification-rescue:${id}`, null)
     rmSync(join(dir, 'hq/checks.json'))
-    assert.equal(h.runner.gameVerificationRescue(t), null)
+    assert.equal(h.runner.gameRecoveryReserve(t), null)
+  } finally { await h.close() }
+})
+
+
+function changedBaseReserveFixture() {
+  const f = verificationRescueFixture(), { h, tid, dir } = f
+  const oldBase = '1'.repeat(40), newBase = '2'.repeat(40)
+  const prior = join(h.dir, 'old-attempt'); mkdirSync(join(prior, 'hq'), { recursive: true })
+  h.store.insertAttempt({ id: `${tid}~a0`, task_id: tid, kind: 'work', n: 0, model: 'sonnet', status: 'brief_blocked', attempt_token: 'test-old', dir: prior, session_id: 'old', generation: 1 })
+  h.store.raw().prepare('update attempts set rowid = 0 where id = ?').run(`${tid}~a0`)
+  writeFileSync(join(prior, 'hq/spec.json'), JSON.stringify({ base: oldBase }))
+  h.store.updateAttempt(`${tid}~a1`, { status: 'brief_blocked' })
+  h.store.updateTask(tid, { head_sha: null, checks_state: null, base_sha: newBase })
+  writeFileSync(join(dir, 'hq/spec.json'), JSON.stringify({ base: newBase }))
+  writeFileSync(join(dir, 'hq/result.json'), JSON.stringify({ outcome: 'brief_blocked', fetched: '3'.repeat(40), summary: 'new approved sprite conflicts with old checker outside owns' }))
+  h.store.set(`game.waiting:${tid}`, JSON.stringify({ signature: gameWaitSignature(h.store, h.store.task(tid)!), needsUser: false }))
+  return { ...f, oldBase, newBase }
+}
+
+test('a blocked integration after a changed approved base receives automatic scope repair without another owner prompt', async () => {
+  const { h, id, tid, spec } = changedBaseReserveFixture()
+  try {
+    assert.equal(h.runner.gameRecoveryReserve(h.store.task(tid)!)?.id, `${tid}~a1`)
+    await h.engine.tick()
+    const t = h.store.task(tid)!
+    assert.equal(t.status, 'rework')
+    assert.ok(JSON.parse(t.spec).owns.includes('gameplay/actor.gd'))
+    assert.deepEqual(JSON.parse(t.spec).acceptance, spec.acceptance)
+    assert.equal(h.store.get(`game.decisions-total:${tid}`), '9')
+    assert.equal(JSON.parse(h.store.get(`game.verification-rescue:${id}`)!).phase, 'changed-integration-base')
+    assert.equal(gameNeedsUser(h.store, t), false)
+  } finally { await h.close() }
+})
+
+test('changed-base reserve requires HQ evidence, passed prerequisites and an actual base transition', async () => {
+  const { h, tid, dir, oldBase, newBase } = changedBaseReserveFixture()
+  try {
+    const t = h.store.task(tid)!
+    assert.ok(h.runner.gameRecoveryReserve(t))
+    writeFileSync(join(dir, 'hq/spec.json'), JSON.stringify({ base: oldBase }))
+    assert.equal(h.runner.gameRecoveryReserve({ ...t, base_sha: oldBase }), null)
+    writeFileSync(join(dir, 'hq/spec.json'), JSON.stringify({ base: newBase }))
+    assert.equal(h.runner.gameRecoveryReserve({ ...t, base_sha: oldBase }), null)
+    const dep = h.store.tasks(t.request_id).find(x => x.key === JSON.parse(t.spec).depends_on[0])!
+    h.store.updateTask(dep.id, { status: 'running' })
+    assert.equal(h.runner.gameRecoveryReserve(t), null)
+    h.store.updateTask(dep.id, { status: 'passed' })
+    writeFileSync(join(dir, 'hq/result.json'), JSON.stringify({ outcome: 'failed', fetched: '3'.repeat(40), summary: 'not a validated blocked result' }))
+    assert.equal(h.runner.gameRecoveryReserve(t), null)
+    rmSync(join(dir, 'hq/spec.json'))
+    assert.equal(h.runner.gameRecoveryReserve(t), null)
   } finally { await h.close() }
 })

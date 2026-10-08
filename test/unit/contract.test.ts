@@ -31,6 +31,18 @@ test('whole-repository owns includes dotfiles without weakening narrow scopes or
   assert.equal(outcome(facts({ owns: ['**'], doneRaw: done({ head_sha: BASE }) })), 'failed', 'whole-repository scope still verifies the commit')
 })
 
+test('directory ownership includes local import metadata but never sibling or parent files', () => {
+  const owns = ['tests/rework/spatial-integration/**']
+  const file = 'tests/rework/spatial-integration/evidence/.gdignore'
+  assert.equal(ownsMatch(file, owns), true)
+  assert.equal(ownsMatch('tests/rework/spatial-integration/.cache/log', owns), true)
+  for (const outside of ['.gdignore', 'tests/rework/.gdignore', 'tests/rework/spatial-integration-other/.gdignore', 'tests/rework/spatial-integration/../.gdignore'])
+    assert.equal(ownsMatch(outside, owns), false, outside)
+  assert.equal(ownsMatch('src/.env', ['src/*']), false, 'narrow wildcard semantics are unchanged')
+  const result = judgeWork(facts({ owns, doneRaw: done({ files_modified: [file] }) }, { changed: [file] }))
+  assert.equal(result.outcome, 'succeeded', 'an owned import exclusion no longer causes a spurious scope block')
+})
+
 test('2. unverifiable: no done, token mismatch, symlink done, oversized done', () => {
   assert.equal(outcome(facts({ doneRaw: null })), 'unverifiable')
   assert.equal(outcome(facts({ doneRaw: done({ attempt_token: 'other' }) })), 'unverifiable')
