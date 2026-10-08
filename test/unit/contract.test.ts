@@ -123,3 +123,20 @@ test('2. collect: read-only cwd and report summary', () => {
   assert.equal(c({ status: ' M README.md' }), 'failed')
   assert.equal(c({}, summary(10)), 'failed')
 })
+
+test('game checkpoint requires fresh owned evidence, a bounded continuation, and the full commit contract', () => {
+  const d = { outcome: 'checkpoint', checkpoint: { next_step: '남은 적 반복 처치를 확인한다', evidence: ['src/a.ts'] } }
+  const f = facts({ doneRaw: done(d), checkpoint: { count: 0, freshFiles: ['src/a.ts'] } })
+  assert.equal(outcome(f), 'checkpoint')
+  assert.equal(outcome({ ...f, checkpoint: undefined }), 'brief_blocked', 'no opt-in outside game')
+  assert.equal(outcome({ ...f, role: 'collect' }), 'brief_blocked', 'no collect checkpoints')
+  assert.equal(outcome({ ...f, checkpoint: { count: 3, freshFiles: ['src/a.ts'] } }), 'brief_blocked', 'lifetime cap')
+  assert.equal(outcome({ ...f, checkpoint: { count: 0, freshFiles: [] } }), 'brief_blocked', 'same head/deleted/symlink evidence rejected')
+  for (const checkpoint of [undefined, { next_step: '', evidence: ['src/a.ts'] }, { next_step: 'continue', evidence: [] }, { next_step: 'continue', evidence: ['../elsewhere'] }])
+    assert.equal(outcome({ ...f, doneRaw: done({ ...d, checkpoint }) }), 'brief_blocked')
+  assert.equal(outcome({ ...f, doneRaw: done({ ...d, files_modified: [] }) }), 'failed', 'whole base diff still required')
+  assert.equal(outcome({ ...f, git: { ...f.git!, hasMerges: true } }), 'failed')
+  assert.equal(outcome({ ...f, report: summary(10) }), 'failed')
+  assert.equal(outcome({ ...f, runaway: true }), 'runaway', 'wall cap still applies')
+  assert.equal(outcome({ ...f, rejectedSeen: true }), 'limited', 'quota still applies')
+})

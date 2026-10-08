@@ -168,9 +168,13 @@ const base = /--no-renames ([0-9a-f]{40}) HEAD/.exec(prompt)?.[1] ?? /head_sha�
 const collect = prompt.includes('읽기 전용 조사·수집')
 const git = (...a: string[]) => execFileSync('git', ['-c', 'user.name=fake', '-c', 'user.email=fake@example.com', ...a], { encoding: 'utf8' }).trim()
 let outcome = mk('outcome') ?? 'succeeded'
+if (mk('checkpointonce')) outcome = resume ? 'succeeded' : 'checkpoint'
 if (outcome === 'question' && resume) outcome = 'succeeded'
 let head = base, files: string[] = []
-if (!collect && outcome === 'succeeded') {
+if (!collect && mk('checkpointstale') && resume) {
+  head = git('rev-parse', 'HEAD')
+  files = git('diff', '--name-only', '--no-renames', base, 'HEAD').split('\n').filter(Boolean)
+} else if (!collect && ['succeeded', 'checkpoint'].includes(outcome)) {
   const refresh = /선행 작업 의존성이 추가되어 검증 기준 커밋이 ([0-9a-f]{40})로 갱신됐다/.exec(prompt)?.[1]
   if (refresh) {
     const previous = /이전 기준은 ([0-9a-f]{40})이다/.exec(prompt)![1]
@@ -229,6 +233,7 @@ writeFileSync(join(out, 'report.md'), `## 요약\n${'이 작업은 가짜 작업
 if (!mk('nodone')) {
   const qn = Number(mk('questions') ?? 1)
   const done = { attempt_token: mk('badtoken') ? 'wrong' : token, outcome, head_sha: head, files_modified: files, summary: `가짜 작업 ${outcome}`,
+    ...(outcome === 'checkpoint' ? { checkpoint: { next_step: '남은 실제 검증을 이어간다', evidence: [marks.write?.[0] ?? 'hq-fake.txt'] } } : {}),
     questions: outcome === 'question' ? Array.from({ length: qn }, (_, i) => ({ question: `질문 ${i + 1}?`, options: ['예', '아니오'], default: '예' })) : [] }
   writeFileSync(join(out, 'done.json.tmp'), JSON.stringify(done))
   renameSync(join(out, 'done.json.tmp'), join(out, 'done.json'))

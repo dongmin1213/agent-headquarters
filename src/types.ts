@@ -76,7 +76,7 @@ export interface RequestView {
 }
 
 export type TaskStatus = 'pending' | 'running' | 'verifying' | 'reviewing' | 'passed' | 'rework' | 'revising' | 'question' | 'held' | 'blocked' | 'cancelled'
-export type AttemptStatus = 'starting' | 'running' | 'succeeded' | 'failed' | 'brief_blocked' | 'question' | 'limited' | 'transient' | 'runaway' | 'unverifiable' | 'start_failed'
+export type AttemptStatus = 'checkpoint' | 'starting' | 'running' | 'succeeded' | 'failed' | 'brief_blocked' | 'question' | 'limited' | 'transient' | 'runaway' | 'unverifiable' | 'start_failed'
 
 export interface TaskView {
   /** "<requestId>.<taskKey>" (URL-safe; clients still percent-encode path segments) */

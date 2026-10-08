@@ -7,14 +7,16 @@ import { mirrorChanged, mirrorHasMerges, mirrorIsAncestor } from './repos.ts'
 export interface WorkerQuestion { question: string; options: string[]; default: string }
 export interface DoneJson {
   attempt_token: string
-  outcome: 'succeeded' | 'failed' | 'blocked' | 'question'
+  outcome: 'succeeded' | 'failed' | 'blocked' | 'question' | 'checkpoint'
   head_sha: string
   files_modified: string[]
   summary: string
   questions: WorkerQuestion[]
+  checkpoint?: { next_step: string; evidence: string[] }
 }
 
-export type WorkOutcome = 'succeeded' | 'failed' | 'brief_blocked' | 'question' | 'limited' | 'transient' | 'runaway' | 'unverifiable'
+export const MAX_GAME_CHECKPOINTS = 3
+export type WorkOutcome = 'checkpoint' | 'succeeded' | 'failed' | 'brief_blocked' | 'question' | 'limited' | 'transient' | 'runaway' | 'unverifiable'
 
 export interface GitFacts {
   /** implement: the fetched `hq-work` tip in the mirror; collect: HEAD of the read-only worktree. */
@@ -29,6 +31,8 @@ export interface GitFacts {
 
 export interface WorkFacts {
   role: 'implement' | 'collect'
+  /** HQ-observed fresh regular files since the last checkpoint; absent outside game work. */
+  checkpoint?: { count: number; freshFiles: string[] }
   token: string
   owns: string[]
   protectedPaths: string[]
@@ -110,13 +114,15 @@ export function parseDone(raw: string | null, token: string): { done: DoneJson |
   try { d = JSON.parse(raw) } catch { return { done: null, problem: 'done.json 파싱 실패' } }
   if (!d || typeof d !== 'object' || Array.isArray(d)) return { done: null, problem: 'done.json이 객체가 아님' }
   if (d.attempt_token !== token) return { done: null, problem: 'done.json attempt_token 불일치' }
-  if (!['succeeded', 'failed', 'blocked', 'question'].includes(String(d.outcome))) return { done: null, problem: `done.json outcome 값이 잘못됨: ${String(d.outcome)}` }
+  if (!['succeeded', 'failed', 'blocked', 'question', 'checkpoint'].includes(String(d.outcome))) return { done: null, problem: `done.json outcome 값이 잘못됨: ${String(d.outcome)}` }
   return {
     problem: null,
     done: {
       attempt_token: d.attempt_token, outcome: d.outcome!, head_sha: typeof d.head_sha === 'string' ? d.head_sha.trim() : '',
       files_modified: Array.isArray(d.files_modified) ? d.files_modified.map(String) : [],
       summary: typeof d.summary === 'string' ? d.summary : '',
+      ...(d.checkpoint && typeof d.checkpoint.next_step === 'string' && Array.isArray(d.checkpoint.evidence) && d.checkpoint.evidence.every(x => typeof x === 'string')
+        ? { checkpoint: { next_step: d.checkpoint.next_step.trim(), evidence: d.checkpoint.evidence } } : {}),
       questions: Array.isArray(d.questions) ? d.questions.filter((q) => q && typeof q === 'object' && typeof q.question === 'string' && q.question.trim())
         .map((q) => ({ question: String(q.question), options: Array.isArray(q.options) ? q.options.map(String) : [], default: String(q.default ?? '') })) : [],
     },
@@ -175,6 +181,15 @@ export function judgeWork(f: WorkFacts): Judgement {
   if (done.outcome === 'failed') return j('failed', [`작업자 보고 failed: ${done.summary || '(요약 없음)'}`], done)
 
   const reasons: string[] = []
+  if (done.outcome === 'checkpoint') {
+    if (f.role !== 'implement' || !f.checkpoint) return j('brief_blocked', ['중간 저장은 게임 제작 작업에서만 허용됨'], done)
+    if (f.checkpoint.count >= MAX_GAME_CHECKPOINTS) return j('brief_blocked', [`중간 저장 상한 ${MAX_GAME_CHECKPOINTS}회 도달: 팀장 재계획 필요`], done)
+    const c = done.checkpoint
+    if (!c || !c.next_step || c.next_step.length > 2000 || !c.evidence.length || c.evidence.length > 8)
+      return j('brief_blocked', ['중간 저장에 다음 작업(1~2000자)과 새 증거 파일(1~8개)이 필요함'], done)
+    if (c.evidence.some(p => !ownsMatch(p, f.owns) || !f.checkpoint!.freshFiles.includes(p)))
+      return j('brief_blocked', ['중간 저장 증거가 소유 범위의 새 변경 일반 파일이 아님 (반복·삭제·링크 증거 금지)'], done)
+  }
   const g = f.git
   if (!g || !g.head) return j('failed', [f.role === 'implement' ? '작업 결과(hq-work 브랜치)를 가져올 수 없음' : '작업 폴더 상태를 확인할 수 없음'], done)
   if (f.role === 'collect') {
@@ -197,7 +212,7 @@ export function judgeWork(f: WorkFacts): Judgement {
   if (g.hasMerges) reasons.push('base 이후 merge 커밋이 있음')
   const rp = reportProblem(f.report)
   if (rp) reasons.push(rp)
-  return j(reasons.length ? 'failed' : 'succeeded', reasons, done, protectedChanges(g.changed, f.protectedPaths))
+  return j(reasons.length ? 'failed' : done.outcome === 'checkpoint' ? 'checkpoint' : 'succeeded', reasons, done, protectedChanges(g.changed, f.protectedPaths))
 }
 
 /** Git facts of a fetched work result, computed in the mirror only (§6.1, §8.8). */

@@ -175,7 +175,7 @@ export const TASK_STATUS = {
   blocked: ['막힘', 'bad'], cancelled: ['취소됨', 'neutral'],
 }
 export const ATTEMPT_STATUS = {
-  starting: ['시작 중', 'info'], running: ['실행 중', 'info'], succeeded: ['성공', 'ok'], failed: ['실패', 'bad'], brief_blocked: ['지시서 막힘', 'warn'],
+  starting: ['시작 중', 'info'], running: ['실행 중', 'info'], succeeded: ['성공', 'ok'], failed: ['실패', 'bad'], brief_blocked: ['지시서 막힘', 'warn'], checkpoint: ['중간 저장 · 이어가기', 'info'],
   question: ['질문', 'warn'], limited: ['한도 걸림', 'warn'], transient: ['일시 오류', 'warn'], runaway: ['폭주 중단', 'bad'],
   unverifiable: ['확인 불가', 'bad'], start_failed: ['시작 실패', 'bad'],
 }

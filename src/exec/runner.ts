@@ -17,7 +17,7 @@ import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../sto
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
 import { baseline, checksProfile, envFailure, sandboxFailure, runChecks, runSandboxed, setupChangedReason, trackedChanges, type BaseResult, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
 import { requestScratchChildren, requestScratchPaths, removeRequestScratch, removeRequestCodexHomes } from './cleanup.ts'
-import { DONE_MAX, isTransient, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, readOutResult, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
+import { DONE_MAX, parseDone, MAX_GAME_CHECKPOINTS, isTransient, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, readOutResult, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
 import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, lingeringOf, lingeringPsKey, lingeringWait, outDirOf, RELEASE, workerViews, type HeadlineInput, type Lingering, type LingeringPs } from './decisions.ts'
 import { runDiagnoseTurn } from './diagnose.ts'
 import { atomicJson, atomicWrite, readJson, readText, sha256 } from './fsx.ts'
@@ -26,7 +26,7 @@ import { integrate, integrationRef } from './integration.ts'
 import { applyMerge } from './merge.ts'
 import { resumePrompt, reviewPrompt, reworkEvidence, workPrompt, type Upstream } from './prompt.ts'
 import { isAllowedEvent, quotaState, quotaView, recordRateLimit, rejectedWithoutReset, type QuotaState } from './quota.ts'
-import { ensureMirror, fetchWork, hqGit, hqGitOk, mirrorChanged, mirrorPath, mirrorRev, newWorkClone, removeMirrorWorktree, verifyWorktree, wtGit, wtMerge, wtStatus } from './repos.ts'
+import { ensureMirror, fetchWork, hqGit, hqGitOk, mirrorChanged, mirrorIsAncestor, mirrorPath, mirrorRev, newWorkClone, removeMirrorWorktree, verifyWorktree, wtGit, wtMerge, wtStatus } from './repos.ts'
 import { canAutoApply, canAutoApplyGame, reviseDiff, reviseProblem, runReviseTurn } from './revise.ts'
 import { checkVerdict, ladderUp, VERDICT_SCHEMA } from './review.ts'
 import { codexBinReadable, real, sandboxProfile, type SandboxOpts } from './sandbox.ts'
@@ -98,7 +98,7 @@ const UNKNOWN_POLLS = 5
 const UNKNOWN_MS = 30_000
 const identityUnknown = (pid: number) => `작업자 프로세스를 확인할 수 없어 멈췄어요 · 이전 작업자(pid ${pid})가 아직 돌 수 있어요`
 export const TERMINAL_REQUEST = new Set(['merged', 'rejected', 'failed', 'cancelled', 'expired'])
-const UNCOUNTED_PREV = new Set(['limited', 'transient', 'start_failed', 'brief_blocked'])
+const UNCOUNTED_PREV = new Set(['limited', 'transient', 'start_failed', 'brief_blocked', 'checkpoint'])
 export const INTEGRATION_OPTIONS = ['다시 통합', '해당 작업 재작업', '요청 중단']
 /** Extra integration option (wire value = label, like the other integration options): accept known base failures for one integration SHA. */
 export const ACCEPT_KNOWN = '기존 실패로 인정하고 진행'
@@ -724,7 +724,22 @@ export class Runner {
     }
     const stderr = (readText(join(hq, 'stderr.log'), 200_000) ?? '').slice(-20_000)
     const doneFile = readOutResult(out, 'done.json', DONE_MAX)
+    let checkpoint: { count: number; freshFiles: string[] } | undefined
+    if (role === 'implement' && this.project(task.project)?.workflow === 'game' && parseDone(doneFile.text, att.attempt_token).done?.outcome === 'checkpoint') {
+      const prior = this.store.attempts(task.id).filter(a => a.kind === 'work' && a.status === 'checkpoint')
+      const previous = this.store.attempts(task.id).filter(a => a.kind === 'work' && a.id !== att.id && a.outcome !== 'waiting').at(-1)
+      const last = prior.at(-1) ?? previous
+      const previousHead = last ? readJson<{ fetched: string | null }>(join(hqDirOf(last), 'result.json'))?.fetched ?? (last.status === 'checkpoint' ? null : task.base_sha) : task.base_sha
+      let freshFiles: string[] = []
+      if (fetched && previousHead && await mirrorIsAncestor(mirror, previousHead, fetched)) {
+        const changed = new Set(await mirrorChanged(mirror, previousHead, fetched))
+        const tree = await hqGitOk(mirror, null, ['ls-tree', '-r', '-z', fetched])
+        freshFiles = tree.split('\0').filter(x => /^100(644|755) blob /.test(x)).map(x => x.slice(x.indexOf('\t') + 1)).filter(p => changed.has(p))
+      }
+      checkpoint = { count: prior.length, freshFiles }
+    }
     const j = judgeWork({
+      checkpoint,
       role, token: att.attempt_token, owns: spec.owns, protectedPaths: this.cfg.protectedPaths, base: task.base_sha ?? '',
       runaway: att.outcome === 'runaway', result, stderr, rejectedSeen: l.tail.rejectedSeen,
       doneRaw: doneFile.text, doneReadProblem: doneFile.problem, report, git,
@@ -746,6 +761,13 @@ export class Runner {
       if (t.status !== 'running' || t.generation !== att.generation) return
       if (j.outcome !== 'transient') this.store.set(`transport:${t.id}:work`, null)
       switch (j.outcome) {
+        case 'checkpoint': {
+          // A durable continuation, never an approved result. All checks/review/dependencies wait for succeeded.
+          const count = (checkpoint?.count ?? 0) + 1
+          this.tset(t, { status: 'pending', resume_session: att.session_id, head_sha: null, report_sha: null, checks_state: null,
+            note: `중간 저장 ${count}/${MAX_GAME_CHECKPOINTS} · 완료 아님. 증거: ${j.done!.checkpoint!.evidence.join(', ')}\n다음 작업: ${j.done!.checkpoint!.next_step}` })
+          break
+        }
         case 'succeeded': {
           // A person-judged criterion needs a judge: with no reviewer, add a sonnet review (F03); protected paths likewise (§3).
           const needsJudge = t.review_model === 'none' && manualIds(spec).length > 0
@@ -1096,7 +1118,7 @@ export class Runner {
         upstream: this.upstream(t) })
       if (resume) {
         const answers = this.store.taskQuestions(t.id).filter(q => q.answer !== null).map(q => ({ question: q.question, answer: q.answer! }))
-        prompt += '\n\n' + resumePrompt({ answers, out, token: att.attempt_token, role, base: t.base_sha! })
+        prompt += '\n\n' + resumePrompt({ answers, out, token: att.attempt_token, role, base: t.base_sha!, game: project.workflow === 'game' })
       }
       // Collect creates a new read-only checkout per attempt, but the Codex thread stays in the original private home.
       const codexHomeKey = resume && prev ? readProcessInfo(hqDirOf(prev))?.codexHomeKey
