@@ -97,3 +97,13 @@ DB 백업 `before-quality-team-correction-20261008-185500.db` 후 검증된 Runn
 운영 반영 전 전체 작업 계획을 validateTasks/gamePlanProblem으로 검사하고, DB 백업 `before-pc-reference-1791455261045.db` 후 아직 시작하지 않은 6개 작업의 spec/revision과 요청 plan/hash만 트랜잭션으로 갱신했다. 기존 수용 기준·소유 범위·의존성·모델·작업 세대·실행 예산 유지. 모든 비대상 작업과 live attempts가 바뀌지 않았음을 적용 중 assert했다. 원래 계약은 `user-directive:pc-display-reference:req-27503764` 감사 기록에 보존했다.
 
 HQ 재시작 후 HTTP 200, 추가 수용 기준의 저장 및 C02 기존 프로세스 생존 확인. AT01 r3의 환경 검사 실패는 HQ 내부 판단으로 전용 Pillow 검사 진입점 보정 a4에 재배정되어 실행 중이다. 이번 변경은 지침·작업 계약 변경이며 런타임 코드 수정은 없다. 실제 FHD/QHD 품질과 조사 보강의 완료 여부는 해당 작업의 후속 제작·독립 검수에서 판정한다.
+
+## C02 제출 후 새 검증 폴더의 import 누락
+
+사용자의 재차 멈춤 제보 시 HQ는 응답 중이었으나 C02 a17 제출 후보 b089765bc744b5d4d5b4e0265f4f9a6261af4463의 death/regression 검사가 각각 120초 시간 초과였다. 누적 복구 판단 9회 상한에 도달하여 C02가 blocked, 후속 작업은 의존 대기였다. AT01은 별도 검토 r4까지 통과했다.
+
+운영자가 제출 커밋의 git archive와 빈 HOME, .godot 없는 임시 소스에서 직접 재현했다. 최초 오류는 hero.png 등 Texture2D loader 부재와 preload/Parse Error였다. lifecycle/check.py가 리소스 import 없이 runtime.gd를 실행했고 SceneTree의 run 오류 후 종료되지 않았다. TimeoutExpired의 부분 stdout/stderr를 기록하지 않아 HQ에는 원인 대신 Python timeout traceback만 전달됐다. 재현 로그는 `/tmp/hq-c02-clean-import-repro.log`에 보존하고 임시 소스 복사본은 제거했다.
+
+백업 `before-c02-import-repair-1791461486.db` 후 검증된 repairGameTask 경로로 C02에 구체 수정 지시를 추가했다. 누적 복구 상한 9회와 요청 예산112회, 기존 검사·소유 범위·독립 검토를 유지하며 게임 기능/완료 플레이 재제작 없이 import 준비 및 timeout 오류 기록을 고치도록 했다. a18(pid19537)이 시작해 기존 결과와 검사 코드를 읽고 캐시 없는 재현에 착수한 것을 확인했다. 재개 확인이며 수정 후보의 HQ 검사 통과는 아직 후속 판정이다.
+
+팀장 문서에만 있던 새 checkout 검사 준비 요구를 모든 게임 작업자가 실제 받는 GAME_WORKER_RULES에도 반영했다. 관련 game/game-flow 검사44개 통과, 타입 검사 통과. 게임 작업자의 실제 수정과 새 checkout 재검·독립 검토를 생략하거나 자동 승인하지 않았다.
