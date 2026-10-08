@@ -31,13 +31,15 @@ export class RequestEngine {
   private hqRoot: string
   private runner: Runner
   private timer: NodeJS.Timeout | null = null
+  private ticking: Promise<void> | null = null
+  private retryAfter = 0
 
   constructor(store: Store, bus: Bus, projects: Project[], hqRoot: string, runner: Runner) {
     this.store = store; this.bus = bus; this.projects = projects; this.hqRoot = hqRoot; this.runner = runner
   }
 
-  start(intervalMs = 3_000): void { this.timer = setInterval(() => void this.tick(), intervalMs) }
-  stop(): void { if (this.timer) clearInterval(this.timer) }
+  start(intervalMs = 3_000): void { this.stop(); this.timer = setInterval(() => void this.tick(), intervalMs) }
+  stop(): void { if (this.timer) clearInterval(this.timer); this.timer = null }
 
   submit(text: string, projectId: string): string {
     const id = 'req-' + randomUUID().slice(0, 8)
@@ -62,13 +64,25 @@ export class RequestEngine {
     return null
   }
 
-  async tick(): Promise<void> {
+  tick(): Promise<void> {
+    if (this.ticking) return this.ticking
+    if (this.runner.now() < this.retryAfter) return Promise.resolve()
+    this.ticking = this.runTick().catch((error) => {
+      // Fire-and-forget timer/submit calls must not turn one coordinator error into a daemon crash.
+      this.retryAfter = this.runner.now() + 30_000
+      console.error('[hq engine] judgment loop failed; retry in 30s', error)
+      try { this.bus.emit({ kind: 'request', text: '판단 루프 오류 · 30초 후 자동 복구 · 실행 중인 작업은 유지', data: { error: String(error).slice(0, 500) } }) }
+      catch { /* A storage outage must not reject the recovery handler as well. */ }
+    }).finally(() => { this.ticking = null })
+    return this.ticking
+  }
+
+  private async runTick(): Promise<void> {
     if (this.runner.canStartGameSupervisor() && await this.manageGame()) return
     const r = this.store.requestsByStatus(['queued']).find(r => this.projects.find(p => p.id === r.project)?.workflow !== 'game' || gameEnabled(this.store, r.project))
     if (!r) { await this.manageGameFlow(); return }
     if (!this.runner.canStartCeo() || !this.runner.ceoLock.tryAcquire()) return
     try { await this.turn(r.id) } finally { this.runner.ceoLock.release() }
-    void this.tick()
   }
 
   /** Internal questions and recoverable blocks go to the team leader, not the chairman. */

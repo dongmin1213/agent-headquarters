@@ -3,7 +3,7 @@
 import type { CheckSpec, ChecksFile, OnSpawn } from './checks.ts'
 import { runChecks, runSandboxed } from './checks.ts'
 import { atomicWrite } from './fsx.ts'
-import { hqGitOk, mirrorRev, removeMirrorWorktree, verifyWorktree, wtGitOk, wtMerge } from './repos.ts'
+import { hqGitOk, mirrorIsAncestor, mirrorRev, removeMirrorWorktree, verifyWorktree, wtGitOk, wtMerge } from './repos.ts'
 import { withRepo } from './git.ts'
 import { sandboxProfile, type SandboxOpts } from './sandbox.ts'
 
@@ -19,11 +19,16 @@ export const integrationRef = (requestId: string, project: string) => `refs/hq/i
 
 /** The mirror must be fetched from the project first so `refs/heads/<target>` is current. */
 export async function integrate(o: {
-  mirror: string; requestId: string; project: string; path: string; target: string; heads: IntegrationHead[]
+  mirror: string; requestId: string; project: string; path: string; target: string; baseSha: string | null; heads: IntegrationHead[]
   setup: string | null; checks: CheckSpec[]; timeoutMs: number; sandbox: SandboxOpts; profilePath: string; onSpawn?: OnSpawn
 }): Promise<IntegrationResult> {
   const targetSha = await mirrorRev(o.mirror, `refs/heads/${o.target}`)
   if (!targetSha) return { kind: 'failed', targetSha: null, checks: null, reason: `대상 브랜치(${o.target})를 찾을 수 없음` }
+  // A reset/rebase of the target must never silently reintroduce history removed since approval.
+  if (!o.baseSha || !await mirrorIsAncestor(o.mirror, o.baseSha, targetSha))
+    return { kind: 'failed', targetSha, checks: null, reason: '대상 브랜치 이력이 요청 기준 커밋을 포함하지 않습니다. 삭제된 이력을 되살리지 않도록 통합을 중단했습니다. 기준 이력을 확인하고 계획을 다시 수립해야 합니다.' }
+  for (const h of o.heads) if (!await mirrorIsAncestor(o.mirror, o.baseSha, h.sha))
+    return { kind: 'failed', targetSha, checks: null, reason: `작업 ${h.taskId}의 제출 커밋이 요청 기준 이력을 포함하지 않습니다.` }
   const wt = await verifyWorktree(o.mirror, o.path, targetSha)
   try {
     for (const h of o.heads) {

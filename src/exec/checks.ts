@@ -23,6 +23,7 @@ export interface ChecksFile {
   checks: CheckOutcome[]; secrets: SecretHit[]; pass: boolean; error: string | null; warnings?: string[]; manual?: string[]; baseTails?: Record<string, string>
   /** The worktree's tracked content differed from the commit under test before any check ran (setup changed it): an environment failure. */
   setupChanged?: boolean
+  environmentFailed?: boolean
   /** Untracked and ignored files present before the first check, i.e. made by setup (the worktree is fresh). Recorded, never a failure. */
   setupCreated?: SetupCreated
 }
@@ -30,10 +31,12 @@ export interface ChecksFile {
 export interface SetupCreated { count: number; sample: string[] }
 /** One check's result on the base (§9 baseline). `setupFailed`: the project setup failed, so the check never ran. */
 export interface BaseResult { pass: boolean; exitCode: number | null; timedOut: boolean; setupFailed?: boolean; tail: string }
+/** Exit 65 alone is also used by build tools; require the sandbox launcher diagnostic. */
+export const sandboxFailure = (code: number | null, output = ''): boolean => code === 65 && /^sandbox-exec:/m.test(output)
 /** The base run says nothing about the code: setup failed, timed out, or the command could not be found/executed. */
-export const envFailure = (b: BaseResult): boolean => !!b.setupFailed || b.timedOut || b.exitCode === 126 || b.exitCode === 127
+export const envFailure = (b: BaseResult): boolean => !!b.setupFailed || b.timedOut || b.exitCode === 126 || b.exitCode === 127 || sandboxFailure(b.exitCode, b.tail)
 /** A base-failed check may be handed to the reviewer only when it failed like on the base: not a timeout or 126/127. */
-export const plainFailure = (r: { pass: boolean; exitCode: number | null }): boolean => !r.pass && r.exitCode !== null && r.exitCode !== 126 && r.exitCode !== 127
+export const plainFailure = (r: { pass: boolean; exitCode: number | null; outputTail?: string }): boolean => !r.pass && r.exitCode !== null && r.exitCode !== 126 && r.exitCode !== 127 && !sandboxFailure(r.exitCode, r.outputTail)
 /** Called with each spawned check process so a restart can kill leftover groups (§9). */
 export type OnSpawn = (pid: number) => void
 
@@ -264,6 +267,8 @@ export async function runChecks(o: RunChecksOpts): Promise<ChecksFile> {
     } else if (c.baseFailed && plainFailure(r)) r.baseFailed = true
     if (c.kind === 'new' && o.basePassed?.[c.id]) warnings.push(`[${c.id}] 이 검사는 base에서도 통과해서 새 동작을 확인하지 않아요`)
     results.push(r)
+    if (sandboxFailure(r.exitCode, r.outputTail)) return { checks: results, secrets: [], pass: false,
+      error: '샌드박스가 검사 실행을 거부했습니다. 코드 검사 결과가 아니므로 실행 환경을 복구해야 합니다.', environmentFailed: true, ...setupCreated }
   }
   const secrets = await secretScan(o.wt.mirror, o.base, o.head)
   return { checks: results, secrets, pass: results.every((r) => r.pass || r.baseFailed) && secrets.length === 0, error: null, warnings, ...setupCreated }

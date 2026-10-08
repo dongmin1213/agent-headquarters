@@ -2,7 +2,7 @@
 import { appendFileSync, closeSync, fstatSync, openSync, readSync } from 'node:fs'
 import { join } from 'node:path'
 import { CodexEvents } from '../codex.ts'
-import { atomicJson, readJson, readText } from './fsx.ts'
+import { atomicJson, readJson } from './fsx.ts'
 
 export interface Activity { at: string; kind: 'message' | 'tool' | 'error' | 'usage'; text: string }
 export interface StreamSignals { sessionId?: string; rateLimit?: Record<string, unknown>; result?: Record<string, unknown> }
@@ -53,6 +53,35 @@ const hasOkToolResult = (line: Record<string, unknown>) => line.type === 'user' 
 
 const MAX_CHUNK = 8 * 1024 * 1024
 
+/** Scan arbitrarily long logs without truncating their final verdict or allocating the whole file.
+ * A single line remains bounded; malformed giant lines are discarded through their next newline.
+ */
+function* streamLines(path: string, end = Infinity): Generator<string> {
+  let fd: number
+  try { fd = openSync(path, 'r') } catch { return }
+  try {
+    if (!fstatSync(fd).isFile()) return
+    const chunk = Buffer.alloc(256 * 1024)
+    let pending = Buffer.alloc(0), dropping = false, offset = 0
+    for (;;) {
+      const n = readSync(fd, chunk, 0, Math.min(chunk.length, Math.max(0, end - offset)), null)
+      offset += n
+      if (!n) break
+      let start = 0
+      for (let i = 0; i < n; i++) if (chunk[i] === 10) {
+        if (!dropping && pending.length + i - start <= MAX_CHUNK)
+          yield Buffer.concat([pending, chunk.subarray(start, i)]).toString('utf8')
+        pending = Buffer.alloc(0); dropping = false; start = i + 1
+      }
+      if (!dropping) {
+        if (pending.length + n - start > MAX_CHUNK) { pending = Buffer.alloc(0); dropping = true }
+        else pending = Buffer.concat([pending, chunk.subarray(start, n)])
+      }
+    }
+    if (!dropping && pending.length) yield pending.toString('utf8')
+  } finally { closeSync(fd) }
+}
+
 /**
  * Follows `<hqDir>/stream.jsonl` from a checkpointed byte offset (`tail.json`), appends `activity.jsonl`,
  * and keeps the signals the runner needs. Only complete lines are consumed, so a half-written line is re-read later.
@@ -64,16 +93,35 @@ export class StreamTail {
   sameErrorCount = 0
   rejectedSeen = false
   toolCount = 0
+  gamePlayCount = 0
+  private gamePlayTool: string | undefined
   result: Record<string, unknown> | null = null
   private lastError = ''
   private codex = new CodexEvents()
 
-  constructor(hqDir: string) {
+  constructor(hqDir: string, gamePlayTool?: string) {
     this.dir = hqDir
+    this.gamePlayTool = gamePlayTool
     const t = readJson<{ offset: number; lastError?: string; sameErrorCount?: number; rejectedSeen?: boolean; lastActivity?: string | null }>(join(hqDir, 'tail.json'))
-    const saved = readJson<{ codexSession?: string; codexText?: string; toolCount?: number }>(join(hqDir, 'tail.json'))
+    const saved = readJson<{ codexSession?: string; codexText?: string; toolCount?: number; gamePlayCount?: number; gamePlayTool?: string }>(join(hqDir, 'tail.json'))
     this.codex.sessionId = saved?.codexSession ?? ''; this.codex.text = saved?.codexText ?? ''; this.toolCount = saved?.toolCount ?? 0
     if (t) { this.offset = t.offset; this.lastError = t.lastError ?? ''; this.sameErrorCount = t.sameErrorCount ?? 0; this.rejectedSeen = !!t.rejectedSeen; this.lastActivity = t.lastActivity ?? null }
+    if (saved?.gamePlayTool === gamePlayTool) this.gamePlayCount = saved?.gamePlayCount ?? 0
+    else if (gamePlayTool) for (const raw of streamLines(join(hqDir, 'stream.jsonl'), this.offset)) {
+      try { if (this.isGamePlay(JSON.parse(raw))) this.gamePlayCount++ } catch { /* malformed line */ }
+    }
+
+  }
+
+  private isGamePlay(line: Record<string, any>): boolean {
+    if (!this.gamePlayTool || line.type !== 'item.started' || line.item?.type !== 'command_execution') return false
+    const normalized = new CodexEvents().consume(line)
+    const input = contentOf(normalized[0] ?? {})[0]?.input as { command?: string } | undefined
+    const command = input?.command ?? ''
+    if (/[;|&`$<>\n\r]/.test(command)) return false
+    const prefixes = [this.gamePlayTool, `'${this.gamePlayTool}'`, `"${this.gamePlayTool}"`].map(p => `python3 ${p} `)
+    const prefix = prefixes.find(p => command.startsWith(p))
+    return !!prefix && /^(?:start|step|stop)(?: |$)/.test(command.slice(prefix.length))
   }
 
   poll(onLine: (line: Record<string, unknown>, s: StreamSignals) => void = () => {}, now = new Date()): void {
@@ -97,7 +145,7 @@ export class StreamTail {
       let line: Record<string, unknown>
       try { line = JSON.parse(raw) } catch { continue }
       if (!line || typeof line !== 'object') continue
-      if (line.type === 'item.started' && !['agent_message', 'reasoning'].includes(String((line.item as any)?.type))) this.toolCount++
+      if (line.type === 'item.started' && !['agent_message', 'reasoning'].includes(String((line.item as any)?.type))) { this.toolCount++; if (this.isGamePlay(line)) this.gamePlayCount++ }
       for (const normalized of this.codex.consume(line)) {
       line = normalized
       const s: StreamSignals = {}
@@ -119,13 +167,13 @@ export class StreamTail {
       appendFileSync(join(this.dir, 'activity.jsonl'), acts.map((a) => JSON.stringify(a)).join('\n') + '\n')
       this.lastActivity = acts[acts.length - 1].text
     }
-    atomicJson(join(this.dir, 'tail.json'), { offset: this.offset, lastError: this.lastError, sameErrorCount: this.sameErrorCount, rejectedSeen: this.rejectedSeen, lastActivity: this.lastActivity, codexSession: this.codex.sessionId, codexText: this.codex.text, toolCount: this.toolCount })
+    atomicJson(join(this.dir, 'tail.json'), { offset: this.offset, lastError: this.lastError, sameErrorCount: this.sameErrorCount, rejectedSeen: this.rejectedSeen, lastActivity: this.lastActivity, codexSession: this.codex.sessionId, codexText: this.codex.text, toolCount: this.toolCount, gamePlayCount: this.gamePlayCount, gamePlayTool: this.gamePlayTool })
   }
 
   /** The final result line, scanning the whole stream if it was consumed before a restart. */
   finalResult(): Record<string, unknown> | null {
     if (this.result) return this.result
-    const lines = (readText(join(this.dir, 'stream.jsonl'), 64 * 1024 * 1024) ?? '').split('\n')
+    const lines = streamLines(join(this.dir, 'stream.jsonl'))
     const decoder = new CodexEvents()
     let result: Record<string, unknown> | null = null
     for (const raw of lines) {
@@ -143,11 +191,10 @@ export interface BashRun { command: string; exitCode: number | null }
  * anything else (interrupted, backgrounded, other errors) → null = unknown.
  */
 export function extractBashRuns(streamPath: string): BashRun[] {
-  const text = readText(streamPath, 64 * 1024 * 1024) ?? ''
   const pending = new Map<string, { command: string; background: boolean }>()
   const runs: BashRun[] = []
   const decoder = new CodexEvents()
-  for (const raw of text.split('\n')) {
+  for (const raw of streamLines(streamPath)) {
     if (!raw.trim()) continue
     let line: Record<string, unknown>
     try { line = JSON.parse(raw) } catch { continue }

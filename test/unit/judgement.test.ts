@@ -37,7 +37,7 @@ test('F01. integration: setup rewriting a tracked file fails before any check (t
   const head = commitFile(e.repo, 'src/a.txt', 'x\n')
   await ensureMirror({ id: 'p', path: e.repo }, e.mirror)
   const path = join(e.home, 'worktrees', 'r', '_integration-p')
-  const res = await integrate({ mirror: e.mirror, requestId: 'r', project: 'p', path, target: 'main', heads: [{ taskId: 'r.A', title: 'A', sha: head }],
+  const res = await integrate({ mirror: e.mirror, requestId: 'r', project: 'p', path, target: 'main', baseSha: e.base, heads: [{ taskId: 'r.A', title: 'A', sha: head }],
     setup: "printf 'GOOD\\n' > value.txt", checks: [{ id: 'A.c', command: 'grep -qx GOOD value.txt' }], timeoutMs: 20_000, sandbox: e.sb(path), profilePath: join(e.dir, 'i.sb') })
   assert.equal(res.kind, 'failed', JSON.stringify(res))
   assert.match((res as { reason: string }).reason, /^setup이 추적 파일을 바꿨어요: value\.txt/)
@@ -98,7 +98,7 @@ test('F02. integration: a base-failed regression check that fails on the integra
   const head = commitFile(e.repo, 'src/a.txt', 'x\n')
   await ensureMirror({ id: 'p', path: e.repo }, e.mirror)
   const path = join(e.home, 'worktrees', 'r', '_integration-p')
-  const res = await integrate({ mirror: e.mirror, requestId: 'r', project: 'p', path, target: 'main', heads: [{ taskId: 'r.A', title: 'A', sha: head }],
+  const res = await integrate({ mirror: e.mirror, requestId: 'r', project: 'p', path, target: 'main', baseSha: e.base, heads: [{ taskId: 'r.A', title: 'A', sha: head }],
     setup: null, checks: [{ id: 'A.R1', command: 'ls missing.txt', kind: 'regression', baseFailed: true }], timeoutMs: 20_000, sandbox: e.sb(path), profilePath: join(e.dir, 'i.sb') })
   assert.equal(res.kind, 'failed', JSON.stringify(res))
   const f = res as { reason: string; checks: { checks: { baseFailed?: boolean; pass: boolean }[]; pass: boolean } }
@@ -189,7 +189,7 @@ test('F02. integrate(): a failing check that is not base-failed means no acknowl
   const head = commitFile(e.repo, 'src/a.txt', 'x\n')
   await ensureMirror({ id: 'p', path: e.repo }, e.mirror)
   const path = join(e.home, 'worktrees', 'r', '_integration-p')
-  const res = await integrate({ mirror: e.mirror, requestId: 'r', project: 'p', path, target: 'main', heads: [{ taskId: 'r.A', title: 'A', sha: head }], setup: null,
+  const res = await integrate({ mirror: e.mirror, requestId: 'r', project: 'p', path, target: 'main', baseSha: e.base, heads: [{ taskId: 'r.A', title: 'A', sha: head }], setup: null,
     checks: [{ id: 'A.R1', command: 'ls missing.txt', kind: 'regression', baseFailed: true }, { id: 'A.N', command: 'ls nope.txt', kind: 'regression' }],
     timeoutMs: 20_000, sandbox: e.sb(path), profilePath: join(e.dir, 'i.sb') })
   assert.equal(res.kind, 'failed')

@@ -85,9 +85,14 @@ export function snapshot(d: ServerDeps): Snapshot {
     const jobs = active.filter(r => r.project === p.id)
     const latest = recent.find(r => r.project === p.id)
     const failed = latest?.status === 'failed' ? latest : null
+    const tasks = jobs.flatMap(r => d.store.tasks(r.id))
+    const running = tasks.some(t => ['running', 'verifying'].includes(t.status)) || d.store.liveAttempts().some(a => tasks.some(t => t.id === a.task_id))
+    const waiting = tasks.find(t => ['blocked', 'question', 'held'].includes(t.status) || /연결 복구 대기/.test(t.note ?? ''))
+    const stalled = waiting && !running && !d.runner.readyTasks().some(t => t.project === p.id) && !d.runner.ceoLock.busy
+
     teams.push({ id: `game:${p.id}`, name: p.name, pack: 'pokemon', kind: 'game', project: p.id, enabled,
-      state: !enabled ? 'idle' : jobs.length ? 'working' : failed ? 'error' : 'idle',
-      bubble: !enabled ? '꺼짐 · 현재 작업 뒤 다음 배정은 쉽니다' : jobs.length ? `게임팀 ${jobs.length}건 진행 · 팀장이 제작하고 피카츄가 검수해요` : failed ? `완성 미달: ${failed.note ?? '작업 실패'}` : '새 요청을 기다려요 · 기획부터 출시 후보까지', lastRun: null, nextRunAt: null })
+      state: !enabled ? 'idle' : stalled ? 'error' : jobs.length ? 'working' : failed ? 'error' : 'idle',
+      bubble: !enabled ? '꺼짐 · 현재 작업 뒤 다음 배정은 쉽니다' : stalled ? `복구·결정 대기: ${waiting.note ?? waiting.title}` : jobs.length ? `게임팀 ${jobs.length}건 진행 · 팀장이 제작하고 피카츄가 검수해요` : failed ? `완성 미달: ${failed.note ?? '작업 실패'}` : '새 요청을 기다려요 · 기획부터 출시 후보까지', lastRun: null, nextRunAt: null })
   }
   const v = d.runner.views(teams.map((t) => ({ name: t.name, state: t.state, bubble: t.bubble })))
   const models: Record<string, string> = d.runner.cfg.models

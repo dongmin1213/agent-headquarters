@@ -24,9 +24,7 @@ export function gameWaiting(store: Store, t: TaskRow): boolean {
 }
 
 /** Transport failures are not product decisions and must not consume the leader's repair budget. */
-export function transientDecisionFailure(error: string | null): boolean {
-  return !!error && /workspace routing discovery failed|ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|network (?:is )?unreachable|fetch failed|stream disconnected|connection (?:reset|closed)|\b(?:502|503|504)\b/i.test(error)
-}
+export { transientTransport as transientDecisionFailure } from './exec/transport.ts'
 export function gameDecisionReady(store: Store, t: TaskRow, now: number): boolean {
   try {
     const retry = JSON.parse(store.get(`game.decision-retry:${t.id}`) ?? 'null')

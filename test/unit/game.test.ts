@@ -7,7 +7,7 @@ import { join } from 'node:path'
 import { GAME_CHECKS, GAME_DEPARTMENTS, GAME_REASSESS, GAME_KEEP_HOLD, gameEnabled, gameNeedsUser, gamePlanProblem, gameWaiting, gameWaitSignature, readGameManifest, type GameManifest } from '../../src/game.ts'
 import { execArgs } from '../../src/codex.ts'
 import { Scheduler } from '../../src/scheduler.ts'
-import { startServer } from '../../src/server.ts'
+import { snapshot, startServer } from '../../src/server.ts'
 import { harness, task, tmp, sh } from './helpers.ts'
 import { useFakeSandboxIfNested } from '../nested.ts'
 
@@ -644,4 +644,24 @@ test('a revised game contract gets fresh recovery rounds without erasing the lif
     assert.match(h.store.task(tid)!.note!, /누적 복구 상한 9회/)
     assert.equal(h.store.get(`game.decisions:${tid}`), '0', 'no paid turn above the lifetime cap')
   } finally { await h.close() }
+})
+
+
+test('game team snapshot reports a technical hold instead of claiming the team is producing', async () => {
+  const h = harness()
+  h.runner.stop()
+  const scheduler = new Scheduler([], h.store, h.bus, 'http://127.0.0.1:18766', { hqHome: h.cfg.home, tokenDir: join(h.dir, 'tok') })
+  try {
+    const id = h.plan([task('A')]); await h.approve(id)
+    h.projects[0].workflow = 'game'
+    h.store.updateTask(`${id}.A`, { status: 'blocked', note: '자동 복구 상한 도달 · 증거 보존' })
+    const deps = { port: 18766, store: h.store, bus: h.bus, scheduler, token: 'test-master', engine: h.engine, runner: h.runner, projects: h.projects }
+    const team = () => snapshot(deps).teams.find(t => t.id === 'game:p')!
+    assert.equal(team().state, 'error')
+    assert.match(team().bubble, /복구·결정 대기.*자동 복구 상한/)
+    h.store.updateTask(`${id}.A`, { status: 'pending', note: null })
+    assert.equal(team().state, 'working', 'ready work is not a hold')
+    h.store.set('game.enabled:p', 'false')
+    assert.equal(team().state, 'idle')
+  } finally { scheduler.stop(); await h.close() }
 })

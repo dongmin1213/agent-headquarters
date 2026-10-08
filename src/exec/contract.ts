@@ -1,6 +1,7 @@
 // Completion judgement for a work attempt (execution.md §8). judgeWork() is pure; the helpers gather its inputs.
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs'
 import { join, matchesGlob } from 'node:path'
+import { transientTransport } from './transport.ts'
 import { mirrorChanged, mirrorHasMerges, mirrorIsAncestor } from './repos.ts'
 
 export interface WorkerQuestion { question: string; options: string[]; default: string }
@@ -96,10 +97,11 @@ export function isLimited(result: Record<string, unknown> | null, stderr: string
   return LIMIT_RE.test(stderr)
 }
 
-export function isTransient(result: Record<string, unknown> | null): boolean {
-  if (!result || result.is_error !== true) return false
+export function isTransient(result: Record<string, unknown> | null, stderr = ''): boolean {
+  if (!result) return transientTransport(stderr)
+  if (result.is_error !== true) return false
   const s = Number(result.api_error_status)
-  return s === 529 || (s >= 500 && s < 600)
+  return s === 529 || (s >= 500 && s < 600) || ((!s || !Number.isFinite(s)) && transientTransport(result.result))
 }
 
 export function parseDone(raw: string | null, token: string): { done: DoneJson | null; problem: string | null } {
@@ -164,7 +166,7 @@ export function judgeWork(f: WorkFacts): Judgement {
   if (f.runaway) return j('runaway', ['폭주 감시로 중단됨'])
   if (isNotLoggedIn(f.result, f.stderr)) return { ...j('limited', ['Codex 로그인 필요']), login: true }
   if (isLimited(f.result, f.stderr, f.rejectedSeen)) return j('limited', ['사용 한도'])
-  if (isTransient(f.result)) return j('transient', [`일시 오류 (API ${String(f.result!.api_error_status)})`])
+  if (isTransient(f.result, f.stderr)) return j('transient', [`일시 연결 오류 (API ${String(f.result?.api_error_status ?? 0)}): ${String(f.result?.result ?? f.stderr).slice(0, 300)}`])
   if (f.result?.subtype === 'error_max_turns') return j('failed', ['턴 상한 도달'])
   const { done, problem } = parseDone(f.doneRaw, f.token)
   if (!done) return j('unverifiable', [f.doneRaw === null && f.doneReadProblem ? f.doneReadProblem : problem!])

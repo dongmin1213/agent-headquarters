@@ -65,6 +65,9 @@ const bash = (command: string, exit: number, output = '') => {
   emit({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, is_error: exit !== 0, content: exit ? `Exit code ${exit}\n${output}` : output || '(Bash completed with no output)' }] } })
 }
 
+if (mk('networkalways') || (mk('networkonce') && !resume) || (schema && mk('reviewnetwork'))) {
+  emit({ type: 'result', is_error: true, session_id: sid, api_error_status: 0, result: 'stream disconnected: ECONNRESET' }); process.exit(1)
+}
 if (schema && prompt.includes('# 교차 검토')) {
   const ids = /수용 기준 id\(([^)]*)\)/.exec(prompt)?.[1].split(', ').filter(Boolean) ?? []
   const mode = mk('review') ?? 'pass'

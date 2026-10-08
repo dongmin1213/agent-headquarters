@@ -2,6 +2,7 @@
 // The runner is the only writer of task/attempt state. Every transition is one DB transaction, guarded by the task
 // generation (§7.7), and intent is recorded before side effects (spawn, git writes, kill). Long work runs in
 // background jobs; the 2-second tick only observes and advances state.
+import { toolBudgetReason } from './tool-budget.ts'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -14,9 +15,9 @@ import { runJsonTurn, reviewModelOf, validateTasks, type Acceptance, type CeoPla
 import type { HqConfig } from '../config.ts'
 import type { ApprovalRow, AttemptRow, RequestRow, Store, TaskRow } from '../store.ts'
 import type { DecisionItem, Headline, QuotaView, Verdict, WorkerView } from '../types.ts'
-import { baseline, checksProfile, envFailure, runChecks, runSandboxed, setupChangedReason, trackedChanges, type BaseResult, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
+import { baseline, checksProfile, envFailure, sandboxFailure, runChecks, runSandboxed, setupChangedReason, trackedChanges, type BaseResult, type CheckSpec, type ChecksFile, type OnSpawn } from './checks.ts'
 import { requestScratchChildren, requestScratchPaths, removeRequestScratch, removeRequestCodexHomes } from './cleanup.ts'
-import { DONE_MAX, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, readOutResult, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
+import { DONE_MAX, isTransient, isLimited, isNotLoggedIn, judgeWork, mirrorFacts, readOut, readOutResult, REPORT_MAX, type GitFacts, type WorkOutcome } from './contract.ts'
 import { BLOCKED_OPTIONS, buildHeadline, decisionItems, hqDirOf, lingeringOf, lingeringPsKey, lingeringWait, outDirOf, RELEASE, workerViews, type HeadlineInput, type Lingering, type LingeringPs } from './decisions.ts'
 import { runDiagnoseTurn } from './diagnose.ts'
 import { atomicJson, atomicWrite, readJson, readText, sha256 } from './fsx.ts'
@@ -529,7 +530,7 @@ export class Runner {
   // ----- live process supervision (§7 §13) -----
   /** `spawned`: the child and its exit watch from launch() (exit observed since spawn, F09); null for recovered processes. */
   track(att: AttemptRow, pid: number, lstart: string | null, startedAt: string | null, spawned: { child: ChildProcess; exit: ExitWatch } | null): Live {
-    const l: Live = { tail: new StreamTail(hqDirOf(att)), pid, lstart, startedAt, child: spawned?.child ?? null, exit: spawned?.exit ?? null,
+    const l: Live = { tail: new StreamTail(hqDirOf(att), join(this.hqRoot, 'tools/game-play/play.py')), pid, lstart, startedAt, child: spawned?.child ?? null, exit: spawned?.exit ?? null,
       exited: false, killAt: null, killed9: false, confirmed: !!spawned, unknownPolls: 0, unknownSince: null }
     if (spawned) spawned.exit.onExit(() => { l.exited = true; this.kick() })
     this.live.set(att.id, l)
@@ -587,9 +588,10 @@ export class Runner {
         const now = this.now()
         const wall = this.wallMs(task)
         const total = att.kind === 'work' && task ? this.spentMs(task, att.id) + elapsed : elapsed
-        if (!att.outcome && (elapsed > wall || total > 3 * wall || l.tail.sameErrorCount >= 3 || l.tail.toolCount > this.cfg.maxTurns)) {
+        const budget = toolBudgetReason(l.tail.toolCount, l.tail.gamePlayCount, this.cfg.maxTurns, this.project(task?.project ?? '')?.workflow === 'game')
+        if (!att.outcome && (elapsed > wall || total > 3 * wall || l.tail.sameErrorCount >= 3 || budget)) {
           const why = elapsed > wall ? `시간 초과 (${Math.round(elapsed / 60_000)}분 > ${wall / 60_000}분)`
-            : total > 3 * wall ? `작업 누적 시간 초과 (${Math.round(total / 60_000)}분 > ${3 * wall / 60_000}분)` : l.tail.toolCount > this.cfg.maxTurns ? `도구 실행 상한 (${this.cfg.maxTurns}) 초과` : `같은 도구 오류 3회 연속: ${l.tail.lastActivity ?? ''}`
+            : total > 3 * wall ? `작업 누적 시간 초과 (${Math.round(total / 60_000)}분 > ${3 * wall / 60_000}분)` : budget ? budget : `같은 도구 오류 3회 연속: ${l.tail.lastActivity ?? ''}`
           this.store.updateAttempt(att.id, { outcome: 'runaway', reason: why })
           att.outcome = 'runaway'
           this.bus.emit({ kind: 'attempt', text: `폭주 감시: ${why}`, data: { id: att.id } })
@@ -742,6 +744,7 @@ export class Runner {
         ...(att.outcome ? {} : { outcome: j.done?.outcome ?? j.outcome }) })
       const t = this.store.task(att.task_id)!
       if (t.status !== 'running' || t.generation !== att.generation) return
+      if (j.outcome !== 'transient') this.store.set(`transport:${t.id}:work`, null)
       switch (j.outcome) {
         case 'succeeded': {
           // A person-judged criterion needs a judge: with no reviewer, add a sonnet review (F03); protected paths likewise (§3).
@@ -773,9 +776,7 @@ export class Runner {
           break
         }
         case 'transient': {
-          const prev = this.store.attempts(t.id).filter((a) => a.kind === 'work' && a.id !== att.id).at(-1)
-          if (prev?.status === 'transient') this.rework(t, `일시 오류가 2번 연속: ${reason}`)
-          else this.tset(t, { status: 'pending', note: reason })
+          this.deferTransport(t, att, reason ?? '일시 연결 오류')
           break
         }
         case 'unverifiable': {
@@ -860,9 +861,31 @@ export class Runner {
       if (this.project(r.project)?.workflow === 'game' && !gameEnabled(this.store, r.project)) continue
       const all = this.store.tasks(r.id)
       // A task whose earlier worker may still run waits for it (not for a slot): it is not ready.
-      for (const t of all) if (['pending', 'rework', 'held'].includes(t.status) && !t.lingering && this.depsPassed(t, all)) out.push(t)
+      for (const t of all) if (['pending', 'rework', 'held'].includes(t.status) && !t.lingering && this.transportReady(t, 'work') && this.depsPassed(t, all)) out.push(t)
     }
     return out
+  }
+
+  private transportState(t: TaskRow, kind: 'work' | 'review'): { failures: number; until: number } | null {
+    try {
+      const r = JSON.parse(this.store.get(`transport:${t.id}:${kind}`) ?? 'null')
+      return r?.generation === t.generation && r?.revision === t.revision && Number.isFinite(r.until) && Number.isFinite(r.failures) ? r : null
+    } catch { return null }
+  }
+
+  private transportReady(t: TaskRow, kind: 'work' | 'review'): boolean {
+    return this.now() >= (this.transportState(t, kind)?.until ?? 0)
+  }
+
+  /** Bounded, persisted backoff; keep the clone and work thread, never promote the model for a lost connection. */
+  private deferTransport(t: TaskRow, att: AttemptRow, reason: string): void {
+    const failures = (this.transportState(t, att.kind === 'work' ? 'work' : 'review')?.failures ?? 0) + 1
+    const delay = Math.min(15 * 60_000, 60_000 * 2 ** Math.min(failures - 1, 4))
+    this.store.set(`transport:${t.id}:${att.kind}`, JSON.stringify({ generation: t.generation, revision: t.revision, failures, until: this.now() + delay }))
+    if (att.kind === 'work') this.tset(t, { resume_session: att.session_id })
+    if (failures >= 8) { this.block(this.store.task(t.id)!, `연결 복구 8회 실패 · 작업과 세션 보존 · ${reason}`); return }
+    this.tset(t, { status: att.kind === 'work' ? 'pending' : 'reviewing', note: `연결 복구 대기 · ${Math.round(delay / 60_000)}분 후 자동 재시도 · ${reason}` })
+    this.emitTask(t, '연결 복구 대기 · 재작업 예산과 모델 유지 · 독립 작업은 계속')
   }
 
   private async dispatch(): Promise<void> {
@@ -882,7 +905,7 @@ export class Runner {
       const r = this.store.request(t.request_id)
       if (!r || !['executing', 'blocked'].includes(r.status)) continue
       if (this.project(r.project)?.workflow === 'game' && !gameEnabled(this.store, r.project)) continue
-      if (this.store.liveAttempts().some((a) => a.task_id === t.id) || t.lingering) continue
+      if (this.store.liveAttempts().some((a) => a.task_id === t.id) || t.lingering || !this.transportReady(t, 'review')) continue
       if (this.claimReview(t)) free--
     }
     for (const t of this.readyTasks()) {
@@ -1176,8 +1199,8 @@ export class Runner {
         }
         continue
       }
-      if (!b.timedOut && kindOf(a) === 'new') continue
-      const why = b.timedOut ? `${this.cfg.checkTimeoutMinutes}분 안에 끝나지 않음` : b.exitCode === 127 ? 'exit 127 (명령을 찾지 못함)' : 'exit 126 (실행할 수 없음)'
+      if (!b.timedOut && !sandboxFailure(b.exitCode, b.tail) && kindOf(a) === 'new') continue
+      const why = sandboxFailure(b.exitCode, b.tail) ? '샌드박스 실행 거부 (exit 65)' : b.timedOut ? `${this.cfg.checkTimeoutMinutes}분 안에 끝나지 않음` : b.exitCode === 127 ? 'exit 127 (명령을 찾지 못함)' : 'exit 126 (실행할 수 없음)'
       const l = lastLine(b.tail)
       lines.push(`- [${a.id}] ${a.check} → ${why}${l ? `: ${l}` : ''}`)
     }
@@ -1258,7 +1281,7 @@ export class Runner {
       file.baseTails = Object.fromEntries(file.manual.map((id) => [id, eff.baseTails[id] ?? '']))
       atomicJson(join(hq, 'checks.json'), file)
       // Setup rewrote tracked files: an environment failure (the chairman decides), not the worker's fault (F01).
-      if (file.setupChanged) throw new Setup(file.error!)
+      if (file.setupChanged || file.environmentFailed) throw new Setup(file.error!)
       const failed = file.checks.filter((c) => !c.pass && !c.baseFailed).map((c) => `[${c.id}] ${c.command} → ${c.exitCode ?? '시간 초과'}`)
       if (file.error) failed.unshift(file.error)
       if (file.secrets.length) failed.push(`비밀값 패턴·금지 파일: ${file.secrets.map((s) => `${s.file}:${s.line}(${s.pattern})`).join(', ')}`)
@@ -1386,6 +1409,15 @@ export class Runner {
       })
       return // otherwise the task stays reviewing; dispatch restarts the review when the hold ends
     }
+    if (att.outcome !== 'runaway' && isTransient(result, stderr)) {
+      this.store.tx(() => {
+        const reason = `검토 연결 오류: ${String(result?.result ?? stderr).slice(0, 300)}`
+        this.store.updateAttempt(att.id, { status: 'transient', ended_at: endedAt, reason, ...this.usage(result) })
+        this.deferTransport(this.store.task(task.id)!, att, reason)
+      })
+      return
+    }
+    this.store.set(`transport:${task.id}:review`, null)
     const codeChanged = task.role === 'implement' && task.base_sha && task.head_sha ? (await mirrorChanged(this.mirror(task.project), task.base_sha, task.head_sha).catch(() => ['?'])).length > 0 : false
     const spec = specOf(task)
     // Evidence first: the reviewer's real Bash runs go to the DB before the verdict is judged.
@@ -1467,7 +1499,7 @@ export class Runner {
     const p = this.procTracker('integration')
     let res
     try {
-      res = await integrate({ mirror, requestId, project: projectId, path, target, heads: tasks.map((t) => ({ taskId: t.id, title: t.title, sha: t.head_sha! })),
+      res = await integrate({ mirror, requestId, project: projectId, path, target, baseSha: this.store.get(`base:${requestId}:${projectId}`), heads: tasks.map((t) => ({ taskId: t.id, title: t.title, sha: t.head_sha! })),
         setup: project.setup ?? null, checks: eff.flatMap((x) => x.e.checks), timeoutMs: this.cfg.checkTimeoutMinutes * 60_000,
         sandbox: this.sandboxFor(path, null, projectId), profilePath: join(hq, 'checks.sb'), onSpawn: p.onSpawn })
     } finally { p.done() }
