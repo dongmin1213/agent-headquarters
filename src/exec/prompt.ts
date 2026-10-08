@@ -1,5 +1,5 @@
 // Worker and reviewer prompts (execution.md §6 §8 §10 §11).
-import { GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, GAME_WORKER_RULES } from '../game.ts'
+import { GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, GAME_WORKER_RULES, GAME_REVIEW_BOUNDARY } from '../game.ts'
 import { GAME_QUALITY_RULES } from '../game-quality.ts'
 import type { PlanTask } from '../ceo.ts'
 import type { Verdict } from '../types.ts'
@@ -99,7 +99,7 @@ export function workPrompt(o: WorkPromptInput): string {
     '',
     '## 지시서',
     t.brief,
-    ...(o.game ? [GAME_WORKER_RULES, GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, GAME_QUALITY_RULES, `직군: ${t.department}`] : []),
+    ...(o.game ? [GAME_WORKER_RULES, GAME_ECONOMY_RULES, GAME_PLAYTEST_RULES, GAME_QUALITY_RULES, GAME_REVIEW_BOUNDARY, `직군: ${t.department}`] : []),
     '',
     '## 수정 가능 범위 (owns)',
     bullet(t.owns),
@@ -180,6 +180,7 @@ export function reviewPrompt(o: ReviewPromptInput): string {
     '',
     '## 회장의 요청', o.requestText.replace(/\s+/g, ' '),
     '', '## 원 지시서', t.brief,
+    ...(t.department ? ['검토 역할: 지금이 HQ가 배정한 독립 검토 단계다. 제작자의 제출은 승인 전 후보이다. 네가 직접 필수 기준과 실제 실행 증거를 검증하고, 별도 검토자에게 다시 위임하거나 제작자의 자체 판정만으로 통과시키지 않는다. 제작자에게 독립 검토 보고서가 없다는 이유만으로 반려하지 않는다. 미완료·결함이 있으면 근거와 담당 수정 지시로 반려한다.'] : []),
     ...(t.role === 'collect' ? ['', '이 작업은 읽기 전용 조사(collect)다. 산출물은 아래 HQ 봉인 보고서이며 저장소에 docs 파일을 만들지 않는 것이 정상이다. owns에 예정 파일명이 있더라도 파일 부재만으로 반려하지 않는다. 보고서 내용과 출처를 독립 검증한다. 환경 제약은 관측한 세션 범위로 판정한다. 게임 프로젝트는 이미지 생성이 art 직군에만 활성화되므로 research 세션에 도구가 없는 것은 정상이며 제작 전체의 부재를 뜻하지 않는다.'] : []),
     ...(o.previousIssue ? ['', '## 이전 검토 문제와 수정 방향', o.previousIssue, '같은 형식 오류를 반복하지 않는다. 이번 세션에서 직접 실행한 단일 명령만 tests_run에 기록한다. 따옴표 안의 세미콜론/줄바꿈도 허용되지 않는다. Python -c 대신 필요시 임시 스크립트 파일을 만들어 한 명령으로 실행한다.'] : []),
     '', '## 수정 가능 범위 (owns)', bullet(t.owns),
