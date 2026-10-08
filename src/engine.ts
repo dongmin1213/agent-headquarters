@@ -98,7 +98,12 @@ export class RequestEngine {
       }
       const tasks = this.store.tasks(r.id)
       const attempts = tasks.reduce((n, t) => n + this.store.attempts(t.id).length, 0)
-      if (attempts >= 100) { this.fail(r.id, '게임팀 실행 상한 100회에 도달했습니다. 완성으로 처리하지 않습니다.'); return true }
+      const attemptLimit = this.runner.gameAttemptLimit(r.id)
+      if (attempts >= attemptLimit && tasks.some(t => t.status !== 'passed')) {
+        // Let the already-paid attempt finish. Dispatch refuses further work/review starts at the cap.
+        if (this.store.liveAttempts().some(a => tasks.some(t => t.id === a.task_id))) continue
+        this.fail(r.id, `게임팀 실행 상한 ${attemptLimit}회에 도달했습니다. 완성으로 처리하지 않습니다.`); return true
+      }
       const integration = this.store.openApprovals().find(a => a.id.startsWith(`integration:${r.id}:`))
       if (integration) {
         const key = `game.integration:${r.id}`, rounds = Number(this.store.get(key) ?? 0)

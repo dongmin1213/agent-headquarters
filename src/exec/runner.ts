@@ -3,8 +3,8 @@
 // generation (§7.7), and intent is recorded before side effects (spawn, git writes, kill). Long work runs in
 // background jobs; the 2-second tick only observes and advances state.
 import { toolBudgetReason } from './tool-budget.ts'
-import { randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, rmSync } from 'node:fs'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { existsSync, lstatSync, readFileSync, realpathSync, mkdirSync, rmSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
@@ -34,6 +34,7 @@ import { extractBashRuns, lastActivityOf, StreamTail } from './stream.ts'
 import { codexArgs, defaultProbe, findOrphan, groupIdentity, identify, killGroup, launch, LaunchAborted, looksLikeWorker, pidAlive, psInfo, readProcessInfo, removeCacheDir, terminateGroup, type ExitWatch, type Identity, type Probe } from './worker.ts'
 import { reconcile as reconcileInvariants, recover as recoverState, type Violation } from './reconcile.ts'
 import { AttemptClock } from './attempt-clock.ts'
+import { feedbackSpecs, type GameFinding } from '../game-feedback.ts'
 import { ancestors, containedOwn, flowSignature } from '../game-flow.ts'
 import { GAME_REASSESS, GAME_KEEP_HOLD } from '../game.ts'
 
@@ -243,7 +244,7 @@ export class Runner {
   sandboxFor(worktree: string, out: string | null, projectId: string): SandboxOpts {
     return { worktree, out, graphics: this.project(projectId)?.workflow === 'game', hqHome: this.home, tokenDir: this.tokenDir, hqPort: this.hqPort, extraWritable: this.cfg.sandbox.extraWritable,
       projects: this.projects.map((p) => p.path), mirror: this.mirror(projectId), readable: [...codexBinReadable(this.cfg.codexBin),
-        ...(this.project(projectId)?.workflow === 'game' ? [join(this.hqRoot, 'tools/game-play')] : [])] }
+        ...(this.project(projectId)?.workflow === 'game' ? [join(this.hqRoot, 'tools/game-play'), join(this.home, 'quality-feedback', projectId)] : [])] }
   }
 
   gamePlayTools(): string {
@@ -880,7 +881,7 @@ export class Runner {
   readyTasks(): TaskRow[] {
     const out: TaskRow[] = []
     for (const r of this.store.requestsByStatus(['executing'])) {
-      if (this.project(r.project)?.workflow === 'game' && !gameEnabled(this.store, r.project)) continue
+      if (this.project(r.project)?.workflow === 'game' && (!gameEnabled(this.store, r.project) || !this.gameAttemptBudgetAvailable(r.id))) continue
       const all = this.store.tasks(r.id)
       // A task whose earlier worker may still run waits for it (not for a slot): it is not ready.
       for (const t of all) if (['pending', 'rework', 'held'].includes(t.status) && !t.lingering && this.transportReady(t, 'work') && this.depsPassed(t, all)) out.push(t)
@@ -926,7 +927,7 @@ export class Runner {
       if (free <= 0) return
       const r = this.store.request(t.request_id)
       if (!r || !['executing', 'blocked'].includes(r.status)) continue
-      if (this.project(r.project)?.workflow === 'game' && !gameEnabled(this.store, r.project)) continue
+      if (this.project(r.project)?.workflow === 'game' && (!gameEnabled(this.store, r.project) || !this.gameAttemptBudgetAvailable(r.id))) continue
       if (this.store.liveAttempts().some((a) => a.task_id === t.id) || t.lingering || !this.transportReady(t, 'review')) continue
       if (this.claimReview(t)) free--
     }
@@ -938,6 +939,7 @@ export class Runner {
 
   // ----- work attempts (§7 start protocol) -----
   private claimWork(t: TaskRow): boolean {
+    if (!this.gameAttemptBudgetAvailable(t.request_id)) return false
     const { prev, counted } = this.workCounting(t)
     const resume = t.resume_session
     const n = this.store.nextAttemptN(t.id, 'work')
@@ -1352,6 +1354,7 @@ export class Runner {
   }
 
   private claimReview(t: TaskRow): boolean {
+    if (!this.gameAttemptBudgetAvailable(t.request_id)) return false
     const n = this.store.nextAttemptN(t.id, 'review')
     const id = `${t.id}~r${n}`
     this.store.insertAttempt({ id, task_id: t.id, kind: 'review', n, model: t.review_model, status: 'starting', attempt_token: randomBytes(16).toString('hex'),
@@ -1462,7 +1465,11 @@ export class Runner {
         reason: check.kind === 'invalid' ? check.reason : check.kind === 'blocking' ? check.verdict.blocking.map((b) => b.summary).join('; ').slice(0, 2000) : null })
       const t = this.store.task(att.task_id)!
       if (t.status !== 'reviewing' || t.generation !== att.generation || t.head_sha !== task.head_sha) return
-      if (check.kind === 'pass') this.tset(t, { status: 'passed', note: null })
+      if (check.kind === 'pass') {
+        this.tset(t, { status: 'passed', note: null })
+        for (const criterion of check.verdict.criteria.filter(c => c.id.startsWith('QF-')))
+          this.store.set(`game.finding-verdict:${t.id}:${criterion.id}`, JSON.stringify({ head: t.head_sha, generation: t.generation, review: att.id, criterion, at: endedAt }))
+      }
       else if (check.kind === 'blocking') this.rework(t, `검토 blocking: ${check.verdict.blocking.map((b) => `[${b.id}] ${b.summary}`).join('; ')}`)
       else {
         const cnt = t.review_invalid + 1
@@ -2206,6 +2213,65 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
     this.store.set(`revise:${taskId}`, null)
     this.invalidateDependents(this.store.task(taskId)!)
     this.emitTask(t, `지시서 수정 적용: ${rev.title} (revision ${t.revision + 1})`)
+    this.kick()
+    return null
+  }
+
+  gameAttemptLimit(requestId: string): number {
+    try {
+      const budget = JSON.parse(this.store.get(`game.attempt-budget:${requestId}`) ?? 'null')
+      return Number.isInteger(budget?.limit) && budget.limit >= 100 && budget.limit <= 124 && typeof budget.reason === 'string' && budget.reason.trim() ? budget.limit : 100
+    } catch { return 100 }
+  }
+
+  /** Operator-authorized corrective scope only; supervisors never increase their own execution budget. */
+  grantGameRepairBudget(requestId: string, limit: number, reason: string): string | null {
+    const r = this.store.request(requestId)
+    if (!r || r.status !== 'executing' || this.project(r.project)?.workflow !== 'game'
+      || !Number.isInteger(limit) || limit < this.gameAttemptLimit(requestId) || limit > 124 || !reason.trim()) return '게임 수정 실행 예산은 사유와 함께 기존 상한~124회 범위로만 설정합니다'
+    this.store.set(`game.attempt-budget:${requestId}`, JSON.stringify({ limit, reason, at: this.iso(), previous: this.gameAttemptLimit(requestId) }))
+    this.emitRequest(requestId, `게임 수정 실행 예산 ${limit}회 · 기존 시도 이력과 사용량 제한 유지 · ${reason}`)
+    return null
+  }
+
+  private gameAttemptBudgetAvailable(requestId: string): boolean {
+    const r = this.store.request(requestId)
+    return !r || this.project(r.project)?.workflow !== 'game'
+      || this.store.tasks(requestId).reduce((n, t) => n + this.store.attempts(t.id).length, 0) < this.gameAttemptLimit(requestId)
+  }
+
+  /** Apply observed defects to pending owners and their QA gate without interrupting active production. */
+  registerGameFindings(requestId: string, findings: GameFinding[], gateKey: string, signature: string): string | null {
+    const request = this.store.request(requestId), rows = this.store.tasks(requestId)
+    if (!request || request.status !== 'executing' || this.project(request.project)?.workflow !== 'game'
+      || flowSignature(rows) !== signature) return '품질 지시 대상 상태가 바뀌었습니다'
+    const evidenceDir = join(this.home, 'quality-feedback', request.project)
+    const { specs, error } = feedbackSpecs(rows, findings, gateKey, evidenceDir)
+    if (error) return error
+    for (const f of findings) {
+      if (this.store.get(`game.finding:${requestId}:${f.id}`)) return `이미 등록한 결함입니다: ${f.id}`
+      for (const e of f.evidence) {
+        const path = join(evidenceDir, e.file)
+        try {
+          if (!lstatSync(path).isFile() || lstatSync(path).isSymbolicLink() || lstatSync(path).size > 8 * 1024 * 1024 || realpathSync(path) !== path
+            || createHash('sha256').update(readFileSync(path)).digest('hex') !== e.sha256) return `품질 증거 해시/경로 불일치: ${e.file}`
+        } catch { return `품질 증거를 읽을 수 없습니다: ${e.file}` }
+      }
+    }
+    const problem = validateTasks(specs, this.projects) ?? gamePlanProblem({ summary: '', assumptions: [], tasks: specs }, request.project)
+    if (problem) return problem
+    this.store.tx(() => {
+      const targets = new Set([...findings.map(f => f.owner), gateKey])
+      for (const row of rows.filter(row => targets.has(row.key))) {
+        const spec = specs.find(s => s.id === row.key)!
+        if (JSON.stringify(spec) === row.spec) continue
+        this.store.updateTask(row.id, { spec: JSON.stringify(spec), revision: row.revision + 1, review_model: reviewModelOf(spec) })
+      }
+      for (const f of findings) this.store.set(`game.finding:${requestId}:${f.id}`, JSON.stringify({ ...f, gate: gateKey, at: this.iso() }))
+      const plan = JSON.stringify({ ...JSON.parse(request.plan!), tasks: specs })
+      this.store.updateRequest(requestId, { plan, plan_hash: sha256(plan) })
+    })
+    this.emitRequest(requestId, `관측 품질 결함 ${findings.length}건을 제작 담당과 독립 검수의 필수 기준으로 배정했습니다`)
     this.kick()
     return null
   }

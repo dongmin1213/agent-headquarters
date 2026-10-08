@@ -58,6 +58,8 @@ export function checkVerdict(raw: unknown, o: { acceptanceIds: string[]; codeCha
   const missing = o.acceptanceIds.filter((x) => !ids.includes(x)), unknown = ids.filter((x) => !o.acceptanceIds.includes(x))
   if (missing.length) return bad(`criteria에 빠진 수용 기준: ${missing.join(', ')}`)
   if (unknown.length) return bad(`criteria에 모르는 id: ${unknown.join(', ')}`)
+  const emptyEvidence = verdict.criteria.filter(c => !c.evidence.trim()).map(c => c.id)
+  if (emptyEvidence.length) return bad(`수용 기준 판정 근거가 비어 있음: ${emptyEvidence.join(', ')}`)
   const unjudged = (o.judgeIds ?? []).filter((id) => { const c = verdict.criteria.find((x) => x.id === id); return !c || (c.result !== 'pass' && c.result !== 'fail') })
   if (unjudged.length) return bad(`사람 확인이 필요한 기준을 판정하지 않음(pass 또는 fail이어야 함): ${unjudged.join(', ')}`)
   if (o.codeChanged && !verdict.tests_run.length) return bad('코드 변경이 있는데 tests_run이 비어 있음')

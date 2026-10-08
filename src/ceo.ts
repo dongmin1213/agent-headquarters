@@ -38,7 +38,7 @@ export const TASK_SCHEMA = { type: 'object', additionalProperties: false,
     id: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,32}$' }, title: str, project: str,
     role: { enum: ['collect', 'implement'] }, grade: { enum: ['L0', 'L1', 'L2', 'L3'] },
     model: { enum: ['haiku', 'sonnet', 'opus'] }, owns: strArr,
-    acceptance: { type: 'array', minItems: 1, maxItems: 7, items: { type: 'object', additionalProperties: false,
+    acceptance: { type: 'array', minItems: 1, maxItems: 16, items: { type: 'object', additionalProperties: false,
       required: ['id', 'text', 'check', 'kind'], properties: { id: str, text: str, check: str, kind: { enum: ['new', 'regression'] } } } },
     brief: str, depends_on: strArr,
     review: { type: 'object', additionalProperties: false, required: ['brief', 'model'], properties: { brief: str, model: { enum: ['sonnet', 'opus', 'none'] } } } } }
@@ -118,6 +118,7 @@ export function validateTasks(tasks: PlanTask[], projects: Project[]): string | 
     if (t.depends_on.includes(t.id)) return `작업 ${josa(t.id, '이/가')} 자기 자신에 의존합니다`
     for (const d of t.depends_on) if (!ids.has(d)) return `작업 ${josa(t.id, '이/가')} 없는 작업 ${d}에 의존합니다`
     if (t.role === 'implement' && t.owns.length === 0) return `작업 ${t.id}에 owns가 없습니다`
+    if (!t.acceptance.length || t.acceptance.length > 16) return `작업 ${t.id} 수용 기준은 1~16개여야 합니다`
     const accIds = t.acceptance.map((a) => a.id)
     if (new Set(accIds).size !== accIds.length) return `작업 ${t.id}의 수용 기준 id가 중복됩니다`
     for (const a of t.acceptance) {
