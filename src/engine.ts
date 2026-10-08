@@ -101,11 +101,12 @@ export class RequestEngine {
       try {
         const rounds = Number(this.store.get(`game.decisions:${t.id}`) ?? 0)
         const totalRounds = Number(this.store.get(`game.decisions-total:${t.id}`) ?? rounds)
+        const reassess = this.store.get(`game.hold-reassess:${t.id}`) === gameWaitSignature(this.store, t)
         if (totalRounds >= 9) { this.waitGameTask(t, `피카츄 누적 복구 상한 9회 도달 · 미해결 근거를 보존합니다: ${t.title} — ${t.note ?? ''}`, false); return true }
-        if (rounds >= 3) { this.waitGameTask(t, `피카츄 내부 복구 상한 도달 · 미해결 상태를 보존합니다: ${t.title} — ${t.note ?? ''}`, false); return true }
+        if (rounds >= 3 && !reassess) { this.waitGameTask(t, `피카츄 내부 복구 상한 도달 · 미해결 상태를 보존합니다: ${t.title} — ${t.note ?? ''}`, false); return true }
         const questions = this.store.taskQuestions(t.id).filter(q => q.answer === null)
-        const decisionModel = rounds === 0 ? 'sonnet' : 'opus'
-        const supervisor = rounds > 0
+        const decisionModel = rounds === 0 && !reassess ? 'sonnet' : 'opus'
+        const supervisor = rounds > 0 || reassess
         const signature = gameWaitSignature(this.store, t)
         const previous = this.store.get(`game.decision:${t.id}:${rounds}`) ?? '(없음)'
         const result = await runJsonTurn({ codexBin: this.runner.cfg.codexBin, runtimeHome: this.runner.home, model: this.runner.cfg.models[decisionModel],
@@ -142,6 +143,7 @@ export class RequestEngine {
           return true
         }
         this.store.set(`game.decision-retry:${t.id}`, null)
+        this.store.set(`game.hold-reassess:${t.id}`, null)
         this.store.set(`game.decisions:${t.id}`, String(rounds + 1))
         this.store.set(`game.decisions-total:${t.id}`, String(totalRounds + 1))
         const o = result.output as GameDecision | null
@@ -297,8 +299,9 @@ export class RequestEngine {
   /** Preserve the failed criterion and stop repeated decisions, without stopping independent work. */
   private waitGameTask(t: TaskRow, reason: string, needsUser: boolean): void {
     this.store.tx(() => {
-      this.store.set(`game.waiting:${t.id}`, JSON.stringify({ signature: gameWaitSignature(this.store, t), reason, needsUser, at: new Date().toISOString() }))
-      this.store.updateTask(t.id, { note: reason.slice(0, 4000) })
+      // A new visible hold is a new decision occurrence, including when the worker's state is still "question".
+      this.store.updateTask(t.id, { note: reason.slice(0, 4000), block_count: t.block_count + 1 })
+      this.store.set(`game.waiting:${t.id}`, JSON.stringify({ signature: gameWaitSignature(this.store, this.store.task(t.id)!), reason, needsUser, at: new Date().toISOString() }))
       if (this.store.request(t.request_id)?.status === 'blocked') this.store.updateRequest(t.request_id, { status: 'executing' })
     })
     this.bus.emit({ kind: 'task', text: `${t.title}: ${needsUser ? '사용자 결정 필요' : '내부 복구 보류 · 미해결 원인 보고'} · 독립 작업은 계속`, data: { id: t.id } })

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { mkdirSync, writeFileSync, symlinkSync, rmSync, cpSync, readFileSync, existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { GAME_CHECKS, GAME_DEPARTMENTS, gameEnabled, gameNeedsUser, gamePlanProblem, gameWaiting, gameWaitSignature, readGameManifest, type GameManifest } from '../../src/game.ts'
+import { GAME_CHECKS, GAME_DEPARTMENTS, GAME_REASSESS, GAME_KEEP_HOLD, gameEnabled, gameNeedsUser, gamePlanProblem, gameWaiting, gameWaitSignature, readGameManifest, type GameManifest } from '../../src/game.ts'
 import { execArgs } from '../../src/codex.ts'
 import { Scheduler } from '../../src/scheduler.ts'
 import { startServer } from '../../src/server.ts'
@@ -215,7 +215,13 @@ test('supervisor distinguishes owner decisions from technical holds, without rep
       assert.equal(gameNeedsUser(h.store, a), mode === 'owner')
       assert.equal(h.runner.views().decisions.some(d => d.kind === 'worker_question' && d.taskId === a.id), mode === 'owner')
       if (mode === 'owner') assert.match(h.runner.views().decisions.find(d => d.taskId === a.id)!.detail, /피카츄 검토/)
-      if (mode !== 'owner') assert.match(h.runner.views().headline.text, /막혔어요/)
+      if (mode !== 'owner') {
+        const report = h.runner.views().decisions.find(d => d.id === `game-hold:${a.id}`)!
+        assert.equal(report.kind, 'blocked')
+        assert.match(report.detail!, /이미 시도한 판단/)
+        assert.deepEqual(report.options, [GAME_REASSESS, GAME_KEEP_HOLD, 'stop'])
+        assert.equal(h.runner.views().headline.needsYou, 1)
+      }
       const count = h.store.get(`game.decisions:${a.id}`)
       await h.engine.tick(); await h.engine.tick()
       assert.equal(h.store.get(`game.decisions:${a.id}`), count, 'no repeated paid decisions for the same wait')
@@ -263,6 +269,49 @@ function repairFixture() {
   h.store.updateTask(tid, { diagnosis: '{}', worktree: h.repo })
   return { h, id, tid, spec }
 }
+
+test('technical hold report can be acknowledged and a new occurrence becomes visible again', async () => {
+  const { h, tid } = repairFixture()
+  try {
+    h.store.set(`game.decisions:${tid}`, '3')
+    await h.engine.tick()
+    const report = h.runner.views().decisions.find(d => d.id === `game-hold:${tid}`)!
+    assert.ok(report)
+    assert.match(h.runner.decideTask(tid, GAME_KEEP_HOLD, report.revision - 1)!, /오래된/)
+    assert.equal(h.runner.decideTask(tid, GAME_KEEP_HOLD, report.revision), null)
+    assert.equal(h.runner.views().decisions.some(d => d.id === report.id), false)
+    assert.equal(gameWaiting(h.store, h.store.task(tid)!), true)
+    h.store.set(`game.waiting:${tid}`, null) // A subsequent failure/decision occurrence.
+    await h.engine.tick()
+    const next = h.runner.views().decisions.find(d => d.id === report.id)!
+    assert.ok(next.revision > report.revision)
+    assert.equal(h.runner.views().headline.needsYou, 1)
+  } finally { await h.close() }
+})
+
+test('owner-requested reassessment grants one supervisor judgment, not a blind worker retry or cap reset', async () => {
+  const { h, tid, spec } = repairFixture()
+  try {
+    h.store.updateTask(tid, { spec: JSON.stringify({ ...spec, brief: '[[FAKE:leadwait]]' }) })
+    h.store.set(`game.decisions:${tid}`, '3'); h.store.set(`game.decisions-total:${tid}`, '7')
+    await h.engine.tick()
+    const card = h.runner.views().decisions.find(d => d.id === `game-hold:${tid}`)!
+    assert.equal(h.runner.decideTask(tid, GAME_REASSESS, card.revision), null)
+    assert.equal(h.store.task(tid)!.status, 'blocked')
+    assert.equal(h.store.get(`game.decisions-total:${tid}`), '7')
+    await h.engine.tick()
+    assert.equal(h.store.get(`game.decisions-total:${tid}`), '8')
+    assert.equal(JSON.parse(h.store.get(`game.decision:${tid}:4`)!).supervisor, true)
+    assert.equal(h.store.get(`game.hold-reassess:${tid}`), null)
+    assert.equal(gameWaiting(h.store, h.store.task(tid)!), true)
+    await h.engine.tick()
+    assert.equal(h.store.get(`game.decisions-total:${tid}`), '8')
+    h.store.set(`game.decisions-total:${tid}`, '9')
+    const exhausted = h.runner.views().decisions.find(d => d.id === `game-hold:${tid}`)!
+    assert.deepEqual(exhausted.options, [GAME_KEEP_HOLD, 'stop'])
+    assert.match(h.runner.decideTask(tid, GAME_REASSESS, exhausted.revision)!, /상한/)
+  } finally { await h.close() }
+})
 
 function orderFixture() {
   const f = repairFixture(), { h, id, tid, spec } = f

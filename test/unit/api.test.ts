@@ -6,8 +6,24 @@ import { Scheduler } from '../../src/scheduler.ts'
 import { startServer } from '../../src/server.ts'
 import { harness, req, task, tsk, type Harness } from './helpers.ts'
 import { useFakeSandboxIfNested } from '../nested.ts'
+import { GAME_KEEP_HOLD, gameWaitSignature } from '../../src/game.ts'
 
 useFakeSandboxIfNested()
+
+test('technical hold report actions are accepted through the pet/web task decision endpoint', async () => {
+  const h = harness(); h.runner.stop(); h.projects[0].workflow = 'game'
+  const { server, call } = await api(h)
+  try {
+    const id = h.plan([task('A', { department: 'art' })]); await h.approve(id)
+    const tid = `${id}.A`; h.store.updateTask(tid, { status: 'blocked', block_count: 2, note: '복구 상한' })
+    h.store.set(`game.waiting:${tid}`, JSON.stringify({ signature: gameWaitSignature(h.store, h.store.task(tid)!), needsUser: false }))
+    assert.equal(h.runner.views().headline.needsYou, 1)
+    const res = await call('POST', `/api/tasks/${enc(tid)}/decide`, { decision: GAME_KEEP_HOLD, revision: 2 })
+    assert.equal(res.status, 200)
+    assert.equal(h.runner.views().headline.needsYou, 0)
+    assert.equal(h.store.task(tid)!.status, 'blocked')
+  } finally { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); await h.close() }
+})
 
 const TOKEN = 'test-token-123'
 /** Percent-encode every character, so the server must decode path ids exactly once. */

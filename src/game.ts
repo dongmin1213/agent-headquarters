@@ -10,6 +10,8 @@ export type GameDepartment = typeof GAME_DEPARTMENTS[number]
 export const GAME_CHECKS = ['boot', 'movement', 'combat', 'progression', 'save-load', 'ending'] as const
 export const gameEnabled = (store: Store, project: string) => store.get(`game.enabled:${project}`) !== 'false'
 export const GAME_MANIFEST = 'release/game-release.json'
+export const GAME_REASSESS = '피카츄 재진단 1회'
+export const GAME_KEEP_HOLD = '보류 유지'
 
 /** A wait belongs to one exact occurrence; answers/retries/new attempts invalidate it. */
 export function gameWaitSignature(store: Store, t: TaskRow): string {

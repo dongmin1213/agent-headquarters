@@ -13,6 +13,7 @@ import type { RequestEngine } from './engine.ts'
 import type { Project } from './ceo.ts'
 import type { Runner } from './exec/runner.ts'
 import { hqDirOf, lingeringOf, outDirOf, recommendMerges, RELEASE, taskView } from './exec/decisions.ts'
+import { GAME_REASSESS, GAME_KEEP_HOLD } from './game.ts'
 import { hqGit, SAFE_DIFF } from './exec/repos.ts'
 import { SERVER_ERROR } from './humanize.ts'
 import { readText } from './exec/fsx.ts'
@@ -195,7 +196,7 @@ export function createApi(d: ServerDeps): ApiRouter {
         }
         if (parts[3] === 'decide') {
           if (!str(b.decision)) throw new HttpError(400, 'decision이 필요합니다')
-          if (!['retry', 'skip', 'stop', RELEASE].includes(b.decision)) throw new HttpError(400, 'decision은 retry | skip | stop | release 중 하나여야 합니다')
+          if (!['retry', 'skip', 'stop', RELEASE, GAME_REASSESS, GAME_KEEP_HOLD].includes(b.decision)) throw new HttpError(400, '지원하지 않는 작업 결정입니다')
           // release forgets an earlier worker that may still run: only offered (and accepted) while one is recorded.
           if (b.decision === RELEASE) { const t = store.task(parts[2]); if (!t || !lingeringOf(t)) throw new HttpError(400, 'release는 이전 작업자가 남아 있을 때만 쓸 수 있습니다') }
           return conflict(runner.decideTask(parts[2], b.decision, b.revision))

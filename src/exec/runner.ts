@@ -34,6 +34,7 @@ import { codexArgs, defaultProbe, findOrphan, groupIdentity, identify, killGroup
 import { reconcile as reconcileInvariants, recover as recoverState, type Violation } from './reconcile.ts'
 import { AttemptClock } from './attempt-clock.ts'
 import { ancestors, containedOwn, flowSignature } from '../game-flow.ts'
+import { GAME_REASSESS, GAME_KEEP_HOLD } from '../game.ts'
 
 export type Notify = (title: string, body: string) => void
 
@@ -1984,6 +1985,28 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
   /** §D decideTask (v3): retry on the same model, skip (with dependents), or stop. Revision = the task's block count. */
   decideTask(taskId: string, decision: string, revision: number): string | null {
     const t = this.store.task(taskId)
+    const technicalHold = t && this.project(t.project)?.workflow === 'game' && gameWaiting(this.store, t) && !gameNeedsUser(this.store, t)
+    if (technicalHold && [GAME_REASSESS, GAME_KEEP_HOLD, 'stop'].includes(decision)) {
+      if (t.block_count !== revision) return `오래된 revision입니다 (현재 ${t.block_count})`
+      if (decision === 'stop') return this.cancelRequest(t.request_id)
+      const signature = gameWaitSignature(this.store, t)
+      if (decision === GAME_KEEP_HOLD) {
+        this.store.set(`game.hold-ack:${t.id}`, signature)
+        this.emitTask(t, '복구 보류 보고를 확인했어요 · 현재 결과를 보존합니다')
+        return null
+      }
+      if (!gameEnabled(this.store, t.project)) return '게임팀을 켠 뒤 재진단할 수 있습니다'
+      if (Number(this.store.get(`game.decisions-total:${t.id}`) ?? this.store.get(`game.decisions:${t.id}`) ?? 0) >= 9) return '누적 복구 판단 상한에 도달했습니다. 원인 수정 없이 추가 호출하지 않습니다'
+      this.store.tx(() => {
+        this.store.set(`game.hold-reassess:${t.id}`, signature)
+        this.store.set(`game.waiting:${t.id}`, null)
+        this.store.set(`game.hold-ack:${t.id}`, null)
+        this.store.updateTask(t.id, { note: `${t.note ?? ''}\n사용자가 피카츄 재진단 1회를 요청했습니다. 같은 작업을 바로 재실행하지 말고 원인·수정 방법을 다시 판단하세요.` })
+      })
+      this.emitTask(t, '피카츄 재진단을 요청했어요 · 기존 완료 기준과 누적 상한 유지')
+      this.kick()
+      return null
+    }
     if (!t || t.status !== 'blocked') return '차단된 작업이 아닙니다'
     if (t.block_count !== revision) return `오래된 revision입니다 (현재 ${t.block_count})`
     if (decision === 'stop') return this.cancelRequest(t.request_id)
@@ -2317,7 +2340,7 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
   }
 
   private userDecisions(): DecisionItem[] {
-    return decisionItems(this.store, this.now(), this.teamNames).filter(d => {
+    const items = decisionItems(this.store, this.now(), this.teamNames).filter(d => {
       const r = d.requestId ? this.store.request(d.requestId) : null
       if (!r || this.project(r.project)?.workflow !== 'game') return true
       if (['accept', 'merge', 'system'].includes(d.kind)) return true
@@ -2333,6 +2356,29 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
       return { ...d, label: '피카츄 검토 후 요청', detail: `${t.note ?? ''}\n\n원래 작업 내용:\n${d.detail ?? ''}`,
         situation: t.note ?? d.situation, recommendation: null }
     })
+    for (const t of this.store.tasksByStatus(['blocked', 'question'])) {
+      if (this.project(t.project)?.workflow !== 'game' || !gameWaiting(this.store, t) || gameNeedsUser(this.store, t)
+        || !['executing', 'blocked'].includes(this.store.request(t.request_id)?.status ?? '')
+        || this.store.get(`game.hold-ack:${t.id}`) === gameWaitSignature(this.store, t)) continue
+      const rounds = Number(this.store.get(`game.decisions:${t.id}`) ?? 0)
+      const total = Number(this.store.get(`game.decisions-total:${t.id}`) ?? rounds)
+      const history: string[] = []
+      for (let n = Math.max(1, rounds - 1); n <= rounds; n++) {
+        try { const d = JSON.parse(this.store.get(`game.decision:${t.id}:${n}`) ?? 'null'); if (d) history.push(`${d.supervisor ? '피카츄' : '팀장'}: ${(d.answer ?? d.error ?? '').slice(0, 1600)}`) } catch {}
+      }
+      const options = [...(total < 9 && gameEnabled(this.store, t.project) ? [GAME_REASSESS] : []), GAME_KEEP_HOLD, 'stop']
+      // A report is visible even though the owner is not being asked to solve the technical defect.
+      items.push({ kind: 'blocked', label: '자동 복구 중단 보고', id: `game-hold:${t.id}`, requestId: t.request_id,
+        taskId: t.id, revision: t.block_count, title: `자동 복구가 멈췄어요: ${t.title}`,
+        detail: `보고된 문제와 중단 이유:\n${t.note ?? '미해결'}\n\n이미 시도한 판단 (${rounds}회, 누적 ${total}/9회):\n${history.join('\n\n') || '추가 판단 기록 없음'}\n\n자동 재시도는 중단된 상태입니다. 기존 결과와 검수 기준은 보존됩니다. ${total < 9 ? '재진단은 피카츄 판단 1회를 요청하며, 같은 작업자를 즉시 재시작하지 않습니다.' : '누적 판단 상한에 도달해 원인 수정 전 추가 재진단은 제공하지 않습니다.'}`,
+        situation: '내부 복구를 마치지 못해 작업이 보류됐어요 · 문제와 시도한 조치를 확인해 주세요', cause: t.note,
+        causeConfirmed: false, recommendation: null, options,
+        optionHelp: { [GAME_REASSESS]: '피카츄가 실패 근거와 수정 방법을 한 번 더 판단해요 · 사용량이 들며 누적 9회 상한은 유지해요',
+          [GAME_KEEP_HOLD]: '보고를 확인하고 보류 상태와 결과물을 유지해요 · 새 문제나 복구 시도 후에는 다시 알려요', stop: '요청 전체를 중단해요 · 기존 결과는 보존해요' },
+        confirm: { stop: '정말 중단할까요? · 되돌릴 수 없어요' }, subjectHash: null,
+        detailPath: `/ui/#request=${encodeURIComponent(t.request_id)}&task=${encodeURIComponent(t.id)}`, createdAt: t.updated_at })
+    }
+    return items
   }
 
   // ----- screen data -----
