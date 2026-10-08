@@ -40,10 +40,15 @@ def main():
   log=open(channel/'engine.log','w')
   command=[shutil.which('godot') or 'godot','--path',str(a.project.resolve()),'--log-file',str(channel/'godot.log'),'--rendering-method','gl_compatibility','--resolution',a.resolution,'--max-fps','60','--audio-driver','Dummy','--script',str(HERE/'controller.gd'),'--','--hq-play-channel',str(channel)]
   proc=subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT,env=env,start_new_session=True);log.close()
-  (channel/'session.json').write_text(json.dumps({'pid':proc.pid,'project':str(a.project.resolve()),'command':command,'started_at':time.time(),'helper_sha256':hashlib.sha256((HERE/'controller.gd').read_bytes()).hexdigest(),'input_method':'agent live physical-key events, no fixture/state injection','audio':'Dummy, not audio evidence'}))
+  helper_hashes={name:hashlib.sha256((HERE/name).read_bytes()).hexdigest() for name in ('controller.gd','session_clock.gd')}
+  (channel/'session.json').write_text(json.dumps({'pid':proc.pid,'project':str(a.project.resolve()),'command':command,'started_at':time.time(),'helper_sha256':helper_hashes['controller.gd'],'helper_files_sha256':helper_hashes,'input_method':'agent live physical-key events, no fixture/state injection','audio':'Dummy, not audio evidence'}))
   wanted='ready'
  else:
   if not (channel/'session.json').is_file():p.error('unknown session')
+  if (channel/'exit.json').is_file():
+   ended=json.loads((channel/'exit.json').read_text())
+   if a.op=='stop':print(json.dumps({'stopped':True,'reason':ended['reason']}));return 0
+   raise SystemExit('Game session ended: '+ended['reason']+'; evidence is preserved in '+str(channel))
   if not 0.05<=a.seconds<=5:p.error('--seconds must be 0.05..5')
   wanted=str(time.time_ns());request={'id':wanted,'op':a.op,'keys':[k.upper() for k in a.keys.split(',') if k],'seconds':a.seconds,'pause_after':a.pause_after,'resume_before':a.resume_before}
   pending=channel/'request.tmp';pending.write_text(json.dumps(request));pending.replace(channel/'request.json')
@@ -55,6 +60,9 @@ def main():
    if result.get('id')==wanted:
     print(json.dumps(result));return 1 if result.get('error') or result.get('capture_error') else 0
   except (FileNotFoundError,json.JSONDecodeError):pass
+  if (channel/'exit.json').is_file():
+   ended=json.loads((channel/'exit.json').read_text())
+   raise SystemExit('Game session ended: '+ended['reason']+'; evidence is preserved in '+str(channel))
   if a.op=='start' and proc.poll() is not None: raise SystemExit('Game exited '+str(proc.returncode)+'; inspect '+str(channel/'engine.log'))
   time.sleep(.05)
  if a.op=='start' and proc.poll() is None: proc.terminate()

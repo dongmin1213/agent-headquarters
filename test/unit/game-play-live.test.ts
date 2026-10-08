@@ -38,6 +38,8 @@ func _draw():
   const run = (cmd: string) => runSandboxed(cmd, project, 35_000, profile, 'live-play', undefined, true)
   try {
     const boot = await run(command(`start --project ${quote(project)}`)); assert.equal(boot.pass, true, boot.outputTail)
+    const metadata = JSON.parse(readFileSync(join(session, 'session.json'), 'utf8'))
+    assert.deepEqual(Object.keys(metadata.helper_files_sha256).sort(), ['controller.gd', 'session_clock.gd'])
     const step = await run(command('step --keys D --seconds 0.3')); assert.equal(step.pass, true, step.outputTail)
     const out = JSON.parse(step.outputTail.trim().split('\n').at(-1)!)
     assert.equal(readFileSync(out.screenshot).subarray(1,4).toString(), 'PNG')

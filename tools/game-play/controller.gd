@@ -7,7 +7,7 @@ var until_usec := 0
 var frame_index := 0
 var capture_index := 0
 var last_request := ""
-var started_usec := Time.get_ticks_usec()
+var session_clock = preload("session_clock.gd").new(Time.get_ticks_usec())
 var frame_log: FileAccess
 var event_log: FileAccess
 var phase := ""
@@ -49,6 +49,14 @@ func record_event(kind: String, data: Dictionary = {}) -> void:
  event_log.store_line(JSON.stringify(row))
  event_log.flush()
  if not active.is_empty(): timeline.append(row)
+func end_session(reason: String) -> void:
+ release_keys()
+ record_event("session_exit", {"reason":reason})
+ var f := FileAccess.open(channel+"/exit.tmp",FileAccess.WRITE)
+ f.store_string(JSON.stringify({"reason":reason,"usec":Time.get_ticks_usec(),"last_request":last_request}))
+ f.close()
+ DirAccess.rename_absolute(channel+"/exit.tmp",channel+"/exit.json")
+ quit()
 func press_keys(keys: Array) -> void:
  for key in keys:
   var code: int = KEYS[key]
@@ -122,9 +130,9 @@ func advance_action() -> void:
   settle_frame = Engine.get_physics_frames()+1
 func after_draw() -> void:
  frame_index += 1
- if Time.get_ticks_usec()-started_usec > 900000000:
-  release_keys()
-  quit()
+ var expiry: String = session_clock.expired(Time.get_ticks_usec())
+ if expiry != "":
+  end_session(expiry)
   return
  if frame_index % 6 == 0:
   var path := channel+"/frames/%06d.png" % capture_index
@@ -146,7 +154,7 @@ func after_draw() -> void:
  if request.get("op") == "stop":
   release_keys()
   response({"id":last_request,"stopped":true})
-  quit()
+  end_session("stopped")
   return
  if request.get("op") != "step" or not request.get("keys") is Array:
   response({"id":last_request,"error":"only step(keys, seconds) or stop allowed"})
@@ -166,6 +174,7 @@ func after_draw() -> void:
   response({"id":last_request,"error":"ESCAPE action cannot be combined with pause flags"})
   return
  active = request
+ session_clock.touch(Time.get_ticks_usec())
  timeline = []
  record_event("request_received")
  if request.get("resume_before",false):
