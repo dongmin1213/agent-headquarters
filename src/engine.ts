@@ -114,24 +114,34 @@ export class RequestEngine {
         await this.runner.decide(integration.id, choice, integration.subjectHash)
         return true
       }
-      const t = tasks.find(t => !gameWaiting(this.store, t) && gameDecisionReady(this.store, t, this.runner.now())
+      const t = tasks.find(t => (!gameWaiting(this.store, t) || !!this.runner.gameVerificationRescue(t)) && gameDecisionReady(this.store, t, this.runner.now())
         && (t.status === 'question' || (t.status === 'blocked' && !t.lingering)))
       if (!t || !this.runner.ceoLock.tryAcquire()) continue
       try {
         const rounds = Number(this.store.get(`game.decisions:${t.id}`) ?? 0)
         const totalRounds = Number(this.store.get(`game.decisions-total:${t.id}`) ?? rounds)
         const reassess = this.store.get(`game.hold-reassess:${t.id}`) === gameWaitSignature(this.store, t)
-        if (totalRounds >= 9) { this.waitGameTask(t, `피카츄 누적 복구 상한 9회 도달 · 미해결 근거를 보존합니다: ${t.title} — ${t.note ?? ''}`, false); return true }
-        if (rounds >= 3 && !reassess) { this.waitGameTask(t, `피카츄 내부 복구 상한 도달 · 미해결 상태를 보존합니다: ${t.title} — ${t.note ?? ''}`, false); return true }
+        const rescue = this.runner.gameVerificationRescue(t)
+        if (totalRounds >= 9 && !rescue) { this.waitGameTask(t, `피카츄 누적 복구 상한 9회 도달 · 미해결 근거를 보존합니다: ${t.title} — ${t.note ?? ''}`, false); return true }
+        if (rounds >= 3 && !reassess && !rescue) { this.waitGameTask(t, `피카츄 내부 복구 상한 도달 · 미해결 상태를 보존합니다: ${t.title} — ${t.note ?? ''}`, false); return true }
         const questions = this.store.taskQuestions(t.id).filter(q => q.answer === null)
-        const decisionModel = rounds === 0 && !reassess ? 'sonnet' : 'opus'
-        const supervisor = rounds > 0 || reassess
+        const decisionModel = rounds === 0 && !reassess && !rescue ? 'sonnet' : 'opus'
+        const supervisor = rounds > 0 || reassess || !!rescue
         const signature = gameWaitSignature(this.store, t)
         const previous = this.store.get(`game.decision:${t.id}:${rounds}`) ?? '(없음)'
+        const rescueKey = `game.verification-rescue:${r.id}`
+        const checkedWork = t.checks_state === 'failed' ? this.store.attempts(t.id).filter(a => a.kind === 'work').at(-1)?.id ?? null : null
+        if (rescue) {
+          // Consume before calling the model: restarts, quota and transport failures cannot buy an unbounded loop.
+          this.store.set(rescueKey, JSON.stringify({ taskId: t.id, checkedWork: rescue.id, head: t.head_sha, signature, at: new Date(this.runner.now()).toISOString(), status: 'started' }))
+          this.store.set(`game.waiting:${t.id}`, null)
+          this.bus.emit({ kind: 'task', text: '제출 후 검증 실패 · 피카츄가 새 원인을 별도 진단합니다 (요청당 1회)', data: { id: t.id } })
+        }
         const result = await runJsonTurn({ codexBin: this.runner.cfg.codexBin, runtimeHome: this.runner.home, model: this.runner.cfg.models[decisionModel],
           cwd: t.worktree ?? p.path, sessionId: randomUUID(), resume: false, addDirs: [], timeoutMs: 5 * 60_000,
           prompt: `너는 ${supervisor ? '피카츄 독립 감독자' : '게임팀장'}이다.\n${GAME_ECONOMY_RULES}\n${GAME_PLAYTEST_RULES}\n사용자에게 세부 기획·구현 판단을 떠넘기지 않고 해결한다. ${supervisor ? '팀장의 판단을 그대로 전달하지 말고 실제 코드·실패 증거·기존 위임 범위를 대조하여 재검토한다.' : '현재 작업 파일과 선행 기획을 확인해 실행 가능한 결정을 내린다.'}\n요청: ${r.text}\n작업: ${t.spec}\n상태: ${t.status}\n문제: ${t.note}\n진단: ${t.diagnosis}\n질문: ${JSON.stringify(questions)}\n전체 작업 계약: ${JSON.stringify(tasks.map(x => ({ key: x.key, title: x.title, department: JSON.parse(x.spec).department, status: x.status, project: x.project, role: x.role, head_sha: x.head_sha, owns: JSON.parse(x.spec).owns, depends_on: JSON.parse(x.spec).depends_on })))}\n이전 내부 판단: ${previous}\n
 출력 계약:
+${rescue ? '- 이번 판단은 요청당 1회인 제출 후 검증 실패 진단이다. 제작 복구 상한 때문에 아직 진단하지 못한 새 후보의 검사 실패만 다룬다. 기계 검사 원문/처음 오류·새 checkout/캐시/의존성 준비·실제 코드 결함을 구분하고 기존 정상 플레이와 자산은 보존한다. 재개하려면 원인·증거·변경할 검사/코드·재검 방법을 answer에 쓰고 구체적으로 변경한 brief를 포함한 revised_task를 반드시 제출한다. 단순 retry, 후속 순서 변경, 기준 완화, 완료 처리, 처음부터 전체 제작/플레이 반복은 허용하지 않는다. 근거가 부족하면 proceed=false로 보고한다. 기존 복구 횟수·요청 실행 예산은 유지된다.' : ''}
 - 검수가 후속 수정 작업의 결과를 요구하여 멈췄다면 같은 검수를 반복하지 않는다. repair_before에 현재 작업을 직접 기다리는 미시작 pending 수정 작업 key를 지정하고 revised_task=null, proceed=true로 반환한다. HQ가 그 작업에 현재 선행 조건을 물려주어 먼저 실행하고 현재 검수는 그 결과를 기다리게 한다. 이미 시작한 작업·순환·검사 삭제는 허용하지 않는다. 순서 변경이 필요 없으면 repair_before=null이다.
 - answer에 확인한 원인·근거, 선택한 수정, 재검 방법을 구체적으로 기록한다. 실패한 방법을 바꾸지 않은 단순 재시도는 금지한다.
 - 작업자가 failed/blocked로 명시적으로 반려한 경우 같은 작업을 그대로 재시작하지 않는다. 선행 결과의 아트·지형 품질 문제가 원인이면 해당 파일과 담당/소유 범위를 확인하고, 수정 가능한 owns와 구체적인 brief를 revised_task로 재배정한다. 읽기 전용 진단만 남겨도 복구된 것으로 간주하지 않는다. 독립 검수와 원래 품질 기준은 유지한다. 답변은 한국어로 쓴다.
@@ -145,11 +155,15 @@ export class RequestEngine {
 - 기술 문제를 이번 판단에서도 해결 못하면 proceed=false, owner_decision=none으로 미해결을 보고한다. 이를 사용자에게 '재시도/건너뛰기' 선택을 떠넘길 근거로 쓰지 않는다. 완료 기준을 낮추거나 검사를 면제하지 않는다.\n${this.runner.gamePlayTools()}\n${this.runner.gameTaskEvidence(t.id)}`,
           schema: GAME_DECISION_SCHEMA,
           onLine: line => { if (line.type === 'rate_limit_event') this.runner.observe(line) } })
+        if (rescue) {
+          const record = JSON.parse(this.store.get(rescueKey)!)
+          this.store.set(rescueKey, JSON.stringify({ ...record, status: 'returned', output: result.output, error: result.error, limited: result.limited }))
+        }
         if (result.limited) { this.runner.limitBackoff(); return true }
         if (!result.ok && /Not logged in|authentication|unauthorized|401|refresh.token/i.test(result.error ?? '')) { this.runner.requireLogin(result.error ?? 'Not logged in'); return true }
         const current = this.store.task(t.id)
         if (!gameEnabled(this.store, p.id) || !current || gameWaitSignature(this.store, current) !== signature || !['executing', 'blocked'].includes(this.store.request(r.id)?.status ?? '')) return true
-        if (!result.ok && transientDecisionFailure(result.error)) {
+        if (!rescue && !result.ok && transientDecisionFailure(result.error)) {
           const key = `game.decision-retry:${t.id}`
           let prior: { signature?: string; failures?: number } | null = null
           try { prior = JSON.parse(this.store.get(key) ?? 'null') } catch {}
@@ -163,15 +177,18 @@ export class RequestEngine {
         }
         this.store.set(`game.decision-retry:${t.id}`, null)
         this.store.set(`game.hold-reassess:${t.id}`, null)
-        this.store.set(`game.decisions:${t.id}`, String(rounds + 1))
-        this.store.set(`game.decisions-total:${t.id}`, String(totalRounds + 1))
+        if (!rescue) {
+          this.store.set(`game.decisions:${t.id}`, String(rounds + 1))
+          this.store.set(`game.decisions-total:${t.id}`, String(totalRounds + 1))
+        }
         const o = result.output as GameDecision | null
         const valid = result.ok && o && typeof o.proceed === 'boolean' && typeof o.answer === 'string' && o.answer.trim()
           && OWNER_DECISIONS.includes(o.owner_decision) && (o.revised_task === null || typeof o.revised_task === 'object')
           && (o.repair_before == null || (typeof o.repair_before === 'string' && !!o.repair_before.trim()
             && o.proceed && o.owner_decision === 'none' && o.revised_task === null))
           && (o.owner_decision === 'none' || (!o.proceed && o.revised_task === null)) && (o.proceed || o.revised_task === null)
-        this.store.set(`game.decision:${t.id}:${rounds + 1}`, JSON.stringify({ ...o, model: decisionModel, supervisor, error: result.error }))
+        const decisionKey = rescue ? `game.verification-rescue-decision:${r.id}` : `game.decision:${t.id}:${rounds + 1}`
+        this.store.set(decisionKey, JSON.stringify({ ...o, model: decisionModel, supervisor, checkedWork, error: result.error }))
         if (!valid || !o!.proceed) {
           const reason = valid ? o!.answer : `판단 출력 실패: ${result.error ?? '잘못된 출력 계약'}`
           // Even a lead's escalation must be independently examined before reaching the user.
@@ -181,7 +198,8 @@ export class RequestEngine {
         }
         const decision = o!
         let problem: string | null = null
-        if (decision.repair_before) problem = this.runner.repairGameOrder(t.id, decision.repair_before, signature)
+        if (rescue && (!decision.revised_task || decision.repair_before || decision.revised_task.brief === JSON.parse(t.spec).brief)) problem = '제출 후 검증 진단에는 기존 기준을 유지한 구체적인 지시서 수정이 필요합니다. 단순 재시도하지 않습니다'
+        else if (decision.repair_before) problem = this.runner.repairGameOrder(t.id, decision.repair_before, signature)
         else if (decision.revised_task) problem = this.runner.repairGameTask(t.id, decision.revised_task, signature)
         else if (t.status === 'question') {
           for (const q of questions) {
@@ -196,8 +214,8 @@ export class RequestEngine {
           }
         }
         if (problem) {
-          this.store.set(`game.decision:${t.id}:${rounds + 1}`, JSON.stringify({ ...decision, model: decisionModel, supervisor, error: problem }))
-          if (rounds >= 2) this.waitGameTask(t, `피카츄 수정안 적용 실패: ${problem}`, false)
+          this.store.set(decisionKey, JSON.stringify({ ...decision, model: decisionModel, supervisor, checkedWork, error: problem }))
+          if (rounds >= 2 || rescue) this.waitGameTask(t, `피카츄 수정안 적용 실패: ${problem}`, false)
           return true
         }
         this.bus.emit({ kind: 'request', text: `${supervisor ? '피카츄' : '게임팀장'}가 해결 지시를 적용했어요: ${t.title}`, data: { id: r.id } })

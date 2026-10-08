@@ -665,3 +665,84 @@ test('game team snapshot reports a technical hold instead of claiming the team i
     assert.equal(team().state, 'idle')
   } finally { scheduler.stop(); await h.close() }
 })
+
+
+function verificationRescueFixture(mode = '[[FAKE:leadrepair]]') {
+  const f = repairFixture(), { h, tid, spec } = f
+  spec.brief = mode
+  spec.acceptance = [{ id: 'A1', kind: 'new', check: 'node --version', text: 'real executable check' }]
+  const head = sh(h.repo, 'rev-parse', 'HEAD')
+  h.store.updateTask(tid, { spec: JSON.stringify(spec), head_sha: head, checks_state: 'failed', note: '기계 검증 실패: fresh checkout', generation: 2 })
+  h.store.set(`game.decisions:${tid}`, '0')
+  h.store.set(`game.decisions-total:${tid}`, '9')
+  const dir = join(h.dir, 'verification-attempt'); mkdirSync(join(dir, 'hq'), { recursive: true })
+  h.store.insertAttempt({ id: `${tid}~a1`, task_id: tid, kind: 'work', n: 1, model: 'sonnet', status: 'succeeded', attempt_token: 'test', dir, session_id: 'test', generation: 2 })
+  writeFileSync(join(dir, 'hq/checks.json'), JSON.stringify({ pass: false, checks: [{ id: 'A1', command: 'test -f README.md', pass: false, exitCode: 1, outputTail: 'fresh checkout import failed' }], secrets: [], error: null }))
+  h.store.set(`game.waiting:${tid}`, JSON.stringify({ signature: gameWaitSignature(h.store, h.store.task(tid)!), needsUser: false }))
+  return { ...f, dir }
+}
+
+test('a new verification failure gets one automatic supervisor repair after exhausted production recovery', async () => {
+  const { h, id, tid, spec } = verificationRescueFixture()
+  try {
+    const before = h.store.task(tid)!
+    assert.ok(h.runner.gameVerificationRescue(before))
+    assert.equal(h.runner.ceoWaiting(), true)
+    await h.engine.tick()
+    const after = h.store.task(tid)!
+    assert.equal(after.status, 'rework')
+    assert.equal(after.worktree, before.worktree)
+    assert.deepEqual(JSON.parse(after.spec).acceptance, spec.acceptance)
+    assert.deepEqual(JSON.parse(after.spec).review, spec.review)
+    assert.equal(h.store.get(`game.decisions-total:${tid}`), '9')
+    const decision = JSON.parse(h.store.get(`game.verification-rescue-decision:${id}`)!)
+    assert.equal(decision.model, 'opus')
+    assert.equal(decision.checkedWork, `${tid}~a1`)
+    assert.equal(gameWaiting(h.store, after), false)
+    h.store.updateTask(tid, { status: 'blocked', checks_state: 'failed' })
+    await h.engine.tick(); await h.engine.tick()
+    assert.equal(h.store.get(`game.decisions-total:${tid}`), '9')
+    assert.equal(gameWaiting(h.store, h.store.task(tid)!), true)
+    assert.match(h.runner.views().decisions.find(d => d.taskId === tid)!.detail!, /제출 후 검증 별도 진단.*1회 사용/)
+  } finally { await h.close() }
+})
+
+test('verification reserve refuses blind retry or weaker checks and reports the unresolved cause', async () => {
+  for (const mode of ['', '[[FAKE:leadrepair=weaken]]', '[[FAKE:leadnetwork]]']) {
+    const { h, id, tid } = verificationRescueFixture(mode)
+    try {
+      const before = h.store.task(tid)!
+      await h.engine.tick(); await h.engine.tick()
+      assert.equal(h.store.task(tid)!.status, 'blocked')
+      assert.equal(h.store.task(tid)!.spec, before.spec)
+      assert.equal(h.store.attempts(tid).length, 1)
+      assert.ok(h.store.get(`game.verification-rescue:${id}`))
+      assert.equal(h.store.get(`game.decisions-total:${tid}`), '9')
+      assert.equal(gameWaiting(h.store, h.store.task(tid)!), true)
+      assert.ok(h.runner.views().decisions.find(d => d.taskId === tid))
+    } finally { await h.close() }
+  }
+})
+
+test('verification reserve excludes known submissions, other phases, stale attempts, owner decisions and a used request reserve', async () => {
+  const { h, id, tid, dir } = verificationRescueFixture()
+  try {
+    const t = h.store.task(tid)!
+    assert.ok(h.runner.gameVerificationRescue(t))
+    assert.equal(h.runner.gameVerificationRescue({ ...t, checks_state: 'passed' }), null)
+    assert.equal(h.runner.gameVerificationRescue({ ...t, status: 'question' }), null)
+    assert.equal(h.runner.gameVerificationRescue({ ...t, generation: t.generation + 1 }), null)
+    h.store.set(`game.decisions:${tid}`, '1')
+    h.store.set(`game.decision:${tid}:1`, JSON.stringify({ checkedWork: `${tid}~a1` }))
+    assert.equal(h.runner.gameVerificationRescue(t), null)
+    h.store.set(`game.decisions:${tid}`, '0')
+    h.store.set(`game.waiting:${tid}`, JSON.stringify({ signature: gameWaitSignature(h.store, t), needsUser: true }))
+    assert.equal(h.runner.gameVerificationRescue(t), null)
+    h.store.set(`game.waiting:${tid}`, null)
+    h.store.set(`game.verification-rescue:${id}`, JSON.stringify({ taskId: 'another-task', status: 'started' }))
+    assert.equal(h.runner.gameVerificationRescue(t), null)
+    h.store.set(`game.verification-rescue:${id}`, null)
+    rmSync(join(dir, 'hq/checks.json'))
+    assert.equal(h.runner.gameVerificationRescue(t), null)
+  } finally { await h.close() }
+})

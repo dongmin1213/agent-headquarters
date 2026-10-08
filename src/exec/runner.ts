@@ -290,12 +290,33 @@ export class Runner {
     return this.store.liveAttempts().length < capacity
   }
 
+  /** One request-wide diagnosis reserve for a newly submitted candidate's mechanical failure.
+   * Ordinary work/review failures never qualify; it cannot reset either retry budget. */
+  gameVerificationRescue(t: TaskRow): AttemptRow | null {
+    if (this.project(t.project)?.workflow !== 'game' || !gameEnabled(this.store, t.project)
+      || t.status !== 'blocked' || t.checks_state !== 'failed' || !t.head_sha || t.lingering
+      || gameNeedsUser(this.store, t) || this.store.get(`game.verification-rescue:${t.request_id}`)
+      || this.store.liveAttempts().some(a => a.task_id === t.id)) return null
+    const rounds = Number(this.store.get(`game.decisions:${t.id}`) ?? 0)
+    const total = Number(this.store.get(`game.decisions-total:${t.id}`) ?? rounds)
+    if (rounds < 3 && total < 9) return null
+    const work = this.store.attempts(t.id).filter(a => a.kind === 'work').at(-1)
+    if (!work || work.status !== 'succeeded' || work.generation !== t.generation) return null
+    const checks = readJson<ChecksFile>(join(hqDirOf(work), 'checks.json'))
+    if (!checks || checks.pass !== false || !Array.isArray(checks.checks) || !checks.checks.some(c => !c.pass && !c.baseFailed)) return null
+    // A cause already examined for this submission is not a new verification-stage failure.
+    for (let n = 1; n <= rounds; n++) {
+      try { if (JSON.parse(this.store.get(`game.decision:${t.id}:${n}`) ?? 'null')?.checkedWork === work.id) return null } catch {}
+    }
+    return work
+  }
+
   /** Something the CEO should do before any worker in save/unobserved mode (§13 "CEO 턴이 우선"). */
   ceoWaiting(): boolean {
     if (this.store.requestsByStatus(['queued']).some(r => this.project(r.project)?.workflow !== 'game' || gameEnabled(this.store, r.project))) return true
     if (this.store.tasksByStatus(['revising']).some((t) => (this.project(t.project)?.workflow !== 'game' || gameEnabled(this.store, t.project)) && this.store.approval(`revise:${t.id}`)?.state !== 'open')) return true
     return this.store.tasksByStatus(['blocked']).some((t) => this.project(t.project)?.workflow === 'game'
-      ? gameEnabled(this.store, t.project) && !t.lingering && !gameWaiting(this.store, t) && gameDecisionReady(this.store, t, this.now())
+      ? gameEnabled(this.store, t.project) && !t.lingering && (!gameWaiting(this.store, t) || !!this.gameVerificationRescue(t)) && gameDecisionReady(this.store, t, this.now())
       : t.diagnosis === null)
   }
 
@@ -2486,6 +2507,13 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
       for (let n = Math.max(1, rounds - 1); n <= rounds; n++) {
         try { const d = JSON.parse(this.store.get(`game.decision:${t.id}:${n}`) ?? 'null'); if (d) history.push(`${d.supervisor ? '피카츄' : '팀장'}: ${(d.answer ?? d.error ?? '').slice(0, 1600)}`) } catch {}
       }
+      try {
+        const reserve = JSON.parse(this.store.get(`game.verification-rescue:${t.request_id}`) ?? 'null')
+        if (reserve?.taskId === t.id) {
+          const decision = JSON.parse(this.store.get(`game.verification-rescue-decision:${t.request_id}`) ?? 'null')
+          history.push(`제출 후 검증 별도 진단 (요청당 1회 사용): ${(decision?.error || decision?.answer || reserve.error || (reserve.limited ? '사용 한도로 진단 미완료' : '진단 완료를 확인하지 못했습니다')).slice(0, 1600)}`)
+        }
+      } catch { /* Older reports have no reserve record. */ }
       const options = [...(total < 9 && gameEnabled(this.store, t.project) ? [GAME_REASSESS] : []), GAME_KEEP_HOLD, 'stop']
       // A report is visible even though the owner is not being asked to solve the technical defect.
       items.push({ kind: 'blocked', label: '자동 복구 중단 보고', id: `game-hold:${t.id}`, requestId: t.request_id,
