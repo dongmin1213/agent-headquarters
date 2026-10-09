@@ -2348,7 +2348,7 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
   gameAttemptLimit(requestId: string): number {
     try {
       const budget = JSON.parse(this.store.get(`game.attempt-budget:${requestId}`) ?? 'null')
-      return Number.isInteger(budget?.limit) && budget.limit >= 100 && budget.limit <= 124 && typeof budget.reason === 'string' && budget.reason.trim() ? budget.limit : 100
+      return Number.isInteger(budget?.limit) && budget.limit >= 100 && budget.limit <= 140 && typeof budget.reason === 'string' && budget.reason.trim() ? budget.limit : 100
     } catch { return 100 }
   }
 
@@ -2356,7 +2356,7 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
   grantGameRepairBudget(requestId: string, limit: number, reason: string): string | null {
     const r = this.store.request(requestId)
     if (!r || r.status !== 'executing' || this.project(r.project)?.workflow !== 'game'
-      || !Number.isInteger(limit) || limit < this.gameAttemptLimit(requestId) || limit > 124 || !reason.trim()) return '게임 수정 실행 예산은 사유와 함께 기존 상한~124회 범위로만 설정합니다'
+      || !Number.isInteger(limit) || limit < this.gameAttemptLimit(requestId) || limit > 140 || !reason.trim()) return '게임 수정 실행 예산은 사유와 함께 기존 상한~140회 범위로만 설정합니다'
     this.store.set(`game.attempt-budget:${requestId}`, JSON.stringify({ limit, reason, at: this.iso(), previous: this.gameAttemptLimit(requestId) }))
     this.emitRequest(requestId, `게임 수정 실행 예산 ${limit}회 · 기존 시도 이력과 사용량 제한 유지 · ${reason}`)
     return null

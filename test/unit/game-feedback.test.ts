@@ -76,8 +76,8 @@ test('corrective execution budget is bounded, durable, and does not reset paid a
     assert.equal(h.runner.gameAttemptLimit(id), 100)
     assert.equal(h.runner.grantGameRepairBudget(id, 112, '사용자 품질 개선 지시에 따른 추가 수정과 필수 검수'), null)
     assert.equal(h.runner.gameAttemptLimit(id), 112)
-    assert.match(h.runner.grantGameRepairBudget(id, 125, 'more')!, /124/)
-    assert.match(h.runner.grantGameRepairBudget(id, 99, 'less')!, /124/)
+    assert.match(h.runner.grantGameRepairBudget(id, 141, 'more')!, /140/)
+    assert.match(h.runner.grantGameRepairBudget(id, 99, 'less')!, /140/)
     assert.equal(h.runner.gameAttemptLimit(id), 112)
     const t = h.store.task(`${id}.research`)!
     for (let n = 1; n <= 112; n++) h.store.insertAttempt({ id: `${t.id}~a${n}`, task_id: t.id, kind: 'work', n, model: 'sonnet', status: 'failed', attempt_token: 'fixture', dir: h.dir, session_id: 'fixture', generation: t.generation })
