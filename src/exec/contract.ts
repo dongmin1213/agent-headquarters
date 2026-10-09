@@ -31,7 +31,7 @@ export interface GitFacts {
 
 export interface WorkFacts {
   role: 'implement' | 'collect'
-  /** HQ-observed fresh regular files since the last checkpoint; absent outside game work. */
+  /** HQ-observed fresh regular files since the last work submission; absent outside game work. */
   checkpoint?: { count: number; freshFiles: string[] }
   token: string
   owns: string[]

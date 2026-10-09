@@ -54,7 +54,7 @@ test('partial game result survives daemon recovery, resumes its session, and can
   } finally { await h.close() }
 })
 
-test('repeated partial results stop at a durable lifetime cap instead of generating unlimited paid work', async () => {
+test('repeated partial results stop at a durable per-generation cap instead of generating unlimited paid work', async () => {
   const h = harness()
   try {
     h.store.set('limit.backoffUntil', new Date(h.clock.t + 60_000).toISOString())
@@ -68,6 +68,18 @@ test('repeated partial results stop at a durable lifetime cap instead of generat
     assert.match(tsk(h, `${id}.A`).note!, /중간 저장 상한 3회/)
     assert.equal(tsk(h, `${id}.A`).head_sha, null)
     assert.equal(attempts.filter(a => a.kind === 'review').length, 0)
+    // A user/supervisor-revised contract has a bounded new continuation allowance.
+    // No execution history or global execution budget is reset.
+    const before = tsk(h, `${id}.A`)
+    h.store.updateTask(before.id, { status: 'pending', revision: before.revision + 1, generation: before.generation + 1, resume_session: null })
+    h.store.updateRequest(id, { status: 'executing', note: null })
+    await h.waitFor(() => tsk(h, before.id).status === 'blocked')
+    const all = h.store.attempts(before.id)
+    assert.equal(all.length, 8)
+    assert.match(readFileSync(join(all[3].dir, 'hq/prompt.md'), 'utf8'), /현재 계약 중간 저장: 3\/3회 사용, 0회 남음/)
+    assert.match(readFileSync(join(all[4].dir, 'hq/prompt.md'), 'utf8'), /현재 계약 중간 저장: 0\/3회 사용, 3회 남음/)
+    assert.deepEqual(all.slice(4).map(a => a.status), ['checkpoint', 'checkpoint', 'checkpoint', 'brief_blocked'])
+    assert.equal(tsk(h, before.id).head_sha, null, 'continuations never approve the product')
   } finally { await h.close() }
 })
 
