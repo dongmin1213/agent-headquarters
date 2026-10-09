@@ -559,6 +559,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         trackMouse()
         updateStatus(s, needsYou: needsYou)
         notifyNew(items)
+        if popover?.isShown == true { refreshCeoStatus() }
         // Test hook: HQ_ROW_SNAPSHOT=<png> renders the character row offscreen once (works with the display asleep).
         if let path = env["HQ_ROW_SNAPSHOT"], !rowSnapped {
             rowSnapped = true
@@ -1003,14 +1004,19 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
     var shownDecisions: [DecisionItem] = []
     var decisionErrors: [Int: NSTextField] = [:]
     var ceoTab = 0
+    weak var ceoHeadlineField: NSTextField?
+    weak var ceoTabs: NSSegmentedControl?
+    weak var recentResultsStack: NSStackView?
+    var recentResultsSignature = ""
 
     /// Chairman ↔ CEO: tabs 내 차례 N / 새 요청 / 사용량 (§19).
     func showCeo(for c: Critter, tab: Int? = nil, focusTask: String? = nil) {
         let items = offline ? [] : (snapshot?.decisions ?? [])
         ceoTab = tab ?? (items.isEmpty ? 1 : 0)
         var header: [NSView] = [text("사장", size: 15, weight: .bold)]
-        if offline { header.append(text("hq 데몬이 꺼져 있어요. 켜진 뒤에 요청할 수 있어요.", size: 12.5, color: Palette.alert)) }
-        else if let h = snapshot?.headline, !h.text.isEmpty { header.append(text(h.text, size: 12.5, color: Palette.muted)) }
+        let headlineField = text(ceoHeadlineText(), size: 12.5, color: offline ? Palette.alert : Palette.muted)
+        ceoHeadlineField = headlineField
+        header.append(headlineField)
         let decisions = items.filter { $0.requiresDecision != false }.count
         let reports = items.count - decisions
         let inboxLabel = reports > 0 ? "내 차례 \(decisions) · 보고 \(reports)" : "내 차례 \(decisions)"
@@ -1018,6 +1024,7 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         seg.segmentDistribution = .fillEqually; seg.font = .systemFont(ofSize: 13)
         seg.widthAnchor.constraint(equalToConstant: Pet.innerWidth).isActive = true
         seg.selectedSegment = ceoTab
+        ceoTabs = seg
         header.append(seg)
         let body = ceoBody(ceoTab)
         openPanel(at: c, header: header, body: body, focus: ceoTab == 1 ? requestInput : nil)
@@ -1148,8 +1155,39 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
         send.keyEquivalent = "\r"; send.keyEquivalentModifierMask = [.command]; send.isEnabled = !offline; send.font = .systemFont(ofSize: 13)
         body.addArrangedSubview(scroll)
         body.addArrangedSubview(row([picker, send]))
+        let recent = vstack(spacing: 10)
+        recentResultsStack = recent
+        recentResultsSignature = ""
+        body.addArrangedSubview(recent)
+        refreshRecentResults()
+        return body
+    }
+
+    func ceoHeadlineText() -> String {
+        offline ? "hq 데몬이 꺼져 있어요. 켜진 뒤에 요청할 수 있어요." : (snapshot?.headline?.text ?? "상태 확인 중")
+    }
+
+    /// Update status in place: rebuilding the request form discards the user's draft and focus.
+    func refreshCeoStatus() {
+        guard let field = ceoHeadlineField else { return }
+        field.stringValue = ceoHeadlineText()
+        field.textColor = offline ? Palette.alert : Palette.muted
+        let items = offline ? [] : (snapshot?.decisions ?? [])
+        let decisions = items.filter { $0.requiresDecision != false }.count
+        let reports = items.count - decisions
+        ceoTabs?.setLabel(reports > 0 ? "내 차례 \(decisions) · 보고 \(reports)" : "내 차례 \(decisions)", forSegment: 0)
+        if ceoTab == 1 { refreshRecentResults() }
+        relayoutBody()
+    }
+
+    func refreshRecentResults() {
+        guard let body = recentResultsStack else { return }
         let done: Set<String> = ["merged", "accepted", "failed", "cancelled", "blocked"]
         let recent = (snapshot?.requests ?? []).filter { done.contains($0.status) }.sorted { ($0.updatedAt ?? "") > ($1.updatedAt ?? "") }.prefix(3)
+        let signature = "\(offline)" + recent.map { "\($0.id)|\($0.status)|\($0.text)|\($0.note ?? "")|\($0.updatedAt ?? "")" }.joined(separator: "\u{1F}")
+        guard signature != recentResultsSignature else { return }
+        recentResultsSignature = signature
+        for view in body.arrangedSubviews { body.removeArrangedSubview(view); view.removeFromSuperview() }
         if !offline && !recent.isEmpty {
             body.addArrangedSubview(text("최근 결과", weight: .semibold))
             for r in recent {
@@ -1159,7 +1197,6 @@ final class FlippedView: NSView { override var isFlipped: Bool { true } }
                 body.addArrangedSubview(boxed(line, fill: Palette.card, stroke: Palette.border, width: Pet.innerWidth, pad: 12, radius: 8))
             }
         }
-        return body
     }
 
     /// 사용량: every quota window with a bar, %, reset time; then the mode.
