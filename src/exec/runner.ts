@@ -38,6 +38,10 @@ import { feedbackSpecs, type GameFinding } from '../game-feedback.ts'
 import { ancestors, containedOwn, flowSignature } from '../game-flow.ts'
 import { GAME_REASSESS, GAME_KEEP_HOLD } from '../game.ts'
 
+export function readReviewHandoff(value: string | null, task: TaskRow): unknown | null {
+  try { const h = JSON.parse(value ?? 'null'); return h?.head === task.head_sha && h?.generation === task.generation ? h : null } catch { return null }
+}
+
 export type Notify = (title: string, body: string) => void
 
 /** Serializes CEO turns (plan turns in the engine, revise and diagnosis turns here). */
@@ -1428,7 +1432,11 @@ export class Runner {
       let prompt = reviewPrompt({ task: specOf(t), requestText: this.store.request(t.request_id)!.text, base: t.base_sha!, head: t.head_sha!, diffStat: stat.stdout,
         checks, previousIssue: t.note, protectedChanges: result?.protectedChanges ?? [], manualIds: checks?.manual ?? [], report,
         manualTails: Object.fromEntries((checks?.manual ?? []).map((id) => [id, { candidate: checks!.checks.find((c) => c.id === id)?.outputTail ?? '', base: checks!.baseTails?.[id] ?? '' }])) })
-      if (project.workflow === 'game') prompt += '\n\n' + this.gamePlayTools()
+      if (project.workflow === 'game') {
+        prompt += '\n\n' + this.gamePlayTools()
+        const handoff = readReviewHandoff(this.store.get(`game.review-handoff:${t.id}`), t)
+        if (handoff) prompt += '\n\n## 동일 제출본의 독립 검토 인계 (승인 아님)\n' + JSON.stringify(handoff) + '\n기존 완료 근거의 소스 일치를 확인하고 미완료 항목부터 검수한다. 새 의심이나 변경 없이 이미 완료한 검사를 전부 반복하지 않는다. 이전 tests_run을 이번 실행으로 복사하지 않는다.'
+      }
       const argv = codexArgs(this.cfg, { role: 'review', model: att.model, sessionId: att.session_id, resume: false, out: null, schema: VERDICT_SCHEMA })
       gate()
       const { info, child, exit } = await launch({ codexBin: this.cfg.codexBin, argv, cwd: wt.path, hqDir: hq, outDir: null, prompt, sessionId: att.session_id, schema: VERDICT_SCHEMA,
@@ -1490,13 +1498,13 @@ export class Runner {
     const judgeIds = [...new Set([...manualIds(spec), ...(checksFile?.manual ?? [])])]
     const check = att.outcome === 'runaway' ? { kind: 'invalid' as const, reason: `검토 폭주: ${att.reason ?? ''}`, verdict: null }
       : result?.is_error || !result ? { kind: 'invalid' as const, reason: `검토 실행 오류: ${String(result?.result ?? result?.subtype ?? '결과 없음').slice(0, 300)}`, verdict: null }
-      : checkVerdict(result.structured_output, { acceptanceIds: spec.acceptance.map((a) => a.id), codeChanged, bashRuns, judgeIds })
+      : checkVerdict(result.structured_output, { acceptanceIds: spec.acceptance.map((a) => a.id), codeChanged, bashRuns, judgeIds, allowContinuation: this.project(task.project)?.workflow === 'game' })
     const prot = work ? readJson<{ protectedChanges?: string[] }>(join(hqDirOf(work), 'result.json'))?.protectedChanges ?? [] : []
     const binding = { task: task.id, head_sha: task.head_sha ?? undefined, base_sha: task.base_sha ?? undefined, reviewer_model: att.model, implementer_model: task.model, sameFamily: true, protectedChanges: prot }
     atomicJson(join(hq, 'verdict.json'), check.verdict ? { ...check.verdict, ...binding, ...(check.kind === 'invalid' ? { invalid: check.reason } : {}) }
       : { invalid: check.kind === 'invalid' ? check.reason : null, raw: result?.structured_output ?? null, ...binding })
     this.store.tx(() => {
-      const status = check.kind === 'pass' ? 'succeeded' : check.kind === 'blocking' ? 'failed' : 'unverifiable'
+      const status = check.kind === 'pass' ? 'succeeded' : check.kind === 'blocking' ? 'failed' : check.kind === 'incomplete' ? 'checkpoint' : 'unverifiable'
       this.store.updateAttempt(att.id, { status, ended_at: endedAt, outcome: check.kind, ...this.usage(result),
         reason: check.kind === 'invalid' ? check.reason : check.kind === 'blocking' ? check.verdict.blocking.map((b) => b.summary).join('; ').slice(0, 2000) : null })
       const t = this.store.task(att.task_id)!
@@ -1505,6 +1513,19 @@ export class Runner {
         this.tset(t, { status: 'passed', note: null })
         for (const criterion of check.verdict.criteria.filter(c => c.id.startsWith('QF-')))
           this.store.set(`game.finding-verdict:${t.id}:${criterion.id}`, JSON.stringify({ head: t.head_sha, generation: t.generation, review: att.id, criterion, at: endedAt }))
+      }
+      else if (check.kind === 'incomplete') {
+        const key = `game.review-continuations:${t.id}`
+        const count = Number(this.store.get(key) ?? 0)
+        const previous = this.store.attempts(t.id).filter(a => a.kind === 'review' && a.id !== att.id && a.outcome === 'incomplete').at(-1)
+        const prior = previous ? readJson<Verdict & { head_sha?: string }>(join(hqDirOf(previous), 'verdict.json')) : null
+        const progress = !prior || prior.head_sha !== t.head_sha || check.verdict.criteria.some(c => c.result === 'pass' && prior.criteria.find(p => p.id === c.id)?.result !== 'pass')
+        if (count >= 2 || !progress) this.block(t, count >= 2 ? '독립 검수 이어가기 상한 2회 · 미완료 근거 보존' : '독립 검수의 새 완료 항목이 없어 반복을 보류합니다')
+        else {
+          this.store.set(key, String(count + 1))
+          this.store.set(`game.review-handoff:${t.id}`, JSON.stringify({ head: t.head_sha, generation: t.generation, review: att.id, verdict: check.verdict }))
+          this.tset(t, { status: 'reviewing', note: `독립 검수 중간 저장 ${count + 1}/2 · 제작 재작업 없이 남은 검수만 이어갑니다` })
+        }
       }
       else if (check.kind === 'blocking') this.rework(t, `검토 blocking: ${check.verdict.blocking.map((b) => `[${b.id}] ${b.summary}`).join('; ')}`)
       else {
@@ -2077,6 +2098,33 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
     await removeRequestScratch(this.home, requestId, gitDirs)
     this.store.set(`scratchPurged:v1:${requestId}`, this.iso())
     return true
+  }
+
+  /** Operator-confirmed review-only recovery. Retains the candidate, checks and failed review history. */
+  resumeGameReview(taskId: string, reviewId: string, signature: string, nextStep: string): string | null {
+    const t = this.store.task(taskId)
+    if (!t || this.project(t.project)?.workflow !== 'game' || !gameEnabled(this.store, t.project)
+      || t.status !== 'blocked' || gameWaitSignature(this.store, t) !== signature || !t.head_sha
+      || t.checks_state !== 'passed' || t.lingering || this.store.liveAttempts().some(a => a.task_id === taskId)
+      || !['executing', 'blocked'].includes(this.store.request(t.request_id)?.status ?? '')) return '검수만 재개할 수 있는 동일 후보 보류 상태가 아닙니다'
+    const reviews = this.store.attempts(taskId).filter(a => a.kind === 'review')
+    const a = reviews.at(-1)
+    const v = a ? readJson<Verdict & { head_sha?: string; base_sha?: string }>(join(hqDirOf(a), 'verdict.json')) : null
+    const count = Number(this.store.get(`game.review-continuations:${taskId}`) ?? 0)
+    if (!a || a.id !== reviewId || a.generation !== t.generation || a.outcome !== 'blocking'
+      || !v || v.head_sha !== t.head_sha || v.base_sha !== t.base_sha || v.pass || !nextStep.trim()
+      || count >= 2 || !this.gameAttemptBudgetAvailable(t.request_id)) return '검수 후보·발생·이어가기 예산을 확인할 수 없습니다'
+    this.store.tx(() => {
+      this.store.set(`game.review-continuations:${taskId}`, String(count + 1))
+      this.store.set(`game.review-handoff:${taskId}`, JSON.stringify({ head: t.head_sha, generation: t.generation,
+        review: a.id, operatorConfirmed: true, nextStep, verdict: { pass: v.pass, blocking: v.blocking, criteria: v.criteria, tests_run: v.tests_run } }))
+      this.store.updateTask(taskId, { status: 'reviewing', note: `검토자 미완료 항목만 재개 · ${nextStep}` })
+      this.store.set(`game.waiting:${taskId}`, null)
+      this.unblockRequest(t.request_id)
+    })
+    this.emitTask(t, '같은 제출본의 독립 검수만 재개 · 제작 재작업·승급·승인 없음')
+    this.kick()
+    return null
   }
 
   /** §D decideTask (v3): retry on the same model, skip (with dependents), or stop. Revision = the task's block count. */

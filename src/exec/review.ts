@@ -5,8 +5,9 @@ import type { Verdict } from '../types.ts'
 
 const str = { type: 'string' }
 export const VERDICT_SCHEMA = {
-  type: 'object', additionalProperties: false, required: ['pass', 'blocking', 'advisory', 'criteria', 'tests_run'],
+  type: 'object', additionalProperties: false, required: ['pass', 'blocking', 'advisory', 'criteria', 'tests_run', 'continuation'],
   properties: {
+    continuation: { anyOf: [{ type: 'null' }, { type: 'object', additionalProperties: false, required: ['next_step'], properties: { next_step: { type: 'string', minLength: 1, maxLength: 4000 } } }] },
     pass: { type: 'boolean' },
     blocking: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['id', 'summary', 'evidence'], properties: { id: str, summary: str, evidence: str } } },
     advisory: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['id', 'summary'], properties: { id: str, summary: str } } },
@@ -23,7 +24,7 @@ export function ladderUp(ladder: ModelAlias[], m: string): string {
   return ladder[Math.min(i + 1, ladder.length - 1)]
 }
 
-export type VerdictCheck = { kind: 'pass'; verdict: Verdict } | { kind: 'blocking'; verdict: Verdict } | { kind: 'invalid'; reason: string; verdict: Verdict | null }
+export type VerdictCheck = { kind: 'incomplete'; verdict: Verdict } | { kind: 'pass'; verdict: Verdict } | { kind: 'blocking'; verdict: Verdict } | { kind: 'invalid'; reason: string; verdict: Verdict | null }
 
 const isArr = (v: unknown): v is Record<string, unknown>[] => Array.isArray(v) && v.every((x) => x && typeof x === 'object')
 const norm = (s: string) => s.replace(/\s+/g, ' ').trim()
@@ -39,7 +40,7 @@ export function unreliableCommand(cmd: string): boolean {
  * `judgeIds`: items handed to the reviewer to judge (explicit `manual` criteria and base-failed checks) — each must be
  * answered `pass` or `fail`; `manual` there means nobody judged it.
  */
-export function checkVerdict(raw: unknown, o: { acceptanceIds: string[]; codeChanged: boolean; bashRuns: { command: string; exitCode: number | null }[]; judgeIds?: string[] }): VerdictCheck {
+export function checkVerdict(raw: unknown, o: { acceptanceIds: string[]; codeChanged: boolean; bashRuns: { command: string; exitCode: number | null }[]; judgeIds?: string[]; allowContinuation?: boolean }): VerdictCheck {
   if (!raw || typeof raw !== 'object') return { kind: 'invalid', reason: '검토 결과(structured_output) 없음', verdict: null }
   const v = raw as Record<string, unknown>
   if (typeof v.pass !== 'boolean' || !isArr(v.blocking) || !isArr(v.advisory) || !isArr(v.criteria) || !isArr(v.tests_run))
@@ -60,7 +61,15 @@ export function checkVerdict(raw: unknown, o: { acceptanceIds: string[]; codeCha
   if (unknown.length) return bad(`criteria에 모르는 id: ${unknown.join(', ')}`)
   const emptyEvidence = verdict.criteria.filter(c => !c.evidence.trim()).map(c => c.id)
   if (emptyEvidence.length) return bad(`수용 기준 판정 근거가 비어 있음: ${emptyEvidence.join(', ')}`)
-  const unjudged = (o.judgeIds ?? []).filter((id) => { const c = verdict.criteria.find((x) => x.id === id); return !c || (c.result !== 'pass' && c.result !== 'fail') })
+  const continuing = v.continuation != null
+  if (continuing) {
+    const c = v.continuation as Record<string, unknown>
+    if (!o.allowContinuation || typeof c !== 'object' || Array.isArray(c) || typeof c.next_step !== 'string' || !c.next_step.trim() || c.next_step.length > 4000) return bad('검토 이어가기 형식 또는 대상 오류')
+    if (verdict.pass || verdict.blocking.length || verdict.criteria.some(c => c.result === 'fail') || !verdict.criteria.some(c => c.result === 'manual')) return bad('검토 미완료는 pass/fail/제품 결함과 혼합할 수 없음')
+    if (!verdict.tests_run.length || !verdict.criteria.some(c => c.result === 'pass') || verdict.tests_run.some(t => t.exit_code !== 0)) return bad('검토 이어가기에는 실제 완료한 검사와 판정 진척이 필요함')
+    verdict.continuation = { next_step: c.next_step }
+  }
+  const unjudged = (continuing ? [] : o.judgeIds ?? []).filter((id) => { const c = verdict.criteria.find((x) => x.id === id); return !c || (c.result !== 'pass' && c.result !== 'fail') })
   if (unjudged.length) return bad(`사람 확인이 필요한 기준을 판정하지 않음(pass 또는 fail이어야 함): ${unjudged.join(', ')}`)
   if (o.codeChanged && !verdict.tests_run.length) return bad('코드 변경이 있는데 tests_run이 비어 있음')
   for (const t of verdict.tests_run) {
@@ -73,6 +82,7 @@ export function checkVerdict(raw: unknown, o: { acceptanceIds: string[]; codeCha
     if (run.exitCode === null) return bad(`tests_run 명령의 종료 코드를 알 수 없음(중단·백그라운드 등): ${cmd}`)
     if (run.exitCode !== t.exit_code) return bad(`tests_run 종료 코드 불일치: ${cmd} (보고 ${t.exit_code}, 실제 ${run.exitCode})`)
   }
+  if (continuing) return { kind: 'incomplete', verdict }
   if (verdict.pass) {
     if (verdict.tests_run.some((t) => t.exit_code !== 0)) return bad('pass=true인데 종료 코드가 0이 아닌 테스트가 있음')
     if (verdict.blocking.length) return bad('pass=true인데 blocking 있음')

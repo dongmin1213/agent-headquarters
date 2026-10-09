@@ -42,3 +42,20 @@ test('4. Bash runs and exit codes come from the reviewer stream', () => {
   const r = checkVerdict(v({ tests_run: [{ command: 'npm run lint', exit_code: 2, summary: '' }] }), { acceptanceIds: ids, codeChanged: true, bashRuns: got })
   assert.equal(r.kind, 'invalid', 'v3: a command contained in a compound Bash run is not a match')
 })
+
+test('game review checkpoints distinguish unverified work from product defects and require real progress', () => {
+  const opts = { acceptanceIds: ids, codeChanged: true, bashRuns: runs, judgeIds: ids, allowContinuation: true }
+  const incomplete = v({ pass: false, continuation: { next_step: 'A2 실제 플레이를 저장 지점부터 확인' },
+    criteria: [{ id: 'A1', result: 'pass', evidence: '직접 확인' }, { id: 'A2', result: 'manual', evidence: '플레이 미완료' }] })
+  assert.equal(checkVerdict(incomplete, opts).kind, 'incomplete')
+  assert.equal(checkVerdict(incomplete, { ...opts, allowContinuation: false }).kind, 'invalid')
+  for (const extra of [
+    { pass: true }, { blocking: [{ id: 'bug', summary: '충돌', evidence: '직접 재현' }] },
+    { continuation: { next_step: '' } }, { tests_run: [] },
+    { tests_run: [{ command: 'not executed', exit_code: 0, summary: 'fake' }] },
+    { criteria: incomplete.criteria.map(c => ({ ...c, result: 'manual' })) },
+    { criteria: incomplete.criteria.map(c => ({ ...c, result: c.result === 'manual' ? 'fail' : c.result })) },
+  ]) assert.equal(checkVerdict({ ...incomplete, ...extra }, opts).kind, 'invalid')
+  assert.equal(checkVerdict({ ...incomplete, continuation: null }, opts).kind, 'invalid', 'final review cannot leave required criteria unverified')
+  assert.equal(checkVerdict(v({ continuation: null }), opts).kind, 'pass')
+})

@@ -119,6 +119,8 @@ export interface AttemptView {
 
 export interface CheckResult { id: string; command: string; exitCode: number | null; durationMs: number; pass: boolean; outputTail: string }
 export interface Verdict {
+  /** A review checkpoint, never a product approval. */
+  continuation?: { next_step: string } | null
   pass: boolean
   blocking: { id: string; summary: string; evidence: string }[]
   advisory: { id: string; summary: string }[]
