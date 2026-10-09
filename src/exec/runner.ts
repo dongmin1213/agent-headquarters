@@ -1435,6 +1435,7 @@ export class Runner {
       if (project.workflow === 'game') {
         prompt += '\n\n' + this.gamePlayTools()
         const handoff = readReviewHandoff(this.store.get(`game.review-handoff:${t.id}`), t)
+        prompt += `\n\n이번 검토의 유일한 실행 작업 폴더: ${wt.path}. 과거 검토 체크아웃은 종료 후 정리되므로 재사용하지 않는다. 준비·import·game-play start는 반드시 현재 폴더에서 수행한다. 이전 /tmp 관측·봉인 저장은 파일 존재 및 소스 일치를 확인한 뒤 인수한다. 복원은 현재 프로젝트를 시작한 세션에 수행한다.\n`
         if (handoff) prompt += '\n\n## 동일 제출본의 독립 검토 인계 (승인 아님)\n' + JSON.stringify(handoff) + '\n기존 완료 근거의 소스 일치를 확인하고 미완료 항목부터 검수한다. 새 의심이나 변경 없이 이미 완료한 검사를 전부 반복하지 않는다. 이전 tests_run을 이번 실행으로 복사하지 않는다.'
       }
       const argv = codexArgs(this.cfg, { role: 'review', model: att.model, sessionId: att.session_id, resume: false, out: null, schema: VERDICT_SCHEMA })
@@ -1517,13 +1518,16 @@ export class Runner {
       else if (check.kind === 'incomplete') {
         const key = `game.review-continuations:${t.id}`
         const count = Number(this.store.get(key) ?? 0)
-        const previous = this.store.attempts(t.id).filter(a => a.kind === 'review' && a.id !== att.id && a.outcome === 'incomplete').at(-1)
-        const prior = previous ? readJson<Verdict & { head_sha?: string }>(join(hqDirOf(previous), 'verdict.json')) : null
-        const progress = !prior || prior.head_sha !== t.head_sha || check.verdict.criteria.some(c => c.result === 'pass' && prior.criteria.find(p => p.id === c.id)?.result !== 'pass')
+        const previous = this.store.attempts(t.id).filter(a => a.kind === 'review' && a.id !== att.id && a.generation === t.generation && a.outcome === 'incomplete').at(-1)
+        const priorHandoff = readReviewHandoff(this.store.get(`game.review-handoff:${t.id}`), t) as { verdict?: Verdict } | null
+        const previousVerdict = previous ? readJson<Verdict & { head_sha?: string }>(join(hqDirOf(previous), 'verdict.json')) : null
+        const prior = priorHandoff?.verdict ?? (previousVerdict?.head_sha === t.head_sha ? previousVerdict : null)
+        const progress = !prior || check.verdict.criteria.some(c => c.result === 'pass' && prior.criteria.find(p => p.id === c.id)?.result !== 'pass')
+        // Even a bounded stop must retain the newest observations and next action.
+        this.store.set(`game.review-handoff:${t.id}`, JSON.stringify({ head: t.head_sha, generation: t.generation, review: att.id, verdict: check.verdict }))
         if (count >= 2 || !progress) this.block(t, count >= 2 ? '독립 검수 이어가기 상한 2회 · 미완료 근거 보존' : '독립 검수의 새 완료 항목이 없어 반복을 보류합니다')
         else {
           this.store.set(key, String(count + 1))
-          this.store.set(`game.review-handoff:${t.id}`, JSON.stringify({ head: t.head_sha, generation: t.generation, review: att.id, verdict: check.verdict }))
           this.tset(t, { status: 'reviewing', note: `독립 검수 중간 저장 ${count + 1}/2 · 제작 재작업 없이 남은 검수만 이어갑니다` })
         }
       }
@@ -2098,6 +2102,42 @@ criteria의 evidence에는 실제로 확인한 프로젝트 상대 파일 경로
     await removeRequestScratch(this.home, requestId, gitDirs)
     this.store.set(`scratchPurged:v1:${requestId}`, this.iso())
     return true
+  }
+
+  /** One audited retry per candidate after fixing a verdict validator bug. Never resets lifetime budgets. */
+  recoverInvalidGameReview(taskId: string, reviewId: string, signature: string, nextStep: string): string | null {
+    const t = this.store.task(taskId)
+    if (!t || this.project(t.project)?.workflow !== 'game' || !gameEnabled(this.store, t.project)
+      || t.status !== 'blocked' || gameWaitSignature(this.store, t) !== signature || !t.head_sha
+      || t.checks_state !== 'passed' || t.lingering || this.store.liveAttempts().some(a => a.task_id === taskId)
+      || !['executing', 'blocked'].includes(this.store.request(t.request_id)?.status ?? '')) return '동일 후보의 검토 무효 보류 상태가 아닙니다'
+    const a = this.store.attempts(taskId).filter(a => a.kind === 'review').at(-1)
+    const key = `game.review-validator-repair:${taskId}:${t.head_sha}:${t.generation}`
+    if (!a || a.id !== reviewId || a.generation !== t.generation || a.outcome !== 'invalid'
+      || this.store.get(key) || !nextStep.trim() || !this.gameAttemptBudgetAvailable(t.request_id)) return '검토 무효 복구 대상·예산·중복 여부를 확인할 수 없습니다'
+    const hq = hqDirOf(a)
+    const binding = readJson<{ head_sha?: string; base_sha?: string }>(join(hq, 'verdict.json'))
+    if (binding?.head_sha !== t.head_sha || binding?.base_sha !== t.base_sha) return '검토 근거의 제출본이 다릅니다'
+    // Replay the original response against actual recorded commands; no edited verdict is accepted.
+    const raw = new StreamTail(hq).finalResult()
+    if (!raw || raw.is_error) return '정상 검토 원문이 없습니다'
+    const spec = specOf(t)
+    const check = checkVerdict(raw.structured_output, { acceptanceIds: spec.acceptance.map(c => c.id),
+      codeChanged: true, bashRuns: extractBashRuns(join(hq, 'stream.jsonl')), judgeIds: manualIds(spec), allowContinuation: true })
+    if (check.kind !== 'incomplete') return '수정된 판정기로 검토 중간 저장을 재검증하지 못했습니다'
+    atomicJson(join(hq, 'checkpoint-recovered.json'), { ...check.verdict, head_sha: binding.head_sha, base_sha: binding.base_sha, operatorNote: nextStep, recoveredAt: this.iso() })
+    this.store.tx(() => {
+      this.store.set(key, JSON.stringify({ review: a.id, at: this.iso(), reason: nextStep }))
+      this.store.set(`game.review-handoff:${taskId}`, JSON.stringify({ head: t.head_sha, generation: t.generation,
+        review: a.id, operatorConfirmed: true, nextStep, verdict: check.verdict }))
+      // Previous invalid attempts stay in history. Budgets and production counters are untouched.
+      this.store.updateTask(taskId, { status: 'reviewing', note: `검토 판정기 수정 후 남은 검수 재개 · ${nextStep}` })
+      this.store.set(`game.waiting:${taskId}`, null)
+      this.unblockRequest(t.request_id)
+    })
+    this.emitTask(t, '검토 원문 재검증 완료 · 남은 검수만 재개')
+    this.kick()
+    return null
   }
 
   /** Operator-confirmed review-only recovery. Retains the candidate, checks and failed review history. */

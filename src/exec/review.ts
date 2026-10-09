@@ -65,9 +65,10 @@ export function checkVerdict(raw: unknown, o: { acceptanceIds: string[]; codeCha
   if (continuing) {
     const c = v.continuation as Record<string, unknown>
     if (!o.allowContinuation || typeof c !== 'object' || Array.isArray(c) || typeof c.next_step !== 'string' || !c.next_step.trim() || c.next_step.length > 4000) return bad('검토 이어가기 형식 또는 대상 오류')
-    if (verdict.pass || verdict.blocking.length || verdict.criteria.some(c => c.result === 'fail') || !verdict.criteria.some(c => c.result === 'manual')) return bad('검토 미완료는 pass/fail/제품 결함과 혼합할 수 없음')
-    if (!verdict.tests_run.length || !verdict.criteria.some(c => c.result === 'pass') || verdict.tests_run.some(t => t.exit_code !== 0)) return bad('검토 이어가기에는 실제 완료한 검사와 판정 진척이 필요함')
     verdict.continuation = { next_step: c.next_step }
+    // A checkpoint preserves failed commands too; it is never a product approval.
+    if (verdict.pass || verdict.blocking.length || verdict.criteria.some(c => c.result === 'fail') || !verdict.criteria.some(c => c.result === 'manual')) return bad('검토 미완료는 pass/fail/제품 결함과 혼합할 수 없음')
+    if (!verdict.tests_run.some(t => t.exit_code === 0) || !verdict.criteria.some(c => c.result === 'pass')) return bad('검토 이어가기에는 실제 완료한 검사와 판정 진척이 필요함')
   }
   const unjudged = (continuing ? [] : o.judgeIds ?? []).filter((id) => { const c = verdict.criteria.find((x) => x.id === id); return !c || (c.result !== 'pass' && c.result !== 'fail') })
   if (unjudged.length) return bad(`사람 확인이 필요한 기준을 판정하지 않음(pass 또는 fail이어야 함): ${unjudged.join(', ')}`)

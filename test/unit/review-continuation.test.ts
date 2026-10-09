@@ -92,7 +92,54 @@ test('review continuation lifetime cap is retained even when the next review rep
   await finish(1,['A1','A2'])
   assert.equal(h.store.task(tid)!.status,'blocked')
   assert.match(h.store.task(tid)!.note!,/상한 2회/)
+  assert.ok(readReviewHandoff(h.store.get(`game.review-handoff:${tid}`),h.store.task(tid)!))
   assert.equal(h.store.task(tid)!.attempts,3)
   assert.equal(h.store.get(`game.review-continuations:${tid}`),'2')
+ }finally{await h.close()}
+})
+
+
+test('validator repair replays original evidence once, retains budgets, and rejects forged commands or stale binding', async()=>{
+ const {h,tid,head}=fixture()
+ try {
+  h.store.updateTask(tid,{status:'blocked',review_invalid:2})
+  h.store.set(`game.review-continuations:${tid}`,'2')
+  const dir=join(h.dir,'bad-review'),hq=join(dir,'hq');mkdirSync(hq,{recursive:true})
+  const aid=`${tid}~r5`
+  h.store.insertAttempt({id:aid,task_id:tid,kind:'review',n:5,model:'sonnet',status:'unverifiable',attempt_token:'test',dir,session_id:'s5',generation:0})
+  h.store.updateAttempt(aid,{outcome:'invalid'})
+  const verdict={pass:false,blocking:[],advisory:[],criteria:['A1','A2','A3'].map(id=>({id,result:id==='A1'?'pass':'manual',evidence:'observed or remaining'})),
+    tests_run:[{command:'npm test',exit_code:0,summary:'ok'},{command:'bad invocation',exit_code:1,summary:'corrected'}],continuation:{next_step:'finish actual play'}}
+  const stream=(raw:unknown)=>writeFileSync(join(hq,'stream.jsonl'),[
+   {type:'assistant',message:{content:[{type:'tool_use',id:'ok',name:'Bash',input:{command:'npm test'}},{type:'tool_use',id:'bad',name:'Bash',input:{command:'bad invocation'}}]}},
+   {type:'user',message:{content:[{type:'tool_result',tool_use_id:'ok',is_error:false,content:'ok'},{type:'tool_result',tool_use_id:'bad',is_error:true,content:'Exit code 1'}]}},
+   {type:'result',is_error:false,structured_output:raw},
+  ].map(x=>JSON.stringify(x)).join('\n'))
+  const binding=(sha:string)=>writeFileSync(join(hq,'verdict.json'),JSON.stringify({...verdict,head_sha:sha,base_sha:head,invalid:'old validator'}))
+  const recover=()=>h.runner.recoverInvalidGameReview(tid,aid,gameWaitSignature(h.store,h.store.task(tid)!), 'fixed validator; use current checkout')
+  stream(verdict);binding('b'.repeat(40));assert.ok(recover())
+  binding(head);stream({...verdict,tests_run:[{command:'never executed',exit_code:0,summary:'fake'}]});assert.ok(recover())
+  stream(verdict);assert.equal(recover(),null)
+  assert.equal(h.store.task(tid)!.status,'reviewing')
+  assert.equal(h.store.task(tid)!.attempts,3)
+  assert.equal(h.store.task(tid)!.review_invalid,2)
+  assert.equal(h.store.get(`game.review-continuations:${tid}`),'2')
+  assert.equal(h.store.attempt(aid)!.outcome,'invalid')
+  assert.ok(readReviewHandoff(h.store.get(`game.review-handoff:${tid}`),h.store.task(tid)!))
+  h.store.updateTask(tid,{status:'blocked'});assert.ok(recover(),'cannot reuse repair budget')
+ }finally{await h.close()}
+})
+
+
+test('operator handoff counts as prior progress instead of earning another identical checkpoint',async()=>{
+ const {h,tid,head,finish}=fixture()
+ try {
+  h.store.set(`game.review-handoff:${tid}`,JSON.stringify({head,generation:0,operatorConfirmed:true,verdict:{criteria:[{id:'A1',result:'pass'}]}}))
+  await finish(1,['A1'])
+  assert.equal(h.store.task(tid)!.status,'blocked')
+  assert.match(h.store.task(tid)!.note!,/새 완료 항목/)
+  assert.equal(h.store.get(`game.review-continuations:${tid}`),null)
+  const latest=JSON.parse(h.store.get(`game.review-handoff:${tid}`)!)
+  assert.equal(latest.review,`${tid}~r1`,'latest evidence survives a no-progress stop')
  }finally{await h.close()}
 })

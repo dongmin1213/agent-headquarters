@@ -59,3 +59,17 @@ test('game review checkpoints distinguish unverified work from product defects a
   assert.equal(checkVerdict({ ...incomplete, continuation: null }, opts).kind, 'invalid', 'final review cannot leave required criteria unverified')
   assert.equal(checkVerdict(v({ continuation: null }), opts).kind, 'pass')
 })
+
+
+test('checkpoint keeps corrected invocation failures without weakening final approval or command verification', () => {
+  const opts = { acceptanceIds: ids, codeChanged: true, bashRuns: runs, judgeIds: ids, allowContinuation: true }
+  const raw = v({ pass: false, continuation: {next_step:'remaining real play'},
+    criteria:[{id:'A1',result:'pass',evidence:'observed'},{id:'A2',result:'manual',evidence:'remaining'}],
+    tests_run:[{command:'npm test',exit_code:0,summary:'ok'},{command:'npm run lint',exit_code:1,summary:'recorded failure; not an approval'}] })
+  const checked = checkVerdict(raw,opts)
+  assert.equal(checked.kind,'incomplete')
+  assert.equal(checked.verdict?.tests_run[1].exit_code,1)
+  assert.equal(checkVerdict({...raw,tests_run:[raw.tests_run[1]]},opts).kind,'invalid','requires a successful executed check')
+  assert.equal(checkVerdict({...raw,tests_run:[raw.tests_run[0],{...raw.tests_run[1],exit_code:0}]},opts).kind,'invalid','cannot rewrite failure')
+  assert.equal(checkVerdict({...raw,pass:true,continuation:null,criteria:v().criteria},opts).kind,'invalid','final pass still rejects failures')
+})
