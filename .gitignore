@@ -7,3 +7,14 @@ config/teams.json
 # built app and third-party sprites (fetched locally by scripts/fetch-packs.sh; not redistributed)
 pet/HQPet.app/
 pet/packs/
+
+# Local credentials, runtime state, and private operational reports
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+auth.json
+credentials.json
+.hq/
+/docs/audits/
