@@ -984,6 +984,10 @@ export class Runner {
   // ----- work attempts (§7 start protocol) -----
   private claimWork(t: TaskRow): boolean {
     if (!this.gameAttemptBudgetAvailable(t.request_id)) return false
+    if (this.spentMs(t, '') >= 3 * this.wallMs(t)) {
+      this.block(t, '작업 누적 시간 예산 소진: 저장된 결과를 보존하고 남은 범위·실행 방법 재계획 필요 (새 작업자 실행 안 함)')
+      return false
+    }
     const { prev, counted } = this.workCounting(t)
     const resume = t.resume_session
     const n = this.store.nextAttemptN(t.id, 'work')
@@ -1157,7 +1161,8 @@ export class Runner {
       const request = this.store.request(t.request_id)!
       t = this.store.task(t.id)!
       // A legacy thread starts fresh in Codex; every resume also needs the current checkout and full brief.
-      let prompt = workPrompt({ checkpointCount: this.store.attempts(t.id).filter(a => a.kind === 'work' && a.status === 'checkpoint' && a.generation === t.generation).length, game: project.workflow === 'game', task: specOf(t), requestText: request.text, projectName: project.name, cwd, branch: role === 'implement' ? 'hq-work' : null, base: t.base_sha!,
+      const remainingMinutes = Math.max(0, (3 * this.wallMs(t) - this.spentMs(t, att.id)) / 60_000)
+      let prompt = workPrompt({ timeBudget: { attemptMinutes: this.wallMs(t) / 60_000, generationRemainingMinutes: remainingMinutes }, checkpointCount: this.store.attempts(t.id).filter(a => a.kind === 'work' && a.status === 'checkpoint' && a.generation === t.generation).length, game: project.workflow === 'game', task: specOf(t), requestText: request.text, projectName: project.name, cwd, branch: role === 'implement' ? 'hq-work' : null, base: t.base_sha!,
         out, token: att.attempt_token, rework: t.note && prev ? this.reworkText(t, prev) : null,
         dirtyNotice: this.store.get(`game.refresh-base:${t.id}`) === String(t.generation)
           ? `선행 작업 의존성이 추가되어 검증 기준 커밋이 ${t.base_sha}로 갱신됐다. 이전 기준은 ${JSON.parse(this.store.get(`game.refreshed-base:${t.id}`) ?? 'null')?.previousBase ?? t.base_sha}이다. 먼저 현재 HEAD를 백업 브랜치에 보존한다. 새 기준이 이미 HEAD의 조상이면 재배치하지 않는다. 그렇지 않으면 기존 코드·미커밋 파일을 보존해 git rebase --autostash --onto ${t.base_sha} <이전 기준>으로 기존 작업 커밋만 승인된 선행 결과 위에 재배치한다. merge 커밋은 제출 계약상 금지다. reset/checkout으로 기존 구현을 버리지 않는다. 충돌은 현재 owns 안에서 해결하며 그 밖의 충돌은 정확한 파일과 함께 보고한다. 선행 아트를 새로 만들거나 누락으로 다시 판단하기 전에 해당 승인 결과를 확인한다. 재배치 후 기존 수용 기준과 회귀·독립 검토를 모두 수행한다.` : null,

@@ -13,6 +13,7 @@ export interface WorkPromptInput {
   game?: boolean
   /** Accepted continuations in the current generation; old contracts remain in execution history. */
   checkpointCount?: number
+  timeBudget?: { attemptMinutes: number; generationRemainingMinutes: number }
   task: PlanTask
   requestText: string
   projectName: string
@@ -87,12 +88,15 @@ function upstreamSection(ups: Upstream[]): string[] {
 
 export function workPrompt(o: WorkPromptInput): string {
   const t = o.task
+  const available = o.timeBudget ? Math.max(0, Math.min(o.timeBudget.attemptMinutes, o.timeBudget.generationRemainingMinutes)) : null
+  const reserve = available === null ? 0 : Math.min(10, available / 5)
   return [
     `# 작업: ${t.title}`,
     '',
     '너는 hq의 작업자다. 아래 작업 하나만 끝까지 하고 완료 계약(out/report.md + out/done.json)을 남긴다.',
     '',
     '## 작업 정보',
+    available === null ? '' : `- 실행 시간 예산: 이번 실행 최대 ${o.timeBudget!.attemptMinutes.toFixed(1)}분, 현재 계약 누적 잔여 ${o.timeBudget!.generationRemainingMinutes.toFixed(1)}분, 실제 사용 가능 ${available.toFixed(1)}분. 마지막 ${reserve.toFixed(1)}분은 커밋·report.md·done.json 제출용으로 비운다. ${Math.max(0, available - reserve).toFixed(1)}분 이후에는 새 장시간 검사를 시작하지 않는다. 중간 저장과 같은 세션 재개는 누적 시간 제한을 초기화하지 않는다. 아래 일반 45~60분 중간 저장 안내보다 이 잔여 시간이 우선한다. 완료 기준이 남으면 사실대로 보고하며, 시간 부족을 성공으로 제출하지 않는다.`,
     o.game ? `- 현재 계약 중간 저장: ${o.checkpointCount ?? 0}/${MAX_GAME_CHECKPOINTS}회 사용, ${Math.max(0, MAX_GAME_CHECKPOINTS - (o.checkpointCount ?? 0))}회 남음. 남은 횟수가 0이면 checkpoint로 자동 재개될 것으로 가정하지 않는다. 같은 실패를 반복하지 말고 남은 일과 실행 방식의 구체적인 재계획을 보고한다.` : '',
     `- 회장의 요청: ${o.requestText.replace(/\s+/g, ' ')}`,
     `- 프로젝트: ${o.projectName}`,
