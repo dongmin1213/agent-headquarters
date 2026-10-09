@@ -834,7 +834,9 @@ export class Runner {
         case 'limited': {
           if (j.login) { this.tset(t, { status: 'held', resume_session: att.session_id, note: 'Codex 로그인 필요' }); break }
           const streak = t.limited_streak + 1
-          if (streak >= MAX_LIMITED_STREAK) { this.tset(t, { limited_streak: streak }); this.block(this.store.task(t.id)!, `사용 한도로 ${streak}번 연속 중단됐어요`) }
+          const q = this.quota()
+          const scheduledReset = q.mode === 'hold' && q.until && q.window !== 'limit' && q.window !== 'login'
+          if (streak >= MAX_LIMITED_STREAK && !scheduledReset) { this.tset(t, { limited_streak: streak }); this.block(this.store.task(t.id)!, `사용 한도로 ${streak}번 연속 중단됐어요`) }
           else this.tset(t, { status: 'held', limited_streak: streak, resume_session: att.session_id, note: '사용 한도로 보류' })
           break
         }
@@ -1475,7 +1477,9 @@ export class Runner {
         const reviews = this.store.attempts(task.id).filter((a) => a.kind === 'review' && a.generation === att.generation)
         const streak = reviews.slice(-MAX_LIMITED_STREAK)
         const t = this.store.task(task.id)!
-        if (!login && streak.length >= MAX_LIMITED_STREAK && streak.every((a) => a.status === 'limited') && t.status === 'reviewing') this.block(t, `검토가 사용 한도로 ${MAX_LIMITED_STREAK}번 연속 중단됐어요`)
+        const q = this.quota()
+        const scheduledReset = q.mode === 'hold' && q.until && q.window !== 'limit' && q.window !== 'login'
+        if (!login && !scheduledReset && streak.length >= MAX_LIMITED_STREAK && streak.every((a) => a.status === 'limited') && t.status === 'reviewing') this.block(t, `검토가 사용 한도로 ${MAX_LIMITED_STREAK}번 연속 중단됐어요`)
       })
       return // otherwise the task stays reviewing; dispatch restarts the review when the hold ends
     }

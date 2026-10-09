@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { activateCodexProvider, chatgptEnv, CodexEvents, commandText, execArgs, prepareCodexHome, strictSchema } from '../../src/codex.ts'
+import { activateCodexProvider, chatgptEnv, codexLimitReset, CodexEvents, commandText, execArgs, prepareCodexHome, strictSchema } from '../../src/codex.ts'
+import { quotaFromEvent, quotaState } from '../../src/exec/quota.ts'
 import { Store } from '../../src/store.ts'
 import { loadConfig } from '../../src/config.ts'
 import { StreamTail, extractBashRuns } from '../../src/exec/stream.ts'
@@ -170,4 +171,23 @@ test('failed native commands retain their measured nonzero exit instead of becom
   assert.match(lines.at(-1)?.message.content[0].content, /^Exit code 1/)
   const unknown = decoder.consume({ type: 'item.completed', item: { id: 'unknown', type: 'command_execution', command: 'node check.mjs', status: 'failed', exit_code: null } })
   assert.equal(unknown.at(-1)?.tool_use_result.interrupted, true)
+})
+
+
+test('Codex retry timestamp becomes a durable quota window, not repeated 15-minute retries', () => {
+  const message = 'You’ve hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Oct 14th, 2026 12:28 PM.'
+  const reset = new Date(2026,9,14,12,28).getTime()
+  assert.equal(codexLimitReset(message),reset / 1000)
+  assert.equal(codexLimitReset('try again at Oct 14, 2026 12:28 AM.'),new Date(2026,9,14,0,28).getTime()/1000)
+  for (const bad of ['try again tomorrow','try again at Feb 30th, 2026 12:28 PM.','try again at Oct 14th, 2026 13:28 PM.']) assert.equal(codexLimitReset(bad),null)
+  const d = new CodexEvents()
+  const events = d.consume({type:'turn.failed',error:{message}})
+  const rows = events.flatMap(e => quotaFromEvent(e,reset-3600000))
+  assert.equal(rows.length,1)
+  const limits = {saveAt:0.8,holdAt:0.95}
+  assert.equal(quotaState(rows,limits,reset-1000).until,new Date(reset).toISOString())
+  assert.equal(quotaState(rows,limits,reset+1).mode,'unobserved','auto resume after reset')
+  assert.equal(d.result?.api_error_status,429)
+  assert.equal(new CodexEvents().consume({type:'turn.failed',error:{message:'Usage limit reached'}}).length,1,'unknown reset keeps bounded backoff')
+  assert.equal(new CodexEvents().consume({type:'item.completed',item:{type:'agent_message',text:message}}).some(e=>e.type==='rate_limit_event'),false,'quoted text cannot hold scheduler')
 })

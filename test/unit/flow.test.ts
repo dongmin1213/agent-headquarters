@@ -292,3 +292,21 @@ test('15. integration conflict: two requests change the same file, accepted in s
     assert.ok(item.optionHelp['다시 통합'] && item.optionHelp['요청 중단'])
   } finally { await h.close() }
 })
+
+
+test('known quota reset keeps interrupted work resumable even after earlier unknown-limit failures', async () => {
+  const h = harness()
+  try {
+    const resets = Math.floor(h.clock.t / 1000) + 3600
+    const id = h.plan([task('A', {brief:`[[FAKE:write=a/out.txt]] [[FAKE:rejectfirst]] [[FAKE:resets=${resets}]]`})])
+    await h.approve(id)
+    const tid = `${id}.A`
+    h.store.updateTask(tid,{limited_streak:2})
+    await h.waitFor(()=>tsk(h,tid).status==='held','scheduled quota hold remains resumable')
+    assert.equal(tsk(h,tid).limited_streak,3)
+    assert.equal(h.runner.quota().until,new Date(resets*1000).toISOString())
+    h.clock.t=resets*1000+1000
+    await h.waitFor(()=>['reviewing','passed'].includes(tsk(h,tid).status),'resumed at known reset')
+    assert.equal(tsk(h,tid).attempts,1)
+  } finally {await h.close()}
+})

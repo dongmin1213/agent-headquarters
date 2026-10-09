@@ -108,6 +108,18 @@ export function commandText(command: string): string {
   return quote === null && started ? out : command
 }
 
+/** Codex CLI formats this retry timestamp in the local timezone of its process. Unknown formats retain backoff. */
+export function codexLimitReset(message: string): number | null {
+  const m = /try again at (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) (\d{1,2})(?:st|nd|rd|th)?, (\d{4}) (\d{1,2}):(\d{2}) (AM|PM)(?:\.|$)/i.exec(message)
+  if (!m) return null
+  const month = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf(m[1].toLowerCase())
+  const day = Number(m[2]), year = Number(m[3]), hour = Number(m[4]), minute = Number(m[5])
+  if (year < 2000 || day < 1 || day > 31 || hour < 1 || hour > 12 || minute > 59) return null
+  const date = new Date(year, month, day, hour % 12 + (m[6].toUpperCase() === 'PM' ? 12 : 0), minute)
+  if (date.getFullYear() !== year || date.getMonth() !== month || date.getDate() !== day) return null
+  return date.getTime() / 1000
+}
+
 type Event = Record<string, any>
 export class CodexEvents {
   sessionId = ''
@@ -151,7 +163,8 @@ export class CodexEvents {
       const message = String(error.message ?? 'Codex 실행 오류')
       const code = /usage limit|rate.?limit|quota|\b429\b/i.test(message) ? 429 : Number(error.status_code ?? error.status ?? 0)
       this.result = { type: 'result', subtype: 'error', is_error: true, session_id: this.sessionId, result: message, api_error_status: code, usage: {} }
-      return [this.result]
+      const resetsAt = code === 429 ? codexLimitReset(message) : null
+      return [...(resetsAt === null ? [] : [{ type: 'rate_limit_event', rate_limit_info: { rateLimitType: 'codex', status: 'rejected', resetsAt } }]), this.result]
     }
     if (line.type === 'item.completed' && item) return [{ type: 'assistant', message: { content: [{ type: 'tool_use', name: item.type, input: { path: item.query ?? item.text ?? '' } }] } }]
     return []
